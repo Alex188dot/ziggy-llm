@@ -41,6 +41,9 @@ const max_tensor_dims: usize = 4;
 const rope_metaspace = "\xE2\x96\x81";
 const negative_infinity = -std.math.inf(f32);
 const simd_lane_count: usize = 8;
+const parallel_matvec_min_rows: usize = 2048;
+const parallel_matvec_min_work: usize = 4_000_000;
+const max_matvec_helper_threads: usize = 3;
 
 const ValueType = enum(u32) {
     uint8 = 0,
@@ -392,10 +395,11 @@ const Session = struct {
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
+    matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
 
     fn init(allocator: std.mem.Allocator, model: *const Model, token_capacity: usize) !Session {
-        return .{
+        var session = Session{
             .model = model,
             .token_buffer = try allocator.alloc(u32, token_capacity),
             .hidden = try allocator.alloc(f32, model.embedding_length),
@@ -412,9 +416,22 @@ const Session = struct {
             .k_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
             .v_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
         };
+        errdefer session.deinit(allocator);
+
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
+        if (helper_count > 0) {
+            session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
+        }
+
+        return session;
     }
 
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
+        if (self.matvec_workers) |workers| {
+            workers.deinit(allocator);
+            allocator.destroy(workers);
+        }
         allocator.free(self.token_buffer);
         allocator.free(self.hidden);
         allocator.free(self.normed);
@@ -517,12 +534,155 @@ const Session = struct {
 
         const bytes = try tensorBytes(self.model, tensor);
         const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
-        for (0..row_count) |row_index| {
+        const work = row_count * row_len;
+
+        if (self.matvec_workers) |workers| {
+            if (row_count >= parallel_matvec_min_rows and work >= parallel_matvec_min_work) {
+                workers.run(.{
+                    .out = out,
+                    .bytes = bytes,
+                    .row_size = row_size,
+                    .row_len = row_len,
+                    .tensor_type = tensor.tensor_type,
+                    .input = input,
+                    .row_count = row_count,
+                });
+                return;
+            }
+        }
+
+        const range = workerRowRange(0, 1, row_count);
+        for (range.start..range.end) |row_index| {
             const row = bytes[row_index * row_size ..][0..row_size];
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
     }
 };
+
+const MatVecTask = struct {
+    out: []f32,
+    bytes: []const u8,
+    row_size: usize,
+    row_len: usize,
+    tensor_type: TensorType,
+    input: []const f32,
+    row_count: usize,
+};
+
+const RowRange = struct {
+    start: usize,
+    end: usize,
+};
+
+const MatVecWorkers = struct {
+    mutex: std.Thread.Mutex = .{},
+    work_ready: std.Thread.Condition = .{},
+    work_done: std.Thread.Condition = .{},
+    threads: []std.Thread,
+    task: ?MatVecTask = null,
+    generation: u64 = 0,
+    active_workers: usize = 0,
+    shutting_down: bool = false,
+
+    fn init(allocator: std.mem.Allocator, helper_count: usize) !*MatVecWorkers {
+        const workers = try allocator.create(MatVecWorkers);
+        errdefer allocator.destroy(workers);
+
+        workers.* = .{
+            .threads = try allocator.alloc(std.Thread, helper_count),
+        };
+        errdefer allocator.free(workers.threads);
+
+        var spawned: usize = 0;
+        errdefer {
+            workers.mutex.lock();
+            workers.shutting_down = true;
+            workers.work_ready.broadcast();
+            workers.mutex.unlock();
+            for (workers.threads[0..spawned]) |thread| thread.join();
+        }
+
+        for (workers.threads, 0..) |*thread, index| {
+            thread.* = try std.Thread.spawn(.{}, matVecWorkerMain, .{ workers, index });
+            spawned += 1;
+        }
+
+        return workers;
+    }
+
+    fn deinit(self: *MatVecWorkers, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        self.shutting_down = true;
+        self.work_ready.broadcast();
+        self.mutex.unlock();
+
+        for (self.threads) |thread| thread.join();
+        allocator.free(self.threads);
+        self.* = undefined;
+    }
+
+    fn run(self: *MatVecWorkers, task: MatVecTask) void {
+        const participant_count = self.threads.len + 1;
+
+        self.mutex.lock();
+        self.task = task;
+        self.active_workers = self.threads.len;
+        self.generation += 1;
+        self.work_ready.broadcast();
+        self.mutex.unlock();
+
+        runMatVecTask(task, self.threads.len, participant_count);
+
+        self.mutex.lock();
+        while (self.active_workers != 0) {
+            self.work_done.wait(&self.mutex);
+        }
+        self.task = null;
+        self.mutex.unlock();
+    }
+};
+
+fn workerRowRange(worker_index: usize, participant_count: usize, row_count: usize) RowRange {
+    const rows_per_participant = std.math.divCeil(usize, row_count, participant_count) catch unreachable;
+    const start = @min(row_count, worker_index * rows_per_participant);
+    const end = @min(row_count, start + rows_per_participant);
+    return .{ .start = start, .end = end };
+}
+
+fn runMatVecTask(task: MatVecTask, worker_index: usize, participant_count: usize) void {
+    const range = workerRowRange(worker_index, participant_count, task.row_count);
+    for (range.start..range.end) |row_index| {
+        const row = task.bytes[row_index * task.row_size ..][0..task.row_size];
+        task.out[row_index] = dotRowAssumeValid(task.tensor_type, row, task.row_len, task.input);
+    }
+}
+
+fn matVecWorkerMain(workers: *MatVecWorkers, worker_index: usize) void {
+    var seen_generation: u64 = 0;
+
+    while (true) {
+        workers.mutex.lock();
+        while (!workers.shutting_down and seen_generation == workers.generation) {
+            workers.work_ready.wait(&workers.mutex);
+        }
+        if (workers.shutting_down) {
+            workers.mutex.unlock();
+            return;
+        }
+
+        seen_generation = workers.generation;
+        const task = workers.task.?;
+        const participant_count = workers.threads.len + 1;
+        workers.mutex.unlock();
+
+        runMatVecTask(task, worker_index, participant_count);
+
+        workers.mutex.lock();
+        workers.active_workers -= 1;
+        if (workers.active_workers == 0) workers.work_done.signal();
+        workers.mutex.unlock();
+    }
+}
 
 pub fn generate(
     allocator: std.mem.Allocator,
