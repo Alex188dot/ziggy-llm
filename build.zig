@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
 
     const default_enable_metal = target.result.os.tag == .macos and target.result.cpu.arch == .aarch64;
     const enable_metal = b.option(bool, "metal", "Enable the Metal backend") orelse default_enable_metal;
