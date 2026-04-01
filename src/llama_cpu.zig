@@ -40,6 +40,7 @@ const default_alignment: u32 = 32;
 const max_tensor_dims: usize = 4;
 const rope_metaspace = "\xE2\x96\x81";
 const negative_infinity = -std.math.inf(f32);
+const simd_lane_count: usize = 8;
 
 const ValueType = enum(u32) {
     uint8 = 0,
@@ -329,7 +330,8 @@ const Tokenizer = struct {
 };
 
 const Model = struct {
-    bytes: []u8,
+    bytes: []const u8,
+    mapped_bytes: ?[]align(std.heap.page_size_min) const u8,
     tokenizer: Tokenizer,
     context_length: usize,
     embedding_length: usize,
@@ -365,7 +367,11 @@ const Model = struct {
         allocator.free(self.token_embd.name);
         allocator.free(self.output.name);
         allocator.free(self.output_norm.name);
-        allocator.free(self.bytes);
+        if (self.mapped_bytes) |mapped_bytes| {
+            std.posix.munmap(mapped_bytes);
+        } else {
+            allocator.free(self.bytes);
+        }
         self.* = undefined;
     }
 };
@@ -437,28 +443,28 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
-            try matVec(self.q, self.model, layer.attn_q, self.normed);
-            try matVec(self.k, self.model, layer.attn_k, self.normed);
-            try matVec(self.v, self.model, layer.attn_v, self.normed);
+            try self.matVec(self.q, layer.attn_q, self.normed);
+            try self.matVec(self.k, layer.attn_k, self.normed);
+            try self.matVec(self.v, layer.attn_v, self.normed);
             applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
             applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
             self.storeKv(layer_index);
             self.computeAttention(layer_index);
-            try matVec(self.attn_tmp, self.model, layer.attn_output, self.attn_out);
+            try self.matVec(self.attn_tmp, layer.attn_output, self.attn_out);
             addInPlace(self.hidden, self.attn_tmp);
 
             try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
-            try matVec(self.gate, self.model, layer.ffn_gate, self.normed);
-            try matVec(self.up, self.model, layer.ffn_up, self.normed);
+            try self.matVec(self.gate, layer.ffn_gate, self.normed);
+            try self.matVec(self.up, layer.ffn_up, self.normed);
             for (self.gate, self.up) |*gate, up| {
                 gate.* = silu(gate.*) * up;
             }
-            try matVec(self.attn_tmp, self.model, layer.ffn_down, self.gate);
+            try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
             addInPlace(self.hidden, self.attn_tmp);
         }
 
         try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-        try matVec(self.logits, self.model, self.model.output, self.normed);
+        try self.matVec(self.logits, self.model.output, self.normed);
 
         self.token_buffer[self.position] = token_id;
         self.position += 1;
@@ -501,6 +507,19 @@ const Session = struct {
                     dst.* += weight * src;
                 }
             }
+        }
+    }
+
+    fn matVec(self: *Session, out: []f32, tensor: TensorRef, input: []const f32) !void {
+        const row_len = try tensor.rowLen();
+        const row_count = try tensor.rowCount();
+        if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
+
+        const bytes = try tensorBytes(self.model, tensor);
+        const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        for (0..row_count) |row_index| {
+            const row = bytes[row_index * row_size ..][0..row_size];
+            out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
     }
 };
@@ -563,12 +582,17 @@ fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
 
     const stat = try file.stat();
     const size = std.math.cast(usize, stat.size) orelse return error.Overflow;
-    const bytes = try allocator.alloc(u8, size);
-    errdefer allocator.free(bytes);
-    const actual = try file.preadAll(bytes, 0);
-    if (actual != size) return error.TruncatedFile;
+    const mapped_bytes = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    errdefer std.posix.munmap(mapped_bytes);
 
-    var parser = Parser{ .bytes = bytes };
+    var parser = Parser{ .bytes = mapped_bytes };
     const magic = try parser.readBytes(4);
     if (!std.mem.eql(u8, magic, gguf_magic)) return error.InvalidMagic;
 
@@ -601,7 +625,7 @@ fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     }
 
     const data_offset = alignForward(parser.pos, metadata.alignment);
-    if (data_offset > bytes.len) return error.TruncatedFile;
+    if (data_offset > mapped_bytes.len) return error.TruncatedFile;
 
     const block_count = metadata.block_count orelse return error.MissingRequiredMetadata;
     const embedding_length = metadata.embedding_length orelse return error.MissingRequiredMetadata;
@@ -639,7 +663,8 @@ fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const kv_dimension = head_dimension * head_count_kv;
 
     return .{
-        .bytes = bytes,
+        .bytes = mapped_bytes,
+        .mapped_bytes = mapped_bytes,
         .tokenizer = tokenizer,
         .context_length = context_length,
         .embedding_length = embedding_length,
@@ -887,27 +912,13 @@ fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRe
     if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
     if (try tensor.rowLen() != input.len) return error.InvalidTensorMetadata;
 
-    var mean_square: f32 = 0;
-    for (input) |value| mean_square += value * value;
+    var mean_square = dot(input, input);
     mean_square /= @as(f32, @floatFromInt(input.len));
     const scale = @as(f32, 1.0) / @sqrt(mean_square + model.rms_norm_eps);
 
     for (input, 0..) |value, index| {
         const weight = readF32(weights[index * 4 ..][0..4]);
         out[index] = value * scale * weight;
-    }
-}
-
-fn matVec(out: []f32, model: *const Model, tensor: TensorRef, input: []const f32) !void {
-    const row_len = try tensor.rowLen();
-    const row_count = try tensor.rowCount();
-    if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
-
-    const bytes = try tensorBytes(model, tensor);
-    const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
-    for (0..row_count) |row_index| {
-        const row = bytes[row_index * row_size ..][0..row_size];
-        out[row_index] = try dotRow(tensor.tensor_type, row, row_len, input);
     }
 }
 
@@ -933,15 +944,40 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
     };
 }
 
+fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, input: []const f32) f32 {
+    return switch (tensor_type) {
+        .f32 => dotF32Row(row, input),
+        .f16 => dotF16Row(row, input),
+        .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
+        .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
+    };
+}
+
 fn dotF32Row(row: []const u8, input: []const f32) f32 {
-    var sum: f32 = 0;
-    for (input, 0..) |value, index| sum += readF32(row[index * 4 ..][0..4]) * value;
+    var acc = zeroSimd();
+    var index: usize = 0;
+    while (index + simd_lane_count <= input.len) : (index += simd_lane_count) {
+        acc += loadF32Vec(row[index * 4 ..][0 .. simd_lane_count * 4]) * loadInputVec(input, index);
+    }
+
+    var sum = reduceVec(acc);
+    while (index < input.len) : (index += 1) {
+        sum += readF32(row[index * 4 ..][0..4]) * input[index];
+    }
     return sum;
 }
 
 fn dotF16Row(row: []const u8, input: []const f32) f32 {
-    var sum: f32 = 0;
-    for (input, 0..) |value, index| sum += readF16AsF32(row[index * 2 ..][0..2]) * value;
+    var acc = zeroSimd();
+    var index: usize = 0;
+    while (index + simd_lane_count <= input.len) : (index += simd_lane_count) {
+        acc += loadF16Vec(row[index * 2 ..][0 .. simd_lane_count * 2]) * loadInputVec(input, index);
+    }
+
+    var sum = reduceVec(acc);
+    while (index < input.len) : (index += 1) {
+        sum += readF16AsF32(row[index * 2 ..][0..2]) * input[index];
+    }
     return sum;
 }
 
@@ -1139,9 +1175,47 @@ fn silu(value: f32) f32 {
     return value / (1 + @exp(-value));
 }
 
+const F32x = @Vector(simd_lane_count, f32);
+
+fn zeroSimd() F32x {
+    return @splat(0);
+}
+
+fn reduceVec(value: F32x) f32 {
+    return @reduce(.Add, value);
+}
+
+fn loadInputVec(values: []const f32, index: usize) F32x {
+    return @as(F32x, @bitCast(values[index..][0..simd_lane_count].*));
+}
+
+fn loadF32Vec(bytes: []const u8) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        values[lane] = readF32(bytes[lane * 4 ..][0..4]);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadF16Vec(bytes: []const u8) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        values[lane] = readF16AsF32(bytes[lane * 2 ..][0..2]);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
 fn dot(a: []const f32, b: []const f32) f32 {
-    var sum: f32 = 0;
-    for (a, b) |lhs, rhs| sum += lhs * rhs;
+    var acc = zeroSimd();
+    var index: usize = 0;
+    while (index + simd_lane_count <= a.len) : (index += simd_lane_count) {
+        acc += loadInputVec(a, index) * loadInputVec(b, index);
+    }
+
+    var sum = reduceVec(acc);
+    while (index < a.len) : (index += 1) {
+        sum += a[index] * b[index];
+    }
     return sum;
 }
 
