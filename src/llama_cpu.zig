@@ -1,4 +1,5 @@
 const std = @import("std");
+const terminal = @import("terminal.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -515,6 +516,10 @@ pub fn generate(
     _ = seed;
 
     const startup_begin = std.time.nanoTimestamp();
+    var spinner = terminal.Spinner{};
+    try spinner.start();
+    errdefer spinner.stop();
+
     var model = try loadModel(allocator, model_path);
     defer model.deinit(allocator);
 
@@ -522,6 +527,7 @@ pub fn generate(
     var session = try Session.init(allocator, &model, @min(model.context_length, prompt_capacity));
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
+    spinner.stop();
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, session.token_buffer);

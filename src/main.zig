@@ -24,4 +24,5 @@ test {
     std.testing.refAllDecls(@import("llama_cpu.zig"));
     std.testing.refAllDecls(@import("gguf.zig"));
     std.testing.refAllDecls(@import("server.zig"));
+    std.testing.refAllDecls(@import("terminal.zig"));
 }

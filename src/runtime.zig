@@ -1,6 +1,7 @@
 const std = @import("std");
 const gguf = @import("gguf.zig");
 const llama_cpu = @import("llama_cpu.zig");
+const terminal = @import("terminal.zig");
 
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
@@ -363,6 +364,10 @@ pub fn generate(allocator: std.mem.Allocator, model_path: []const u8, prompt: []
     if (!std.mem.eql(u8, report.architecture, native_architecture)) return error.UnsupportedArchitecture;
 
     const startup_begin = std.time.nanoTimestamp();
+    var spinner = terminal.Spinner{};
+    try spinner.start();
+    errdefer spinner.stop();
+
     var model = try loadModel(allocator, model_path);
     defer model.deinit(allocator);
 
@@ -371,6 +376,7 @@ pub fn generate(allocator: std.mem.Allocator, model_path: []const u8, prompt: []
     defer session.deinit(allocator);
 
     const startup_end = std.time.nanoTimestamp();
+    spinner.stop();
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(prompt, session.token_buffer);
@@ -421,6 +427,7 @@ pub fn runCommand(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_pa
         \\temperature: {d:.3}
         \\startup_ms: {d:.3}
         \\prompt_ms: {d:.3}
+        \\tps: {d:.3}
         \\decode_tok_s: {d:.3}
         \\
     ,
@@ -432,6 +439,7 @@ pub fn runCommand(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_pa
             report.temperature,
             nsToMs(report.startup_ns),
             nsToMs(report.prompt_ns),
+            report.decodeTokensPerSecond(),
             report.decodeTokensPerSecond(),
         },
     );
@@ -447,6 +455,7 @@ pub fn benchCommand(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_
         \\decode_ns={d}
         \\prompt_tokens={d}
         \\generated_tokens={d}
+        \\tps={d:.3}
         \\decode_tok_s={d:.3}
         \\
     ,
@@ -456,6 +465,7 @@ pub fn benchCommand(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_
             report.decode_ns,
             report.prompt_token_count,
             report.generated_token_count,
+            report.decodeTokensPerSecond(),
             report.decodeTokensPerSecond(),
         },
     );
