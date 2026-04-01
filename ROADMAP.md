@@ -16,21 +16,21 @@ If a task turns out to be too large, split it into smaller checklist items rathe
 
 ## v0.1.0 Foundations
 
-- [ ] Finalize project name, binary name, and repo description
-- [ ] Decide initial license and add `LICENSE`
-- [ ] Create initial `build.zig.zon` if external dependencies become necessary
-- [ ] Create `src/` module layout for CLI, GGUF parsing, backend, runtime, and server
-- [ ] Keep the executable buildable with `zig build`
-- [ ] Keep the test suite runnable with `zig build test`
-- [ ] Add a `version` subcommand or `--version` output
-- [ ] Add a `help` output that documents the intended command surface
-- [ ] Define initial error-handling conventions for CLI and library code
-- [ ] Document repository scope and non-goals in `README.md`
-- [ ] Document milestone status and work sequencing in this roadmap
+- [x] Finalize project name, binary name, and repo description
+- [x] Decide initial license and add `LICENSE`
+- [x] Create initial `build.zig.zon` if external dependencies become necessary
+- [x] Create `src/` module layout for CLI, GGUF parsing, backend, runtime, and server
+- [x] Keep the executable buildable with `zig build`
+- [x] Keep the test suite runnable with `zig build test`
+- [x] Add a `version` subcommand or `--version` output
+- [x] Add a `help` output that documents the intended command surface
+- [x] Define initial error-handling conventions for CLI and library code
+- [x] Document repository scope and non-goals in `README.md`
+- [x] Document milestone status and work sequencing in this roadmap
 
 Definition of done for v0.1.0:
 
-- [ ] A new contributor can clone the repo, run `zig build`, run the CLI, and understand what the project is trying to become
+- [x] A new contributor can clone the repo, run `zig build`, run the CLI, and understand what the project is trying to become
 
 ## v0.2.0 GGUF Inspection
 

@@ -1,8 +1,8 @@
 # ziggy-llm
 
-Mac-first, Zig-native GGUF inference for Apple Silicon.
+A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal support.
 
-`ziggy-llm` is a deliberately narrow local LLM runtime:
+`ziggy-llm` is a deliberately narrow local LLM inference engine:
 
 - Apple Silicon first
 - Metal first
@@ -21,9 +21,18 @@ Today, the codebase provides:
 
 - a working Zig build
 - a CLI skeleton for the core commands
+- a module layout for CLI, commands, runtime, GGUF, and server code
 - project docs, scope, and roadmap
 
 The actual GGUF loading, Metal backend, and inference path are not implemented yet.
+
+## Repo Description
+
+Suggested short repo description:
+
+> A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal support
+
+Yes, "inference engine" is the right term here. It is accurate, concise, and strong enough for a public repository description without overclaiming.
 
 ## Why This Exists
 
@@ -175,7 +184,7 @@ Initial implementation order:
 
 Prerequisite:
 
-- Zig 0.14+ or newer
+- Zig 0.15.2 or newer
 
 Build:
 
@@ -205,6 +214,15 @@ zig build test
 
 - [PROJECT_OUTLINE.md](/Users/alessioleodori/HelloWorld/zig_/PROJECT_OUTLINE.md)
 - [ROADMAP.md](/Users/alessioleodori/HelloWorld/zig_/ROADMAP.md)
+
+## Error Handling Conventions
+
+Early scaffold conventions:
+
+- CLI parsing returns explicit errors for unknown commands, unknown flags, missing values, and invalid ports
+- command handlers print scaffold status instead of pretending unimplemented features already exist
+- unsupported functionality should fail clearly and specifically rather than silently degrade
+- initialization-time failures and runtime hot-path behavior should stay conceptually separate as the engine grows
 
 ## Success Criteria
 
@@ -239,4 +257,4 @@ Community success:
 
 ## License
 
-TBD
+Apache-2.0

@@ -1,0 +1,16 @@
+.{
+    .name = .ziggy_llm,
+    .version = "0.1.0",
+    .fingerprint = 0xcbea3dbce6a298d8,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+        "ROADMAP.md",
+        "PROJECT_OUTLINE.md",
+    },
+}
