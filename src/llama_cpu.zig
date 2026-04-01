@@ -1193,8 +1193,25 @@ fn dotQ4KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
             const d2 = d * @as(f32, @floatFromInt(sm1.scale));
             const m2 = dmin * @as(f32, @floatFromInt(sm1.min));
 
-            for (0..32) |l| sum += (d1 * @as(f32, @floatFromInt(q[l] & 0x0F)) - m1) * input[input_offset + l];
-            for (0..32) |l| sum += (d2 * @as(f32, @floatFromInt(q[l] >> 4)) - m2) * input[input_offset + 32 + l];
+            var low_q_dot: f32 = 0;
+            var low_input_sum: f32 = 0;
+            var high_q_dot: f32 = 0;
+            var high_input_sum: f32 = 0;
+
+            var l: usize = 0;
+            while (l < 32) : (l += simd_lane_count) {
+                const q_chunk = q[l..][0..simd_lane_count];
+                const input_low = loadInputVec(input, input_offset + l);
+                const input_high = loadInputVec(input, input_offset + 32 + l);
+
+                low_q_dot += reduceVec(loadQ4LowVec(q_chunk) * input_low);
+                low_input_sum += reduceVec(input_low);
+                high_q_dot += reduceVec(loadQ4HighVec(q_chunk) * input_high);
+                high_input_sum += reduceVec(input_high);
+            }
+
+            sum += d1 * low_q_dot - m1 * low_input_sum;
+            sum += d2 * high_q_dot - m2 * high_input_sum;
             input_offset += 64;
             q = q[32..];
             scale_index += 2;
@@ -1361,6 +1378,22 @@ fn loadF16Vec(bytes: []const u8) F32x {
     var values: [simd_lane_count]f32 = undefined;
     for (0..simd_lane_count) |lane| {
         values[lane] = readF16AsF32(bytes[lane * 2 ..][0..2]);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ4LowVec(bytes: []const u8) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        values[lane] = @floatFromInt(bytes[lane] & 0x0F);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ4HighVec(bytes: []const u8) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        values[lane] = @floatFromInt(bytes[lane] >> 4);
     }
     return @as(F32x, @bitCast(values));
 }
