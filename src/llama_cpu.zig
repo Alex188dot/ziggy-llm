@@ -1272,20 +1272,30 @@ fn dotQ6KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
         var sc_half = scales;
         var half: usize = 0;
         while (half < 2) : (half += 1) {
-            for (0..32) |l| {
-                const is = l / 16;
-                const s0 = @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[is + 0]))));
-                const s2 = @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[is + 2]))));
-                const s4 = @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[is + 4]))));
-                const s6 = @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[is + 6]))));
-                const q1 = (@as(i32, ql_half[l + 0] & 0x0F) | (@as(i32, (qh_half[l] >> 0) & 0x03) << 4)) - 32;
-                const q2 = (@as(i32, ql_half[l + 32] & 0x0F) | (@as(i32, (qh_half[l] >> 2) & 0x03) << 4)) - 32;
-                const q3 = (@as(i32, ql_half[l + 0] >> 4) | (@as(i32, (qh_half[l] >> 4) & 0x03) << 4)) - 32;
-                const q4 = (@as(i32, ql_half[l + 32] >> 4) | (@as(i32, (qh_half[l] >> 6) & 0x03) << 4)) - 32;
-                sum += d * s0 * @as(f32, @floatFromInt(q1)) * input[input_offset + l + 0];
-                sum += d * s2 * @as(f32, @floatFromInt(q2)) * input[input_offset + l + 32];
-                sum += d * s4 * @as(f32, @floatFromInt(q3)) * input[input_offset + l + 64];
-                sum += d * s6 * @as(f32, @floatFromInt(q4)) * input[input_offset + l + 96];
+            for (0..2) |group16| {
+                const l0 = group16 * 16;
+                const s0 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[group16 + 0]))));
+                const s2 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[group16 + 2]))));
+                const s4 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[group16 + 4]))));
+                const s6 = d * @as(f32, @floatFromInt(@as(i8, @bitCast(sc_half[group16 + 6]))));
+
+                var q1_dot: f32 = 0;
+                var q2_dot: f32 = 0;
+                var q3_dot: f32 = 0;
+                var q4_dot: f32 = 0;
+
+                for (0..2) |sub| {
+                    const base = l0 + sub * simd_lane_count;
+                    q1_dot += reduceVec(loadQ6Q1Vec(ql_half, qh_half, base) * loadInputVec(input, input_offset + base + 0));
+                    q2_dot += reduceVec(loadQ6Q2Vec(ql_half, qh_half, base) * loadInputVec(input, input_offset + base + 32));
+                    q3_dot += reduceVec(loadQ6Q3Vec(ql_half, qh_half, base) * loadInputVec(input, input_offset + base + 64));
+                    q4_dot += reduceVec(loadQ6Q4Vec(ql_half, qh_half, base) * loadInputVec(input, input_offset + base + 96));
+                }
+
+                sum += s0 * q1_dot;
+                sum += s2 * q2_dot;
+                sum += s4 * q3_dot;
+                sum += s6 * q4_dot;
             }
             input_offset += 128;
             ql_half = ql_half[64..];
@@ -1394,6 +1404,46 @@ fn loadQ4HighVec(bytes: []const u8) F32x {
     var values: [simd_lane_count]f32 = undefined;
     for (0..simd_lane_count) |lane| {
         values[lane] = @floatFromInt(bytes[lane] >> 4);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ6Q1Vec(ql: []const u8, qh: []const u8, base: usize) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        const idx = base + lane;
+        const q = (@as(i32, ql[idx] & 0x0F) | (@as(i32, (qh[idx] >> 0) & 0x03) << 4)) - 32;
+        values[lane] = @floatFromInt(q);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ6Q2Vec(ql: []const u8, qh: []const u8, base: usize) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        const idx = base + lane;
+        const q = (@as(i32, ql[idx + 32] & 0x0F) | (@as(i32, (qh[idx] >> 2) & 0x03) << 4)) - 32;
+        values[lane] = @floatFromInt(q);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ6Q3Vec(ql: []const u8, qh: []const u8, base: usize) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        const idx = base + lane;
+        const q = (@as(i32, ql[idx] >> 4) | (@as(i32, (qh[idx] >> 4) & 0x03) << 4)) - 32;
+        values[lane] = @floatFromInt(q);
+    }
+    return @as(F32x, @bitCast(values));
+}
+
+fn loadQ6Q4Vec(ql: []const u8, qh: []const u8, base: usize) F32x {
+    var values: [simd_lane_count]f32 = undefined;
+    for (0..simd_lane_count) |lane| {
+        const idx = base + lane;
+        const q = (@as(i32, ql[idx + 32] >> 4) | (@as(i32, (qh[idx] >> 6) & 0x03) << 4)) - 32;
+        values[lane] = @floatFromInt(q);
     }
     return @as(F32x, @bitCast(values));
 }
