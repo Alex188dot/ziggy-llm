@@ -34,20 +34,20 @@ Definition of done for v0.1.0:
 
 ## v0.2.0 GGUF Inspection
 
-- [ ] Define the exact GGUF versions and metadata fields the project will support first
-- [ ] Implement GGUF header parsing
-- [ ] Implement tensor metadata parsing
-- [ ] Implement key/value metadata parsing
-- [ ] Implement clear unsupported-model detection
-- [ ] Add `inspect` output for architecture, tensor count, quantization, and tokenizer metadata
-- [ ] Add validation for missing or malformed tensor metadata
-- [ ] Add tests for valid GGUF fixtures
-- [ ] Add tests for invalid and truncated GGUF fixtures
-- [ ] Document supported and unsupported GGUF expectations in `README.md`
+- [x] Define the exact GGUF versions and metadata fields the project will support first
+- [x] Implement GGUF header parsing
+- [x] Implement tensor metadata parsing
+- [x] Implement key/value metadata parsing
+- [x] Implement clear unsupported-model detection
+- [x] Add `inspect` output for architecture, tensor count, quantization, and tokenizer metadata
+- [x] Add validation for missing or malformed tensor metadata
+- [x] Add tests for valid GGUF fixtures
+- [x] Add tests for invalid and truncated GGUF fixtures
+- [x] Document supported and unsupported GGUF expectations in `README.md`
 
 Definition of done for v0.2.0:
 
-- [ ] `ziggy-llm inspect -m model.gguf` produces useful output on supported fixtures and fails clearly on unsupported ones
+- [x] `ziggy-llm inspect -m model.gguf` produces useful output on supported fixtures and fails clearly on unsupported ones
 
 ## v0.3.0 CPU Correctness Path
 

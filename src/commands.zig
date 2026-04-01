@@ -12,7 +12,7 @@ pub fn dispatch(writer: *std.Io.Writer, config: cli.Config) !void {
         .run => try printRuntimeStub(writer, "run", config),
         .chat => try printRuntimeStub(writer, "chat", config),
         .bench => try printRuntimeStub(writer, "bench", config),
-        .inspect => try printInspectStub(writer, config),
+        .inspect => try printInspect(writer, config),
         .serve => try printServerStub(writer, config),
     }
 }
@@ -43,26 +43,14 @@ fn printRuntimeStub(writer: *std.Io.Writer, name: []const u8, config: cli.Config
     );
 }
 
-fn printInspectStub(writer: *std.Io.Writer, config: cli.Config) !void {
-    const summary = gguf.inspectSummary(config.model_path);
-    try writer.print(
-        \\[inspect] scaffold command
-        \\version: {s}
-        \\model: {s}
-        \\gguf_status: {s}
-        \\supported_versions: {s}
-        \\
-        \\{s}
-        \\
-    ,
-        .{
-            build_options.version,
-            config.model_path orelse "<unset>",
-            summary.status,
-            gguf.supported_versions,
-            summary.message,
-        },
-    );
+fn printInspect(writer: *std.Io.Writer, config: cli.Config) !void {
+    const model_path = config.model_path orelse return error.MissingModelPath;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const report = try gguf.inspectFile(arena.allocator(), model_path);
+    try gguf.printInspectReport(writer, model_path, report);
 }
 
 fn printServerStub(writer: *std.Io.Writer, config: cli.Config) !void {

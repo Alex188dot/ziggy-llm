@@ -69,6 +69,10 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.command = .help;
             return config;
         }
+        if (config.command == .inspect and config.model_path == null and arg.len > 0 and arg[0] != '-') {
+            config.model_path = arg;
+            continue;
+        }
 
         return error.UnknownFlag;
     }
@@ -126,6 +130,12 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
 
 test "known command parsing works" {
     const config = try parseArgs(&.{ "ziggy-llm", "inspect", "-m", "demo.gguf" });
+    try std.testing.expectEqual(Command.inspect, config.command);
+    try std.testing.expectEqualStrings("demo.gguf", config.model_path.?);
+}
+
+test "inspect accepts positional model path" {
+    const config = try parseArgs(&.{ "ziggy-llm", "inspect", "demo.gguf" });
     try std.testing.expectEqual(Command.inspect, config.command);
     try std.testing.expectEqualStrings("demo.gguf", config.model_path.?);
 }

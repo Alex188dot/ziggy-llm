@@ -15,16 +15,17 @@ The project is not trying to be Zig vLLM or a broad Ollama replacement. The goal
 
 ## Status
 
-This repository is in the initial scaffold stage.
+This repository is in the early GGUF inspection stage.
 
 Today, the codebase provides:
 
 - a working Zig build
-- a CLI skeleton for the core commands
+- a CLI surface for the core commands
+- a working `inspect` command for GGUF metadata and tensor-table validation
 - a module layout for CLI, commands, runtime, GGUF, and server code
 - project docs, scope, and roadmap
 
-The actual GGUF loading, Metal backend, and inference path are not implemented yet.
+The runtime, Metal backend, and inference path are not implemented yet.
 
 ## Repo Description
 
@@ -131,7 +132,7 @@ ziggy-llm bench -m /path/to/model.gguf
 ziggy-llm serve -m /path/to/model.gguf --port 8080
 ```
 
-Current scaffold:
+Current commands:
 
 ```bash
 zig build run
@@ -139,7 +140,37 @@ zig build run -- inspect -m /path/to/model.gguf
 zig build run -- serve -m /path/to/model.gguf --port 8080
 ```
 
-At the moment, the commands are placeholders that print intent and build configuration. They exist to establish the command shape before the engine implementation lands.
+Right now, `inspect` is implemented for GGUF validation and metadata summary. The runtime commands are still placeholders that print intent and build configuration.
+
+## GGUF Support
+
+`ziggy-llm inspect` currently supports:
+
+- GGUF `v2` and `v3`
+- little-endian files only
+- `general.type=model` artifacts
+- required `general.architecture` metadata
+- standard inspection fields from `general.*` and `tokenizer.ggml.*`
+- tensor-table validation for name, dimension count, dimension sizes, tensor type, alignment, and data extents
+
+The current inspect output reports:
+
+- architecture
+- tensor count
+- metadata count
+- file alignment
+- GGUF file-type quantization when present
+- dominant tensor type across the tensor table
+- tokenizer model and pre-tokenizer metadata when present
+- tokenizer token count and common special-token ids when present
+
+Unsupported or rejected today:
+
+- GGUF versions other than `v2` and `v3`
+- big-endian GGUF files
+- non-model artifacts such as adapters or auxiliary blobs
+- malformed tensor metadata
+- truncated metadata or tensor payloads
 
 ## Planned HTTP API
 
