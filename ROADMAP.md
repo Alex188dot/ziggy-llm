@@ -51,23 +51,23 @@ Definition of done for v0.2.0:
 
 ## v0.3.0 CPU Correctness Path
 
-- [ ] Choose the first supported model architecture for end-to-end implementation
-- [ ] Define the exact supported model family and quantization matrix for the first runtime path
-- [ ] Implement tensor loading for the first supported architecture
-- [ ] Implement tokenizer loading strategy for the first supported architecture
-- [ ] Implement prompt tokenization on the CPU path
-- [ ] Implement KV cache layout for the CPU reference path
-- [ ] Implement a minimal forward pass for prompt processing
-- [ ] Implement a minimal decode loop for one-token-at-a-time generation
-- [ ] Implement deterministic sampling with seed control
-- [ ] Add basic generation smoke tests
-- [ ] Add golden-output or reference-behavior tests where realistic
-- [ ] Separate initialization allocations from steady-state inference allocations
-- [ ] Add instrumentation for startup time, prompt processing time, and tok/s
+- [x] Choose the first supported model architecture for end-to-end implementation
+- [x] Define the exact supported model family and quantization matrix for the first runtime path
+- [x] Implement tensor loading for the first supported architecture
+- [x] Implement tokenizer loading strategy for the first supported architecture
+- [x] Implement prompt tokenization on the CPU path
+- [x] Implement KV cache layout for the CPU reference path
+- [x] Implement a minimal forward pass for prompt processing
+- [x] Implement a minimal decode loop for one-token-at-a-time generation
+- [x] Implement deterministic sampling with seed control
+- [x] Add basic generation smoke tests
+- [x] Add golden-output or reference-behavior tests where realistic
+- [x] Separate initialization allocations from steady-state inference allocations
+- [x] Add instrumentation for startup time, prompt processing time, and tok/s
 
 Definition of done for v0.3.0:
 
-- [ ] A small supported model can run end to end on CPU with deterministic, testable behavior
+- [x] A small supported model can run end to end on CPU with deterministic, testable behavior
 
 ## v0.4.0 Apple Silicon Runtime
 

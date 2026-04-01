@@ -17,6 +17,9 @@ pub const Config = struct {
     model_path: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     port: u16 = server.default_port,
+    max_tokens: usize = 16,
+    seed: u64 = 0,
+    temperature: f32 = 0,
 };
 
 pub const ParseError = error{
@@ -24,6 +27,9 @@ pub const ParseError = error{
     UnknownFlag,
     MissingFlagValue,
     InvalidPort,
+    InvalidMaxTokens,
+    InvalidSeed,
+    InvalidTemperature,
 };
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
@@ -63,6 +69,24 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config.port = std.fmt.parseUnsigned(u16, args[i], 10) catch return error.InvalidPort;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--max-tokens")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.max_tokens = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--seed")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.seed = std.fmt.parseUnsigned(u64, args[i], 10) catch return error.InvalidSeed;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--temperature")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.temperature = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -110,23 +134,32 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\Options:
         \\  -m, --model <path>    Path to a GGUF model
         \\  -p, --prompt <text>   Prompt text for one-shot generation
+        \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
+        \\      --seed <n>        Seed for deterministic sampling (default: {d})
+        \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
         \\  Metal enabled by default on macOS/aarch64: {s}
         \\
         \\Status:
-        \\  This is the initial scaffold. The command surface is in place,
-        \\  but the GGUF runtime and Metal backend are not implemented yet.
+        \\  Native CPU correctness path is available for ziggy-tiny fixtures.
+        \\  LLaMA-family GGUF execution uses the native CPU runtime.
+        \\  Metal acceleration and the broader native runtime are still in progress.
         \\
     ,
         .{
             build_options.version,
+            configDefaults.max_tokens,
+            configDefaults.seed,
+            configDefaults.temperature,
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
     );
 }
+
+const configDefaults = Config{};
 
 test "known command parsing works" {
     const config = try parseArgs(&.{ "ziggy-llm", "inspect", "-m", "demo.gguf" });
@@ -143,4 +176,11 @@ test "inspect accepts positional model path" {
 test "version flag parsing works" {
     const config = try parseArgs(&.{ "ziggy-llm", "--version" });
     try std.testing.expectEqual(Command.version, config.command);
+}
+
+test "runtime flags parse correctly" {
+    const config = try parseArgs(&.{ "ziggy-llm", "run", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--seed", "9", "--temperature", "0.5" });
+    try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
+    try std.testing.expectEqual(@as(u64, 9), config.seed);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.temperature, 0.0001);
 }

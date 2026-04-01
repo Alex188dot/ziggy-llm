@@ -5,13 +5,13 @@ const gguf = @import("gguf.zig");
 const server = @import("server.zig");
 const build_options = @import("build_options");
 
-pub fn dispatch(writer: *std.Io.Writer, config: cli.Config) !void {
+pub fn dispatch(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !void {
     switch (config.command) {
         .help => try cli.printHelp(writer),
         .version => try writer.print("ziggy-llm {s}\n", .{build_options.version}),
-        .run => try printRuntimeStub(writer, "run", config),
+        .run => try runModel(writer, allocator, config),
         .chat => try printRuntimeStub(writer, "chat", config),
-        .bench => try printRuntimeStub(writer, "bench", config),
+        .bench => try benchModel(writer, allocator, config),
         .inspect => try printInspect(writer, config),
         .serve => try printServerStub(writer, config),
     }
@@ -26,6 +26,8 @@ fn printRuntimeStub(writer: *std.Io.Writer, name: []const u8, config: cli.Config
         \\metal_enabled: {s}
         \\model: {s}
         \\prompt: {s}
+        \\supported_cpu_architecture: {s}
+        \\supported_quantization: {s}
         \\
         \\{s}
         \\
@@ -38,9 +40,33 @@ fn printRuntimeStub(writer: *std.Io.Writer, name: []const u8, config: cli.Config
             if (build_options.enable_metal) "yes" else "no",
             config.model_path orelse "<unset>",
             config.prompt orelse "<unset>",
-            runtime.scaffold_status,
+            runtime.supported_architecture,
+            runtime.supported_quantization,
+            "Interactive chat is still scaffold-only. Use `run` or `bench` with a ziggy-tiny fixture or a native llama-family GGUF model for the current implemented paths.",
         },
     );
+}
+
+fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !void {
+    const model_path = config.model_path orelse return error.MissingModelPath;
+    const prompt = config.prompt orelse return error.MissingPrompt;
+
+    try runtime.runCommand(writer, allocator, model_path, prompt, .{
+        .max_tokens = config.max_tokens,
+        .seed = config.seed,
+        .temperature = config.temperature,
+    });
+}
+
+fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !void {
+    const model_path = config.model_path orelse return error.MissingModelPath;
+    const prompt = config.prompt orelse return error.MissingPrompt;
+
+    try runtime.benchCommand(writer, allocator, model_path, prompt, .{
+        .max_tokens = config.max_tokens,
+        .seed = config.seed,
+        .temperature = config.temperature,
+    });
 }
 
 fn printInspect(writer: *std.Io.Writer, config: cli.Config) !void {
@@ -69,7 +95,7 @@ fn printServerStub(writer: *std.Io.Writer, config: cli.Config) !void {
             config.port,
             server.api_surface,
             server.compatibility_note,
-            runtime.scaffold_status,
+            "The HTTP surface is still scaffold-only. The current implemented path is local CPU generation through `run` and `bench`.",
         },
     );
 }

@@ -15,17 +15,20 @@ The project is not trying to be Zig vLLM or a broad Ollama replacement. The goal
 
 ## Status
 
-This repository is in the early GGUF inspection stage.
+This repository is in the first CPU correctness stage.
 
 Today, the codebase provides:
 
 - a working Zig build
 - a CLI surface for the core commands
 - a working `inspect` command for GGUF metadata and tensor-table validation
+- a narrow native CPU reference runtime for `ziggy-tiny` GGUF fixtures
+- a native CPU `llama` GGUF runtime in Zig
+- deterministic `run` and `bench` execution with seed and timing output
 - a module layout for CLI, commands, runtime, GGUF, and server code
 - project docs, scope, and roadmap
 
-The runtime, Metal backend, and inference path are not implemented yet.
+Metal acceleration, interactive chat, and the HTTP server are not implemented yet.
 
 ## Repo Description
 
@@ -137,10 +140,12 @@ Current commands:
 ```bash
 zig build run
 zig build run -- inspect -m /path/to/model.gguf
+zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
+zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
 zig build run -- serve -m /path/to/model.gguf --port 8080
 ```
 
-Right now, `inspect` is implemented for GGUF validation and metadata summary. The runtime commands are still placeholders that print intent and build configuration.
+Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
 
 ## GGUF Support
 
@@ -172,6 +177,26 @@ Unsupported or rejected today:
 - malformed tensor metadata
 - truncated metadata or tensor payloads
 
+## CPU Reference Path
+
+The first implemented runtime path is intentionally narrow:
+
+- architecture: `ziggy-tiny`
+- model family: small GGUF reference fixtures used for CPU validation
+- quantization: `F16` tensors only with `general.file_type=1`
+- tokenizer source: `tokenizer.ggml.tokens`
+- runtime surface: `run` and `bench`
+
+This path exists to make prompt processing, decode behavior, seeded sampling, and timing instrumentation testable before the Metal backend lands.
+
+There is also a pragmatic real-model path:
+
+- architecture: `llama`
+- tokenizer: native `llama` tokenizer path with GGUF vocab, scores, and byte fallback
+- forward pass: native CPU-only incremental decode with RMSNorm, RoPE, GQA attention, SiLU-gated FFN, and KV cache
+- currently implemented tensor types: `F32`, `F16`, `Q4_K`, and `Q6_K`
+- intended use: real TinyLlama/LLaMA-family GGUF execution without `ollama` or `llama.cpp`
+
 ## Planned HTTP API
 
 The server should stay small.
@@ -195,7 +220,12 @@ Core technical choices:
 - a narrow backend abstraction centered on actual inference hot paths
 - reproducible benchmark workflows
 
-Initial quantization target set:
+Current implemented quantization support:
+
+- `F16` for `ziggy-tiny`
+- `F32`, `F16`, `Q4_K`, and `Q6_K` for the native `llama` CPU path
+
+Planned broader quantization target set after the reference path stabilizes:
 
 - `Q4_K_M`
 - `Q5_K_M`
@@ -229,10 +259,10 @@ Run the CLI scaffold:
 zig build run
 ```
 
-Run a stub subcommand:
+Run an implemented CPU reference command:
 
 ```bash
-zig build run -- inspect -m /path/to/model.gguf
+zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
 ```
 
 Run tests:
@@ -281,7 +311,7 @@ Community success:
 
 - finish the repo scaffold
 - implement GGUF inspection and validation
-- build a CPU correctness path
+- broaden the CPU correctness path beyond `ziggy-tiny`
 - wire the Metal backend
 - add a minimal OpenAI-compatible server
 - publish honest M3 benchmark results
