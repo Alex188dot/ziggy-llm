@@ -197,6 +197,78 @@ The document itself should instruct future implementers to validate each item wi
 - focused correctness checks for dense matvec, quantized matvec, attention, and any new fused or residency-specific paths
 - context-length-sensitive attention benchmarks so short-context wins do not mask long-context regressions
 
+## Benchmark Snapshot
+
+This is the current benchmark to preserve as a documented baseline.
+
+### Benchmark As Of 02 Apr 2026, 2:50 PM CEST
+
+- Machine context: primary Apple Silicon benchmark machine
+- Backend: `metal`
+- Model: `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`
+- Prompt: `Write one short paragraph about Zig.`
+- Prompt tokens: `20`
+- Generated tokens: `128`
+- Seed: `42`
+- Temperature: `0.700`
+- Startup: `8302.766 ms`
+- Prompt processing: `852.521 ms`
+- TTFT: `9263.437 ms`
+- Decode throughput: `35.827 TPS`
+
+Canonical command:
+
+```bash
+cd /absolute/path/to/ziggy-llm
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/ziggy-llm run \
+  --model /absolute/path/to/ziggy-llm/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --prompt "Write one short paragraph about Zig." \
+  --backend metal \
+  --max-tokens 128 \
+  --temperature 0.7 \
+  --seed 42
+```
+
+Example invocation with anonymized shell prompt:
+
+```bash
+user@machine ziggy-llm % cd /absolute/path/to/ziggy-llm
+user@machine ziggy-llm % zig build -Doptimize=ReleaseFast
+user@machine ziggy-llm % ./zig-out/bin/ziggy-llm run \
+  --model /absolute/path/to/ziggy-llm/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --prompt "Write one short paragraph about Zig." \
+  --backend metal \
+  --max-tokens 128 \
+  --temperature 0.7 \
+  --seed 42
+
+backend: metal
+generated_text:
+
+1. Zig Ziglar was an American motivational speaker, author, and television personality.
+
+2. Zig was born on August 15, 1926, in Chicago, Illinois.
+
+3. He was the son of a Polish immigrant who worked as a janitor.
+
+4. Zig's father instilled in him the value of hard work and perseverance.
+
+5. Zig's mother was a homemaker who instilled in him the importance of family and community.
+
+6. Zig attended public school
+prompt_tokens: 20
+generated_tokens: 128
+seed: 42
+temperature: 0.700
+startup_ms: 8302.766
+prompt_ms: 852.521
+ttft_ms: 9263.437
+tps: 35.827
+decode_tok_s: 35.827
+user@machine ziggy-llm %
+```
+
 ## Assumptions And Defaults
 
 - The file lives at the repo root as `INFERENCE.md`.
