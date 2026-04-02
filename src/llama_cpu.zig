@@ -1268,6 +1268,24 @@ pub fn eosTokenId(model: *const Model) ?u32 {
     return model.tokenizer.eos_token_id;
 }
 
+pub fn appendDecodedToken(model: *const Model, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
+    try model.tokenizer.appendDecodedToken(output, allocator, token_id);
+}
+
+pub fn tokenizersMatch(a: *const Model, b: *const Model) bool {
+    if (a.tokenizer.tokens.len != b.tokenizer.tokens.len) return false;
+    if (a.tokenizer.bos_token_id != b.tokenizer.bos_token_id) return false;
+    if (a.tokenizer.eos_token_id != b.tokenizer.eos_token_id) return false;
+    if (a.tokenizer.unk_token_id != b.tokenizer.unk_token_id) return false;
+    if (a.tokenizer.pad_token_id != b.tokenizer.pad_token_id) return false;
+    if (a.tokenizer.add_bos_token != b.tokenizer.add_bos_token) return false;
+    if (a.tokenizer.add_eos_token != b.tokenizer.add_eos_token) return false;
+    for (a.tokenizer.tokens, b.tokenizer.tokens) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs, rhs)) return false;
+    }
+    return true;
+}
+
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;

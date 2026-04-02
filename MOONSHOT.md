@@ -33,6 +33,14 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 
 - [x] Keep speculative decoding scoped to a narrow llama-first path.
 - [x] Build decode-first benchmarks for acceptance rate, verifier overhead, and throughput.
+- [x] Thread a real llama-first draft-model speculative decode path into `run` and `bench`.
+- [ ] Build a true low-overhead verifier that checks multiple draft tokens in one target pass instead of stepping token-by-token. This is the biggest missing TPS lever.
+  - [ ] Eliminate mismatch resync replay by keeping reusable branchable KV/cache snapshots per round.
+  - [ ] Add a smaller/faster dedicated draft model strategy instead of same-class target/draft pairings.
+  - [ ] Make speculative draft width adaptive from observed acceptance rate instead of fixed N.
+  - [ ] Move the verifier onto the fused llama-first Metal path and specialize it for accepted-span verification.
+  - [ ] Add a proper bonus-token path only once verifier work for K accepted tokens can yield K+1 cheaply.
+  - [ ] Keep profiling verifier overhead and acceptance together; acceptance without cheap verification will not move TPS enough.
 - [ ] Implement low-overhead verification on top of the strong base runtime.
 - [ ] Validate single-user local inference before any serving-oriented work.
 

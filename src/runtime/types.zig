@@ -33,6 +33,9 @@ pub const RuntimeError = error{
     MetalCompilationFailed,
     MetalBufferError,
     MetalExecutionFailed,
+    UnsupportedSpeculativeSampling,
+    InvalidSpeculativeConfig,
+    SpeculativeDraftTokenizerMismatch,
 };
 
 pub const BackendPreference = enum {
@@ -97,6 +100,16 @@ pub const GenerationOptions = struct {
     backend: BackendPreference = .auto,
     moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
+    speculative: SpeculativeConfig = .{},
+};
+
+pub const SpeculativeConfig = struct {
+    draft_model_path: ?[]const u8 = null,
+    draft_tokens: usize = 4,
+
+    pub fn enabled(self: SpeculativeConfig) bool {
+        return self.draft_model_path != null;
+    }
 };
 
 pub const StartupBreakdown = struct {
@@ -121,6 +134,7 @@ pub const GenerationReport = struct {
     temperature: f32,
     backend: BackendUsed,
     startup_breakdown: StartupBreakdown = .{},
+    speculative: ?SpeculativeStats = null,
     metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *GenerationReport, allocator: std.mem.Allocator) void {
@@ -132,6 +146,23 @@ pub const GenerationReport = struct {
     pub fn decodeTokensPerSecond(self: GenerationReport) f64 {
         if (self.generated_token_count == 0 or self.decode_ns == 0) return 0;
         return @as(f64, @floatFromInt(self.generated_token_count)) / (@as(f64, @floatFromInt(self.decode_ns)) / std.time.ns_per_s);
+    }
+};
+
+pub const SpeculativeStats = struct {
+    draft_tokens: usize,
+    rounds: usize,
+    accepted_tokens: usize,
+    rejected_tokens: usize,
+    draft_decode_ns: u64,
+    verifier_decode_ns: u64,
+    resync_count: usize = 0,
+
+    pub fn acceptanceRate(self: SpeculativeStats) f64 {
+        const attempts = self.accepted_tokens + self.rejected_tokens;
+        if (attempts == 0) return 0;
+        return @as(f64, @floatFromInt(self.accepted_tokens)) /
+            @as(f64, @floatFromInt(attempts));
     }
 };
 

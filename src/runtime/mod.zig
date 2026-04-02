@@ -14,6 +14,8 @@ pub const RuntimeError = types.RuntimeError;
 pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;
 pub const MoonQuantMode = types.MoonQuantMode;
+pub const SpeculativeConfig = types.SpeculativeConfig;
+pub const SpeculativeStats = types.SpeculativeStats;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationReport = types.GenerationReport;
 pub const BenchSummary = bench_runner.BenchSummary;
@@ -94,6 +96,21 @@ pub fn runCommand(
     );
     if (report.metal_profile_summary) |summary| {
         try writer.print("metal_profile:\n{s}", .{summary});
+    }
+    if (report.speculative) |stats| {
+        try writer.print(
+            "speculative.draft_tokens: {d}\nspeculative.rounds: {d}\nspeculative.accepted_tokens: {d}\nspeculative.rejected_tokens: {d}\nspeculative.acceptance_rate: {d:.3}\nspeculative.draft_decode_ms: {d:.3}\nspeculative.verifier_decode_ms: {d:.3}\nspeculative.resync_count: {d}\n",
+            .{
+                stats.draft_tokens,
+                stats.rounds,
+                stats.accepted_tokens,
+                stats.rejected_tokens,
+                stats.acceptanceRate(),
+                nsToMs(stats.draft_decode_ns),
+                nsToMs(stats.verifier_decode_ns),
+                stats.resync_count,
+            },
+        );
     }
 }
 
@@ -178,6 +195,36 @@ pub fn benchCommand(
         if (summary.cold.metal_profile_summary) |summary_text| {
             try writer.print("cold.metal_profile:\n{s}", .{summary_text});
         }
+        if (summary.cold.speculative) |stats| {
+            try writer.print(
+                "cold.speculative.draft_tokens={d}\ncold.speculative.rounds={d}\ncold.speculative.accepted_tokens={d}\ncold.speculative.rejected_tokens={d}\ncold.speculative.acceptance_rate={d:.3}\ncold.speculative.draft_decode_ms={d:.3}\ncold.speculative.verifier_decode_ms={d:.3}\ncold.speculative.resync_count={d}\n",
+                .{
+                    stats.draft_tokens,
+                    stats.rounds,
+                    stats.accepted_tokens,
+                    stats.rejected_tokens,
+                    stats.acceptanceRate(),
+                    nsToMs(stats.draft_decode_ns),
+                    nsToMs(stats.verifier_decode_ns),
+                    stats.resync_count,
+                },
+            );
+        }
+        if (summary.warm_speculative_avg) |stats| {
+            try writer.print(
+                "warm.speculative.draft_tokens_avg={d}\nwarm.speculative.rounds_avg={d}\nwarm.speculative.accepted_tokens_avg={d}\nwarm.speculative.rejected_tokens_avg={d}\nwarm.speculative.acceptance_rate_avg={d:.3}\nwarm.speculative.draft_decode_ms_avg={d:.3}\nwarm.speculative.verifier_decode_ms_avg={d:.3}\nwarm.speculative.resync_count_avg={d}\n",
+                .{
+                    stats.draft_tokens,
+                    stats.rounds,
+                    stats.accepted_tokens,
+                    stats.rejected_tokens,
+                    stats.acceptanceRate(),
+                    nsToMs(stats.draft_decode_ns),
+                    nsToMs(stats.verifier_decode_ns),
+                    stats.resync_count,
+                },
+            );
+        }
         return;
     }
 
@@ -230,5 +277,20 @@ pub fn benchCommand(
     );
     if (report.metal_profile_summary) |summary| {
         try writer.print("{s}", .{summary});
+    }
+    if (report.speculative) |stats| {
+        try writer.print(
+            "speculative.draft_tokens={d}\nspeculative.rounds={d}\nspeculative.accepted_tokens={d}\nspeculative.rejected_tokens={d}\nspeculative.acceptance_rate={d:.3}\nspeculative.draft_decode_ms={d:.3}\nspeculative.verifier_decode_ms={d:.3}\nspeculative.resync_count={d}\n",
+            .{
+                stats.draft_tokens,
+                stats.rounds,
+                stats.accepted_tokens,
+                stats.rejected_tokens,
+                stats.acceptanceRate(),
+                nsToMs(stats.draft_decode_ns),
+                nsToMs(stats.verifier_decode_ns),
+                stats.resync_count,
+            },
+        );
     }
 }

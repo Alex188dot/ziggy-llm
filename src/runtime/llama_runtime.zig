@@ -1,6 +1,7 @@
 const std = @import("std");
 const llama_loaded_runtime = @import("llama_loaded_runtime.zig");
 const llama_fixture = @import("llama_fixture.zig");
+const llama_speculative_runtime = @import("llama_speculative_runtime.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
 
@@ -12,6 +13,19 @@ pub fn generate(
 ) !types.GenerationReport {
     var runtime = try llama_loaded_runtime.LoadedRuntime.init(allocator, model_path, options.backend, options.moon_quant, options.metal_profile);
     defer runtime.deinit();
+    if (options.speculative.enabled()) {
+        const draft_model_path = options.speculative.draft_model_path orelse return error.InvalidSpeculativeConfig;
+        var draft_runtime = try llama_loaded_runtime.LoadedRuntime.init(allocator, draft_model_path, options.backend, options.moon_quant, false);
+        defer draft_runtime.deinit();
+        return llama_speculative_runtime.generateWithDraftRuntime(
+            allocator,
+            &runtime,
+            &draft_runtime,
+            prompt,
+            options,
+            llama_speculative_runtime.coldStartupBreakdown(&runtime, &draft_runtime),
+        );
+    }
     var report = try runtime.generate(prompt, options, runtime.model_load_ns);
     report.startup_breakdown.model_load_ns = runtime.model_load_ns;
     return report;

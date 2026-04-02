@@ -29,6 +29,8 @@ pub const Config = struct {
     backend: runtime.BackendPreference = .auto,
     moon_quant: runtime.MoonQuantMode = .enabled,
     metal_profile: bool = false,
+    spec_draft_model_path: ?[]const u8 = null,
+    spec_draft_tokens: usize = 4,
 };
 
 pub const ParseError = error{
@@ -44,6 +46,7 @@ pub const ParseError = error{
     InvalidMinP,
     InvalidBackend,
     InvalidMoonQuant,
+    InvalidSpecDraftTokens,
 };
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
@@ -152,6 +155,19 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.metal_profile = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--spec-draft-model")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.spec_draft_model_path = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--spec-draft-tokens")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.spec_draft_tokens = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidSpecDraftTokens;
+            if (config.spec_draft_tokens == 0) return error.InvalidSpecDraftTokens;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -207,6 +223,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --min-p <f>       Sampling filter: drop tokens below min_p * top token prob (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
+        \\      --spec-draft-model <path>  Optional llama draft model for greedy speculative decoding
+        \\      --spec-draft-tokens <n>    Draft width per speculative round (default: {d})
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
         \\      --port <port>     Port for server mode (default: {d})
         \\
@@ -230,6 +248,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.min_p,
             configDefaults.backend.label(),
             configDefaults.moon_quant.label(),
+            configDefaults.spec_draft_tokens,
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
@@ -256,7 +275,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--spec-draft-model", "draft.gguf", "--spec-draft-tokens", "6", "--metal-profile" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
@@ -267,5 +286,7 @@ test "runtime flags parse correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), config.min_p, 0.0001);
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
     try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
+    try std.testing.expectEqualStrings("draft.gguf", config.spec_draft_model_path.?);
+    try std.testing.expectEqual(@as(usize, 6), config.spec_draft_tokens);
     try std.testing.expect(config.metal_profile);
 }
