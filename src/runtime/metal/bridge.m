@@ -8,7 +8,11 @@
 @interface ZiggyMetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
-@property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> ropePipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> attentionScoresPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> attentionValuesPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
 @end
 
 @implementation ZiggyMetalState
@@ -40,6 +44,59 @@ static ZiggyMetalBufferState *ziggy_buffer(ZiggyMetalBuffer *buffer) {
 
 static const ZiggyMetalBufferState *ziggy_const_buffer(const ZiggyMetalBuffer *buffer) {
     return (__bridge ZiggyMetalBufferState *)buffer;
+}
+
+static id<MTLComputePipelineState> ziggy_pipeline(
+    id<MTLDevice> device,
+    id<MTLLibrary> library,
+    NSString *name,
+    NSError **error
+) {
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    if (function == nil) return nil;
+    return [device newComputePipelineStateWithFunction:function error:error];
+}
+
+static int ziggy_run_compute(
+    ZiggyMetalState *state,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger grid_width,
+    void (^encode)(id<MTLComputeCommandEncoder> encoder),
+    char *error_message,
+    size_t error_message_len
+) {
+    id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
+    if (command_buffer == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    [encoder setComputePipelineState:pipeline];
+    encode(encoder);
+
+    NSUInteger thread_width = pipeline.threadExecutionWidth;
+    if (thread_width == 0) thread_width = 1;
+    NSUInteger threads_per_group = thread_width < grid_width ? thread_width : grid_width;
+    if (threads_per_group == 0) threads_per_group = 1;
+    MTLSize grid_size = MTLSizeMake(grid_width, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+    [encoder endEncoding];
+
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+    return ZIGGY_METAL_OK;
 }
 
 int ziggy_metal_create_context(
@@ -75,12 +132,6 @@ int ziggy_metal_create_context(
             return ZIGGY_METAL_COMPILATION_FAILED;
         }
 
-        id<MTLFunction> function = [library newFunctionWithName:@"matvec_f32"];
-        if (function == nil) {
-            ziggy_write_error(error_message, error_message_len, @"missing matvec_f32 Metal function");
-            return ZIGGY_METAL_COMPILATION_FAILED;
-        }
-
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (queue == nil) {
             ziggy_write_error(error_message, error_message_len, @"failed to create Metal command queue");
@@ -88,16 +139,44 @@ int ziggy_metal_create_context(
         }
 
         NSError *pipeline_error = nil;
-        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&pipeline_error];
-        if (pipeline == nil) {
-            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal pipeline");
+        id<MTLComputePipelineState> matvec_pipeline = ziggy_pipeline(device, library, @"matvec_f32", &pipeline_error);
+        if (matvec_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal matvec pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> rope_pipeline = ziggy_pipeline(device, library, @"apply_rope_f32", &pipeline_error);
+        if (rope_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal rope pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> attention_scores_pipeline = ziggy_pipeline(device, library, @"attention_scores_f32", &pipeline_error);
+        if (attention_scores_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal attention-scores pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> attention_values_pipeline = ziggy_pipeline(device, library, @"attention_values_f32", &pipeline_error);
+        if (attention_values_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal attention-values pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> silu_mul_pipeline = ziggy_pipeline(device, library, @"silu_mul_f32", &pipeline_error);
+        if (silu_mul_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal silu pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
 
         ZiggyMetalState *state = [ZiggyMetalState new];
         state.device = device;
         state.queue = queue;
-        state.pipeline = pipeline;
+        state.matvecPipeline = matvec_pipeline;
+        state.ropePipeline = rope_pipeline;
+        state.attentionScoresPipeline = attention_scores_pipeline;
+        state.attentionValuesPipeline = attention_values_pipeline;
+        state.siluMulPipeline = silu_mul_pipeline;
         *out_ctx = (__bridge_retained void *)state;
 
         if (out_info != NULL) {
@@ -251,46 +330,239 @@ int ziggy_metal_run_matvec_f32(
 
     @autoreleasepool {
         ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
+        return ziggy_run_compute(
+            state,
+            state.matvecPipeline,
+            rows,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+                [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_copy_buffer_region(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    size_t src_offset,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset,
+    size_t length,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || src == NULL || dst == NULL || length == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal buffer copy request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *src_buffer = ziggy_const_buffer(src);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+        if (src_offset + length > src_buffer.length || dst_offset + length > dst_buffer.length) {
+            ziggy_write_error(error_message, error_message_len, @"Metal buffer copy exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
         id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
         if (command_buffer == nil) {
             ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
         if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal blit encoder");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
 
-        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
-        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
-        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-
-        [encoder setComputePipelineState:state.pipeline];
-        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
-        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-
-        NSUInteger thread_width = state.pipeline.threadExecutionWidth;
-        if (thread_width == 0) thread_width = 1;
-        NSUInteger threads_per_group = thread_width < rows ? thread_width : rows;
-        if (threads_per_group == 0) threads_per_group = 1;
-
-        MTLSize grid_size = MTLSizeMake(rows, 1, 1);
-        MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
-        [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+        [encoder copyFromBuffer:src_buffer.buffer sourceOffset:src_offset toBuffer:dst_buffer.buffer destinationOffset:dst_offset size:length];
         [encoder endEncoding];
-
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal buffer copy failed");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_apply_rope_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *vector,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || vector == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal rope request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    const uint32_t pair_count = (rope_dim < head_dim ? rope_dim : head_dim) / 2;
+    if (pair_count == 0) return ZIGGY_METAL_OK;
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *buffer = ziggy_buffer(vector);
+        return ziggy_run_compute(
+            state,
+            state.ropePipeline,
+            head_count * pair_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:buffer.buffer offset:0 atIndex:0];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:1];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:2];
+                [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:3];
+                [encoder setBytes:&position length:sizeof(position) atIndex:4];
+                [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:5];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_attention_scores_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *q,
+    const ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *scores,
+    uint32_t head_count,
+    uint32_t head_count_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    uint32_t context_length,
+    uint32_t position,
+    uint32_t layer_base,
+    float scale,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || q == NULL || k_cache == NULL || scores == NULL || head_count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal attention-scores request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *q_buffer = ziggy_const_buffer(q);
+        const ZiggyMetalBufferState *k_buffer = ziggy_const_buffer(k_cache);
+        ZiggyMetalBufferState *scores_buffer = ziggy_buffer(scores);
+        return ziggy_run_compute(
+            state,
+            state.attentionScoresPipeline,
+            head_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:q_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:k_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:scores_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_count_kv length:sizeof(head_count_kv) atIndex:4];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:5];
+                [encoder setBytes:&kv_dim length:sizeof(kv_dim) atIndex:6];
+                [encoder setBytes:&context_length length:sizeof(context_length) atIndex:7];
+                [encoder setBytes:&position length:sizeof(position) atIndex:8];
+                [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:9];
+                [encoder setBytes:&scale length:sizeof(scale) atIndex:10];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_attention_values_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *scores,
+    const ZiggyMetalBuffer *v_cache,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_count_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    uint32_t context_length,
+    uint32_t position,
+    uint32_t layer_base,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || scores == NULL || v_cache == NULL || output == NULL || head_count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal attention-values request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *scores_buffer = ziggy_const_buffer(scores);
+        const ZiggyMetalBufferState *v_buffer = ziggy_const_buffer(v_cache);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
+        return ziggy_run_compute(
+            state,
+            state.attentionValuesPipeline,
+            head_count * head_dim,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:scores_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:v_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_count_kv length:sizeof(head_count_kv) atIndex:4];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:5];
+                [encoder setBytes:&kv_dim length:sizeof(kv_dim) atIndex:6];
+                [encoder setBytes:&context_length length:sizeof(context_length) atIndex:7];
+                [encoder setBytes:&position length:sizeof(position) atIndex:8];
+                [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:9];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_silu_mul_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || gate == NULL || up == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal silu request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *gate_buffer = ziggy_buffer(gate);
+        const ZiggyMetalBufferState *up_buffer = ziggy_const_buffer(up);
+        return ziggy_run_compute(
+            state,
+            state.siluMulPipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:up_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
     }
 }

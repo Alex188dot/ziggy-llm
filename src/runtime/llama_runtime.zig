@@ -34,6 +34,7 @@ pub fn generate(
         llama_cpu.DenseTensorLookup{
             .ctx = dense_tensors,
             .get_fn = lookupDenseTensor,
+            .get_by_offset_fn = lookupDenseTensorByOffset,
         }
     else
         null;
@@ -99,6 +100,11 @@ fn createMetalExecution(allocator: std.mem.Allocator, model: *const llama_cpu.Mo
 fn lookupDenseTensor(ctx: ?*const anyopaque, tensor: llama_cpu.TensorRef) ?[]const f32 {
     const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
     return dense_tensors.get(tensor);
+}
+
+fn lookupDenseTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const f32 {
+    const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
+    return dense_tensors.getByOffset(offset);
 }
 
 fn isRecoverableMetalError(err: anyerror) bool {

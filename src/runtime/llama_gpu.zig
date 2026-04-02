@@ -1,0 +1,226 @@
+const std = @import("std");
+const backend_api = @import("backend.zig");
+const metal_backend = @import("metal_backend.zig");
+
+pub const DenseLookup = struct {
+    ctx: ?*const anyopaque,
+    get_fn: *const fn (?*const anyopaque, u64) ?[]const f32,
+
+    pub fn get(self: DenseLookup, offset: u64) ?[]const f32 {
+        return self.get_fn(self.ctx, offset);
+    }
+};
+
+pub const TensorDesc = struct {
+    offset: u64,
+    rows: usize,
+    cols: usize,
+};
+
+pub const LayerDesc = struct {
+    attn_q: TensorDesc,
+    attn_k: TensorDesc,
+    attn_v: TensorDesc,
+    attn_output: TensorDesc,
+    ffn_gate: TensorDesc,
+    ffn_down: TensorDesc,
+    ffn_up: TensorDesc,
+};
+
+pub const ModelDesc = struct {
+    embedding_length: usize,
+    block_count: usize,
+    context_length: usize,
+    feed_forward_length: usize,
+    rope_dimension_count: usize,
+    head_count: usize,
+    head_count_kv: usize,
+    head_dimension: usize,
+    kv_dimension: usize,
+    rope_freq_base: f32,
+    vocab_size: usize,
+};
+
+pub const Session = struct {
+    backend: backend_api.MatVecBackend,
+    dense_lookup: DenseLookup,
+    model: ModelDesc,
+    input: metal_backend.BufferHandle,
+    q: metal_backend.BufferHandle,
+    k: metal_backend.BufferHandle,
+    v: metal_backend.BufferHandle,
+    attn: metal_backend.BufferHandle,
+    gate: metal_backend.BufferHandle,
+    up: metal_backend.BufferHandle,
+    tmp: metal_backend.BufferHandle,
+    scores: metal_backend.BufferHandle,
+    k_cache: metal_backend.BufferHandle,
+    v_cache: metal_backend.BufferHandle,
+
+    pub fn init(
+        backend: backend_api.MatVecBackend,
+        dense_lookup: DenseLookup,
+        model: ModelDesc,
+    ) !Session {
+        const max_input = @max(model.embedding_length, model.feed_forward_length);
+        const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.vocab_size));
+        const cache_len = model.block_count * model.context_length * model.kv_dimension;
+        const scores_len = model.head_count * model.context_length;
+
+        const input = try metal_backend.createScratchBuffer(backend, max_input);
+        errdefer metal_backend.destroyBuffer(input);
+        const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        errdefer metal_backend.destroyBuffer(q);
+        const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(k);
+        const v = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(v);
+        const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        errdefer metal_backend.destroyBuffer(attn);
+        const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        errdefer metal_backend.destroyBuffer(gate);
+        const up = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        errdefer metal_backend.destroyBuffer(up);
+        const tmp = try metal_backend.createScratchBuffer(backend, max_vec);
+        errdefer metal_backend.destroyBuffer(tmp);
+        const scores = try metal_backend.createScratchBuffer(backend, scores_len);
+        errdefer metal_backend.destroyBuffer(scores);
+        const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
+        errdefer metal_backend.destroyBuffer(k_cache);
+        const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
+        errdefer metal_backend.destroyBuffer(v_cache);
+
+        return .{
+            .backend = backend,
+            .dense_lookup = dense_lookup,
+            .model = model,
+            .input = input,
+            .q = q,
+            .k = k,
+            .v = v,
+            .attn = attn,
+            .gate = gate,
+            .up = up,
+            .tmp = tmp,
+            .scores = scores,
+            .k_cache = k_cache,
+            .v_cache = v_cache,
+        };
+    }
+
+    pub fn deinit(self: *Session) void {
+        metal_backend.destroyBuffer(self.input);
+        metal_backend.destroyBuffer(self.q);
+        metal_backend.destroyBuffer(self.k);
+        metal_backend.destroyBuffer(self.v);
+        metal_backend.destroyBuffer(self.attn);
+        metal_backend.destroyBuffer(self.gate);
+        metal_backend.destroyBuffer(self.up);
+        metal_backend.destroyBuffer(self.tmp);
+        metal_backend.destroyBuffer(self.scores);
+        metal_backend.destroyBuffer(self.k_cache);
+        metal_backend.destroyBuffer(self.v_cache);
+        self.* = undefined;
+    }
+
+    pub fn runAttentionBlock(
+        self: *Session,
+        input: []const f32,
+        layer: LayerDesc,
+        layer_index: usize,
+        position: usize,
+        out: []f32,
+    ) !void {
+        try metal_backend.writeBufferF32(self.input, input);
+        try self.runProjection(layer.attn_q, self.input, self.q);
+        try self.runProjection(layer.attn_k, self.input, self.k);
+        try self.runProjection(layer.attn_v, self.input, self.v);
+
+        try metal_backend.applyRoPE(
+            self.backend,
+            self.q,
+            self.model.head_count,
+            self.model.head_dimension,
+            self.model.rope_dimension_count,
+            position,
+            self.model.rope_freq_base,
+        );
+        try metal_backend.applyRoPE(
+            self.backend,
+            self.k,
+            self.model.head_count_kv,
+            self.model.head_dimension,
+            self.model.rope_dimension_count,
+            position,
+            self.model.rope_freq_base,
+        );
+
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
+        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
+        try metal_backend.copyBufferRegion(self.backend, self.k, 0, self.k_cache, kv_offset, kv_bytes);
+        try metal_backend.copyBufferRegion(self.backend, self.v, 0, self.v_cache, kv_offset, kv_bytes);
+
+        try metal_backend.attentionScores(
+            self.backend,
+            self.q,
+            self.k_cache,
+            self.scores,
+            self.model.head_count,
+            self.model.head_count_kv,
+            self.model.head_dimension,
+            self.model.kv_dimension,
+            self.model.context_length,
+            position,
+            layer_base,
+            @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
+        );
+        try metal_backend.attentionValues(
+            self.backend,
+            self.scores,
+            self.v_cache,
+            self.attn,
+            self.model.head_count,
+            self.model.head_count_kv,
+            self.model.head_dimension,
+            self.model.kv_dimension,
+            self.model.context_length,
+            position,
+            layer_base,
+        );
+        try self.runProjection(layer.attn_output, self.attn, self.tmp);
+        try metal_backend.readBufferF32(self.tmp, out);
+    }
+
+    pub fn runFfnBlock(self: *Session, input: []const f32, layer: LayerDesc, out: []f32) !void {
+        try metal_backend.writeBufferF32(self.input, input);
+        try self.runProjection(layer.ffn_gate, self.input, self.gate);
+        try self.runProjection(layer.ffn_up, self.input, self.up);
+        try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+        try self.runProjection(layer.ffn_down, self.gate, self.tmp);
+        try metal_backend.readBufferF32(self.tmp, out);
+    }
+
+    pub fn runOutput(self: *Session, input: []const f32, tensor: TensorDesc, out: []f32) !void {
+        try metal_backend.writeBufferF32(self.input, input);
+        try self.runProjection(tensor, self.input, self.tmp);
+        try metal_backend.readBufferF32(self.tmp, out);
+    }
+
+    fn runProjection(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+    ) !void {
+        const matrix = self.dense_lookup.get(tensor.offset) orelse return error.InvalidTensorMetadata;
+        try metal_backend.runMatVecToBuffer(
+            self.backend,
+            matrix,
+            input,
+            output,
+            tensor.rows,
+            tensor.cols,
+        );
+    }
+};

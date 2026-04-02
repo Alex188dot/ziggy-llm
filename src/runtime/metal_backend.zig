@@ -226,6 +226,136 @@ pub fn runMatVecToBuffer(
     ));
 }
 
+pub fn copyBufferRegion(
+    backend: backend_api.MatVecBackend,
+    src: BufferHandle,
+    src_offset_bytes: usize,
+    dst: BufferHandle,
+    dst_offset_bytes: usize,
+    length_bytes: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_copy_buffer_region(
+        state.context,
+        src.raw,
+        src_offset_bytes,
+        dst.raw,
+        dst_offset_bytes,
+        length_bytes,
+        null,
+        0,
+    ));
+}
+
+pub fn applyRoPE(
+    backend: backend_api.MatVecBackend,
+    vector: BufferHandle,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_apply_rope_f32(
+        state.context,
+        vector.raw,
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        null,
+        0,
+    ));
+}
+
+pub fn attentionScores(
+    backend: backend_api.MatVecBackend,
+    q: BufferHandle,
+    k_cache: BufferHandle,
+    scores: BufferHandle,
+    head_count: usize,
+    head_count_kv: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    context_length: usize,
+    position: usize,
+    layer_base: usize,
+    scale: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_attention_scores_f32(
+        state.context,
+        q.raw,
+        k_cache.raw,
+        scores.raw,
+        @intCast(head_count),
+        @intCast(head_count_kv),
+        @intCast(head_dim),
+        @intCast(kv_dim),
+        @intCast(context_length),
+        @intCast(position),
+        @intCast(layer_base),
+        scale,
+        null,
+        0,
+    ));
+}
+
+pub fn attentionValues(
+    backend: backend_api.MatVecBackend,
+    scores: BufferHandle,
+    v_cache: BufferHandle,
+    output: BufferHandle,
+    head_count: usize,
+    head_count_kv: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    context_length: usize,
+    position: usize,
+    layer_base: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_attention_values_f32(
+        state.context,
+        scores.raw,
+        v_cache.raw,
+        output.raw,
+        @intCast(head_count),
+        @intCast(head_count_kv),
+        @intCast(head_dim),
+        @intCast(kv_dim),
+        @intCast(context_length),
+        @intCast(position),
+        @intCast(layer_base),
+        null,
+        0,
+    ));
+}
+
+pub fn siluMul(
+    backend: backend_api.MatVecBackend,
+    gate: BufferHandle,
+    up: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_silu_mul_f32(
+        state.context,
+        gate.raw,
+        up.raw,
+        @intCast(count),
+        null,
+        0,
+    ));
+}
+
 fn metalMatVec(
     ctx: ?*anyopaque,
     out: []f32,

@@ -1,7 +1,7 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
 const backend_api = @import("runtime/backend.zig");
-const metal_backend = @import("runtime/metal_backend.zig");
+const llama_gpu = @import("runtime/llama_gpu.zig");
 const runtime_types = @import("runtime/types.zig");
 
 pub const GenerateError = error{
@@ -43,9 +43,14 @@ pub const GenerateReport = struct {
 pub const DenseTensorLookup = struct {
     ctx: ?*const anyopaque,
     get_fn: *const fn (?*const anyopaque, TensorRef) ?[]const f32,
+    get_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const f32,
 
     pub fn get(self: DenseTensorLookup, tensor: TensorRef) ?[]const f32 {
         return self.get_fn(self.ctx, tensor);
+    }
+
+    pub fn getByOffset(self: DenseTensorLookup, offset: u64) ?[]const f32 {
+        return self.get_by_offset_fn(self.ctx, offset);
     }
 };
 
@@ -397,7 +402,7 @@ const Session = struct {
     model: *const Model,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
-    metal_scratch: ?MetalScratch = null,
+    gpu_session: ?llama_gpu.Session = null,
     token_buffer: []u32,
     hidden: []f32,
     normed: []f32,
@@ -445,7 +450,8 @@ const Session = struct {
 
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
-                session.metal_scratch = try MetalScratch.init(selected_backend, model);
+                const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model));
             }
         }
 
@@ -461,7 +467,7 @@ const Session = struct {
     }
 
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
-        if (self.metal_scratch) |*metal_scratch| metal_scratch.deinit();
+        if (self.gpu_session) |*gpu_session| gpu_session.deinit();
         if (self.matvec_workers) |workers| {
             workers.deinit(allocator);
             allocator.destroy(workers);
@@ -494,78 +500,45 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
-            if (try self.tryMetalTripleMatVec(self.normed, self.q, layer.attn_q, self.k, layer.attn_k, self.v, layer.attn_v)) |_| {
-                // handled by the Metal scratch path
+            if (self.gpu_session) |*gpu_session| {
+                try gpu_session.runAttentionBlock(self.normed, adaptLayerDesc(layer), layer_index, self.position, self.attn_tmp);
+                addInPlace(self.hidden, self.attn_tmp);
             } else {
                 try self.matVec(self.q, layer.attn_q, self.normed);
                 try self.matVec(self.k, layer.attn_k, self.normed);
                 try self.matVec(self.v, layer.attn_v, self.normed);
+                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
+                self.storeKv(layer_index);
+                self.computeAttention(layer_index);
+                try self.matVec(self.attn_tmp, layer.attn_output, self.attn_out);
+                addInPlace(self.hidden, self.attn_tmp);
             }
-            applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
-            applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
-            self.storeKv(layer_index);
-            self.computeAttention(layer_index);
-            try self.matVec(self.attn_tmp, layer.attn_output, self.attn_out);
-            addInPlace(self.hidden, self.attn_tmp);
 
             try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
-            if (try self.tryMetalDualMatVec(self.normed, self.gate, layer.ffn_gate, self.up, layer.ffn_up)) |_| {
-                // handled by the Metal scratch path
+            if (self.gpu_session) |*gpu_session| {
+                try gpu_session.runFfnBlock(self.normed, adaptLayerDesc(layer), self.attn_tmp);
             } else {
                 try self.matVec(self.gate, layer.ffn_gate, self.normed);
                 try self.matVec(self.up, layer.ffn_up, self.normed);
+                for (self.gate, self.up) |*gate, up| {
+                    gate.* = silu(gate.*) * up;
+                }
+                try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
             }
-            for (self.gate, self.up) |*gate, up| {
-                gate.* = silu(gate.*) * up;
-            }
-            try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
             addInPlace(self.hidden, self.attn_tmp);
         }
 
         try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-        try self.matVec(self.logits, self.model.output, self.normed);
+        if (self.gpu_session) |*gpu_session| {
+            try gpu_session.runOutput(self.normed, adaptTensorDesc(self.model.output), self.logits);
+        } else {
+            try self.matVec(self.logits, self.model.output, self.normed);
+        }
 
         self.token_buffer[self.position] = token_id;
         self.position += 1;
         return self.logits;
-    }
-
-    fn tryMetalDualMatVec(
-        self: *Session,
-        input: []const f32,
-        out_a: []f32,
-        tensor_a: TensorRef,
-        out_b: []f32,
-        tensor_b: TensorRef,
-    ) !?void {
-        const scratch = if (self.metal_scratch) |*scratch| scratch else return null;
-        try scratch.uploadInput(input);
-        try scratch.runProjection(self, tensor_a, scratch.output_a);
-        try scratch.runProjection(self, tensor_b, scratch.output_b);
-        try scratch.readOutput(scratch.output_a, out_a);
-        try scratch.readOutput(scratch.output_b, out_b);
-        return {};
-    }
-
-    fn tryMetalTripleMatVec(
-        self: *Session,
-        input: []const f32,
-        out_a: []f32,
-        tensor_a: TensorRef,
-        out_b: []f32,
-        tensor_b: TensorRef,
-        out_c: []f32,
-        tensor_c: TensorRef,
-    ) !?void {
-        const scratch = if (self.metal_scratch) |*scratch| scratch else return null;
-        try scratch.uploadInput(input);
-        try scratch.runProjection(self, tensor_a, scratch.output_a);
-        try scratch.runProjection(self, tensor_b, scratch.output_b);
-        try scratch.runProjection(self, tensor_c, scratch.output_c);
-        try scratch.readOutput(scratch.output_a, out_a);
-        try scratch.readOutput(scratch.output_b, out_b);
-        try scratch.readOutput(scratch.output_c, out_c);
-        return {};
     }
 
     fn storeKv(self: *Session, layer_index: usize) void {
@@ -646,68 +619,48 @@ const Session = struct {
     }
 };
 
-const MetalScratch = struct {
-    backend: backend_api.MatVecBackend,
-    input: metal_backend.BufferHandle,
-    output_a: metal_backend.BufferHandle,
-    output_b: metal_backend.BufferHandle,
-    output_c: metal_backend.BufferHandle,
+fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
+    return .{
+        .ctx = lookup.ctx,
+        .get_fn = lookup.get_by_offset_fn,
+    };
+}
 
-    fn init(backend: backend_api.MatVecBackend, model: *const Model) !MetalScratch {
-        const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.tokenizer.tokens.len));
-        const max_input = @max(model.embedding_length, model.feed_forward_length);
-        const input = try metal_backend.createScratchBuffer(backend, max_input);
-        errdefer metal_backend.destroyBuffer(input);
-        const output_a = try metal_backend.createScratchBuffer(backend, max_vec);
-        errdefer metal_backend.destroyBuffer(output_a);
-        const output_b = try metal_backend.createScratchBuffer(backend, max_vec);
-        errdefer metal_backend.destroyBuffer(output_b);
-        const output_c = try metal_backend.createScratchBuffer(backend, max_vec);
-        errdefer metal_backend.destroyBuffer(output_c);
-        return .{
-            .backend = backend,
-            .input = input,
-            .output_a = output_a,
-            .output_b = output_b,
-            .output_c = output_c,
-        };
-    }
+fn adaptTensorDesc(tensor: TensorRef) llama_gpu.TensorDesc {
+    return .{
+        .offset = tensor.offset,
+        .rows = tensor.rowCount() catch unreachable,
+        .cols = tensor.rowLen() catch unreachable,
+    };
+}
 
-    fn deinit(self: *MetalScratch) void {
-        metal_backend.destroyBuffer(self.input);
-        metal_backend.destroyBuffer(self.output_a);
-        metal_backend.destroyBuffer(self.output_b);
-        metal_backend.destroyBuffer(self.output_c);
-        self.* = undefined;
-    }
+fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
+    return .{
+        .attn_q = adaptTensorDesc(layer.attn_q),
+        .attn_k = adaptTensorDesc(layer.attn_k),
+        .attn_v = adaptTensorDesc(layer.attn_v),
+        .attn_output = adaptTensorDesc(layer.attn_output),
+        .ffn_gate = adaptTensorDesc(layer.ffn_gate),
+        .ffn_down = adaptTensorDesc(layer.ffn_down),
+        .ffn_up = adaptTensorDesc(layer.ffn_up),
+    };
+}
 
-    fn uploadInput(self: *MetalScratch, input: []const f32) !void {
-        try metal_backend.writeBufferF32(self.input, input);
-    }
-
-    fn runProjection(
-        self: *MetalScratch,
-        session: *Session,
-        tensor: TensorRef,
-        output: metal_backend.BufferHandle,
-    ) !void {
-        const dense_tensors = session.dense_tensors orelse return error.InvalidTensorMetadata;
-        const matrix = dense_tensors.get(tensor) orelse return error.InvalidTensorMetadata;
-        try metal_backend.runMatVecToBuffer(
-            self.backend,
-            matrix,
-            self.input,
-            output,
-            try tensor.rowCount(),
-            try tensor.rowLen(),
-        );
-    }
-
-    fn readOutput(self: *MetalScratch, output: metal_backend.BufferHandle, out: []f32) !void {
-        _ = self;
-        try metal_backend.readBufferF32(output, out);
-    }
-};
+fn adaptModelDesc(model: *const Model) llama_gpu.ModelDesc {
+    return .{
+        .embedding_length = model.embedding_length,
+        .block_count = model.block_count,
+        .context_length = model.context_length,
+        .feed_forward_length = model.feed_forward_length,
+        .rope_dimension_count = model.rope_dimension_count,
+        .head_count = model.head_count,
+        .head_count_kv = model.head_count_kv,
+        .head_dimension = model.head_dimension,
+        .kv_dimension = model.kv_dimension,
+        .rope_freq_base = model.rope_freq_base,
+        .vocab_size = model.tokenizer.tokens.len,
+    };
+}
 
 const MatVecTask = struct {
     out: []f32,

@@ -80,4 +80,69 @@ int ziggy_metal_run_matvec_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_copy_buffer_region(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    size_t src_offset,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset,
+    size_t length,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_apply_rope_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *vector,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_attention_scores_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *q,
+    const ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *scores,
+    uint32_t head_count,
+    uint32_t head_count_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    uint32_t context_length,
+    uint32_t position,
+    uint32_t layer_base,
+    float scale,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_attention_values_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *scores,
+    const ZiggyMetalBuffer *v_cache,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_count_kv,
+    uint32_t head_dim,
+    uint32_t kv_dim,
+    uint32_t context_length,
+    uint32_t position,
+    uint32_t layer_base,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_silu_mul_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif

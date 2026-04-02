@@ -38,6 +38,10 @@ pub const DenseTensorStore = struct {
         return self.tensors.get(tensor.offset);
     }
 
+    pub fn getByOffset(self: *const DenseTensorStore, offset: u64) ?[]const f32 {
+        return self.tensors.get(offset);
+    }
+
     pub fn prewarm(self: *const DenseTensorStore, backend: backend_api.MatVecBackend) !void {
         var iterator = self.tensors.valueIterator();
         while (iterator.next()) |matrix| {
