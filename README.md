@@ -15,7 +15,7 @@ The project is not trying to be Zig vLLM or a broad Ollama replacement. The goal
 
 ## Status
 
-This repository is in the first CPU correctness stage.
+This repository is in the first Apple Silicon runtime stage.
 
 Today, the codebase provides:
 
@@ -23,12 +23,13 @@ Today, the codebase provides:
 - a CLI surface for the core commands
 - a working `inspect` command for GGUF metadata and tensor-table validation
 - a narrow native CPU reference runtime for `ziggy-tiny` GGUF fixtures
+- a narrow Metal matvec runtime for `ziggy-tiny` GGUF fixtures on Apple Silicon
 - a native CPU `llama` GGUF runtime in Zig
-- deterministic `run` and `bench` execution with seed and timing output
-- a module layout for CLI, commands, runtime, GGUF, and server code
+- deterministic `run` and `bench` execution with seed, backend selection, and timing output
+- a smaller runtime module layout for backend dispatch, tiny-model loading, CPU/Metal backends, and fixtures
 - project docs, scope, and roadmap
 
-Metal acceleration, interactive chat, and the HTTP server are not implemented yet.
+Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the first `ziggy-tiny` reference path only.
 
 ## Repo Description
 
@@ -140,12 +141,14 @@ Current commands:
 ```bash
 zig build run
 zig build run -- inspect -m /path/to/model.gguf
-zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
-zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
+zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend auto
+zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend cpu
 zig build run -- serve -m /path/to/model.gguf --port 8080
 ```
 
 Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
+
+`--backend auto` is the default. On Apple Silicon builds with Metal enabled, the `ziggy-tiny` path will use Metal when it can initialize and fall back to CPU otherwise. The `llama` path remains CPU-only for now.
 
 ## GGUF Support
 
@@ -187,7 +190,26 @@ The first implemented runtime path is intentionally narrow:
 - tokenizer source: `tokenizer.ggml.tokens`
 - runtime surface: `run` and `bench`
 
-This path exists to make prompt processing, decode behavior, seeded sampling, and timing instrumentation testable before the Metal backend lands.
+This path exists to make prompt processing, decode behavior, seeded sampling, and timing instrumentation testable before broader Metal coverage lands.
+
+## First Metal Path
+
+The first Metal runtime is intentionally narrow:
+
+- architecture: `ziggy-tiny`
+- accelerated kernel boundary: matrix-vector multiply
+- shader strategy: compile an embedded `.metal` shader source at runtime
+- buffer strategy: upload model matrices once and reuse shared input/output buffers across dispatches
+- fallback behavior: `--backend auto` drops to CPU if Metal is unavailable, disabled at build time, or fails to initialize
+
+This keeps the backend boundary tied to the actual hot path without introducing a large generic tensor abstraction too early.
+
+Current Metal-specific limitations:
+
+- Apple Silicon macOS builds only
+- only the `ziggy-tiny` reference runtime uses Metal today
+- the `llama` runtime is still CPU-only
+- performance notes and benchmark numbers for the M3 target machine are still to be recorded
 
 There is also a pragmatic real-model path:
 

@@ -71,17 +71,17 @@ Definition of done for v0.3.0:
 
 ## v0.4.0 Apple Silicon Runtime
 
-- [ ] Define the first Metal backend boundary and the CPU fallback boundary
-- [ ] Choose the first inference kernels to accelerate on Metal
-- [ ] Implement Metal device discovery and initialization
-- [ ] Implement shader compilation or shader asset loading strategy
-- [ ] Implement Metal buffer management for model tensors and runtime buffers
-- [ ] Implement at least one working Metal compute path for the first supported model
-- [ ] Validate correctness against the CPU reference path
+- [x] Define the first Metal backend boundary and the CPU fallback boundary
+- [x] Choose the first inference kernels to accelerate on Metal
+- [x] Implement Metal device discovery and initialization
+- [x] Implement shader compilation or shader asset loading strategy
+- [x] Implement Metal buffer management for model tensors and runtime buffers
+- [x] Implement at least one working Metal compute path for the first supported model
+- [x] Validate correctness against the CPU reference path
 - [ ] Measure TTFT and tok/s on the M3 MacBook Pro target machine
 - [ ] Profile hot kernels on macOS and record optimization notes
-- [ ] Document Metal-specific assumptions and limitations
-- [ ] Add graceful fallback behavior when Metal is unavailable or disabled
+- [x] Document Metal-specific assumptions and limitations
+- [x] Add graceful fallback behavior when Metal is unavailable or disabled
 
 Definition of done for v0.4.0:
 

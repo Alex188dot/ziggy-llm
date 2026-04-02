@@ -509,7 +509,7 @@ const Session = struct {
 
             for (0..self.position + 1) |token_index| {
                 const k_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
-                const k_head = self.k_cache[k_base ..][0..head_dim];
+                const k_head = self.k_cache[k_base..][0..head_dim];
                 self.scores[token_index] = dot(q_head, k_head) * scale;
             }
             softmaxInPlace(self.scores[0 .. self.position + 1]);
@@ -519,7 +519,7 @@ const Session = struct {
             for (0..self.position + 1) |token_index| {
                 const weight = self.scores[token_index];
                 const v_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
-                const v_head = self.v_cache[v_base ..][0..head_dim];
+                const v_head = self.v_cache[v_base..][0..head_dim];
                 for (out_head, v_head) |*dst, src| {
                     dst.* += weight * src;
                 }

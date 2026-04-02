@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime.zig");
 const server = @import("server.zig");
 const build_options = @import("build_options");
 
@@ -20,6 +21,7 @@ pub const Config = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
     temperature: f32 = 0,
+    backend: runtime.BackendPreference = .auto,
 };
 
 pub const ParseError = error{
@@ -30,6 +32,7 @@ pub const ParseError = error{
     InvalidMaxTokens,
     InvalidSeed,
     InvalidTemperature,
+    InvalidBackend,
 };
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
@@ -89,6 +92,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.temperature = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.backend = runtime.BackendPreference.parse(args[i]) orelse return error.InvalidBackend;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -137,6 +146,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
         \\      --seed <n>        Seed for deterministic sampling (default: {d})
         \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
+        \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -153,6 +163,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.max_tokens,
             configDefaults.seed,
             configDefaults.temperature,
+            configDefaults.backend.label(),
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
@@ -179,8 +190,9 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "run", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--seed", "9", "--temperature", "0.5" });
+    const config = try parseArgs(&.{ "ziggy-llm", "run", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--seed", "9", "--temperature", "0.5", "--backend", "metal" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.temperature, 0.0001);
+    try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
 }
