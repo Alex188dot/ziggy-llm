@@ -60,6 +60,7 @@ pub fn generate(
     return .{
         .generated_text = llama_report.generated_text,
         .prompt_token_count = llama_report.prompt_token_count,
+        .reused_prompt_token_count = llama_report.reused_prompt_token_count,
         .generated_token_count = llama_report.generated_token_count,
         .startup_ns = llama_report.startup_ns,
         .prompt_ns = llama_report.prompt_ns,

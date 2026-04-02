@@ -91,6 +91,7 @@ pub const StartupBreakdown = struct {
 pub const GenerationReport = struct {
     generated_text: []u8,
     prompt_token_count: usize,
+    reused_prompt_token_count: usize = 0,
     generated_token_count: usize,
     startup_ns: u64,
     prompt_ns: u64,

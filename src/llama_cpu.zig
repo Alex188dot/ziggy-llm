@@ -28,6 +28,7 @@ pub const GenerateError = error{
 pub const GenerateReport = struct {
     generated_text: []u8,
     prompt_token_count: usize,
+    reused_prompt_token_count: usize = 0,
     generated_token_count: usize,
     startup_ns: u64,
     prompt_ns: u64,
@@ -406,6 +407,37 @@ pub const Model = struct {
             allocator.free(self.bytes);
         }
         self.* = undefined;
+    }
+};
+
+pub const ReusableSession = struct {
+    session: Session,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        model: *const Model,
+        backend: ?backend_api.MatVecBackend,
+        dense_tensors: ?DenseTensorLookup,
+    ) !ReusableSession {
+        var session = try Session.init(
+                allocator,
+                model,
+                backend,
+                dense_tensors,
+                model.context_length,
+                null,
+            );
+        errdefer session.deinit(allocator);
+        return .{ .session = session };
+    }
+
+    pub fn deinit(self: *ReusableSession, allocator: std.mem.Allocator) void {
+        self.session.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *ReusableSession) void {
+        self.session.position = 0;
     }
 };
 
@@ -894,6 +926,7 @@ pub fn generateLoadedStreaming(
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
         .prompt_token_count = prompt_token_count,
+        .reused_prompt_token_count = 0,
         .generated_token_count = generated_token_count,
         .startup_ns = deltaNs(startup_begin, startup_end),
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
@@ -906,6 +939,115 @@ pub fn generateLoadedStreaming(
         },
         .metal_profile_summary = profile_summary,
     };
+}
+
+pub fn generateLoadedStreamingCached(
+    allocator: std.mem.Allocator,
+    model: *const Model,
+    prompt: []const u8,
+    options: runtime_types.GenerationOptions,
+    backend: ?backend_api.MatVecBackend,
+    _: ?DenseTensorLookup,
+    reusable_session: *ReusableSession,
+    stream_ctx: ?*anyopaque,
+    stream_callback: ?StreamCallback,
+) !GenerateReport {
+    const startup_begin = std.time.nanoTimestamp();
+    var spinner = terminal.Spinner{};
+    try spinner.start();
+    errdefer spinner.stop();
+    var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
+    defer profiler.deinit();
+    var prng = std.Random.DefaultPrng.init(options.seed);
+    const random = prng.random();
+    const startup_end = std.time.nanoTimestamp();
+    spinner.stop();
+
+    const prompt_tokens = try allocator.alloc(u32, model.context_length);
+    defer allocator.free(prompt_tokens);
+
+    const prompt_begin = std.time.nanoTimestamp();
+    const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, prompt_tokens);
+    if (prompt_token_count == 0) return error.EmptyPrompt;
+
+    var session = &reusable_session.session;
+    if (session.model != model) return error.InvalidPrompt;
+
+    const cached_token_count = session.position;
+    const reused_prompt_token_count = commonPrefixLen(
+        session.token_buffer[0..cached_token_count],
+        prompt_tokens[0..prompt_token_count],
+    );
+    if (reused_prompt_token_count != cached_token_count) {
+        reusable_session.reset();
+        session = &reusable_session.session;
+    }
+
+    if (session.position < prompt_token_count) {
+        try session.runPrompt(prompt_tokens[session.position..prompt_token_count]);
+    }
+    const prompt_end = std.time.nanoTimestamp();
+
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    const sample_candidates = try allocator.alloc(SampleCandidate, session.logits.len);
+    defer allocator.free(sample_candidates);
+    var generated_token_count: usize = 0;
+    var ttft_ns = deltaNs(startup_begin, prompt_end);
+    var first_decode_step_ns: u64 = 0;
+
+    const decode_begin = std.time.nanoTimestamp();
+    while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
+        profiler.beginDecodeToken();
+        const sample_begin = std.time.nanoTimestamp();
+        const next_token = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
+        profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+        if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
+            profiler.endDecodeToken();
+            break;
+        }
+        const chunk_start = output.items.len;
+        try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
+        if (stream_callback) |callback| {
+            const chunk = output.items[chunk_start..];
+            if (chunk.len > 0) try callback(stream_ctx, chunk);
+        }
+        if (generated_token_count == 0) {
+            ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
+        }
+        const step_begin = std.time.nanoTimestamp();
+        _ = try session.step(next_token);
+        if (generated_token_count == 0) {
+            first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
+        }
+        profiler.endDecodeToken();
+    }
+    const decode_end = std.time.nanoTimestamp();
+    const profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
+
+    return .{
+        .generated_text = try output.toOwnedSlice(allocator),
+        .prompt_token_count = prompt_token_count,
+        .reused_prompt_token_count = reused_prompt_token_count,
+        .generated_token_count = generated_token_count,
+        .startup_ns = deltaNs(startup_begin, startup_end),
+        .prompt_ns = deltaNs(prompt_begin, prompt_end),
+        .ttft_ns = ttft_ns,
+        .decode_ns = deltaNs(decode_begin, decode_end),
+        .backend = if (backend == null) .cpu else .metal,
+        .startup_breakdown = .{
+            .session_init_ns = 0,
+            .first_decode_step_ns = first_decode_step_ns,
+        },
+        .metal_profile_summary = profile_summary,
+    };
+}
+
+fn commonPrefixLen(lhs: []const u32, rhs: []const u32) usize {
+    const max_len = @min(lhs.len, rhs.len);
+    var index: usize = 0;
+    while (index < max_len and lhs[index] == rhs[index]) : (index += 1) {}
+    return index;
 }
 
 pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {

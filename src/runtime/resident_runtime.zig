@@ -1,5 +1,6 @@
 const std = @import("std");
 const llama_cpu = @import("../llama_cpu.zig");
+const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
 const llama_metal = @import("llama_metal.zig");
 const metal_backend = @import("metal_backend.zig");
@@ -76,16 +77,32 @@ pub const ResidentRuntime = struct {
         else
             null;
 
-        var report = try llama_cpu.generateLoadedStreaming(
-            self.allocator,
-            &loaded.model,
-            prompt,
-            options,
-            loaded.execution.backend,
-            lookup,
-            stream_ctx,
-            stream_callback,
-        );
+        var report = if (options.metal_profile)
+            try llama_cpu.generateLoadedStreaming(
+                self.allocator,
+                &loaded.model,
+                prompt,
+                options,
+                loaded.execution.backend,
+                lookup,
+                stream_ctx,
+                stream_callback,
+            )
+        else
+            llama_cpu.generateLoadedStreamingCached(
+                self.allocator,
+                &loaded.model,
+                prompt,
+                options,
+                loaded.execution.backend,
+                lookup,
+                &loaded.reusable_session,
+                stream_ctx,
+                stream_callback,
+            ) catch |err| {
+                loaded.reusable_session.reset();
+                return err;
+            };
         report.startup_breakdown.model_load_ns = loaded.startup_breakdown.model_load_ns;
         report.startup_breakdown.tensor_prepare_ns = loaded.startup_breakdown.tensor_prepare_ns;
         report.startup_breakdown.backend_init_ns = loaded.startup_breakdown.backend_init_ns;
@@ -119,6 +136,7 @@ pub const ResidentRuntime = struct {
         return .{
             .generated_text = report.generated_text,
             .prompt_token_count = report.prompt_token_count,
+            .reused_prompt_token_count = report.reused_prompt_token_count,
             .generated_token_count = report.generated_token_count,
             .startup_ns = report.startup_ns,
             .prompt_ns = report.prompt_ns,
@@ -152,11 +170,31 @@ pub const ResidentRuntime = struct {
         var execution = try selectExecution(self.allocator, &model, backend_pref);
         errdefer execution.deinit(self.allocator);
 
+        const owned_model_path = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(owned_model_path);
+
+        var reusable_session = try llama_cpu.ReusableSession.init(
+            self.allocator,
+            &model,
+            execution.backend,
+            if (execution.dense_tensors) |*dense_tensors|
+                llama_cpu.DenseTensorLookup{
+                    .ctx = dense_tensors,
+                    .get_fn = lookupDenseTensor,
+                    .get_by_offset_fn = lookupDenseTensorByOffset,
+                    .get_raw_by_offset_fn = lookupRawTensorByOffset,
+                }
+            else
+                null,
+        );
+        errdefer reusable_session.deinit(self.allocator);
+
         self.loaded = .{
-            .model_path = try self.allocator.dupe(u8, model_path),
+            .model_path = owned_model_path,
             .backend_pref = backend_pref,
             .model = model,
             .execution = execution,
+            .reusable_session = reusable_session,
             .last_used_ts = std.time.timestamp(),
             .startup_breakdown = .{
                 .model_load_ns = model_load_ns,
@@ -165,6 +203,22 @@ pub const ResidentRuntime = struct {
                 .metal_prewarm_ns = execution.startup_breakdown.metal_prewarm_ns,
             },
         };
+
+        const loaded = &self.loaded.?;
+        loaded.reusable_session.session.model = &loaded.model;
+        if (loaded.execution.dense_tensors) |*dense_tensors| {
+            loaded.reusable_session.session.dense_tensors = llama_cpu.DenseTensorLookup{
+                .ctx = dense_tensors,
+                .get_fn = lookupDenseTensor,
+                .get_by_offset_fn = lookupDenseTensorByOffset,
+                .get_raw_by_offset_fn = lookupRawTensorByOffset,
+            };
+            if (loaded.reusable_session.session.gpu_session) |*gpu_session| {
+                gpu_session.dense_lookup.ctx = dense_tensors;
+            }
+        } else {
+            loaded.reusable_session.session.dense_tensors = null;
+        }
     }
 };
 
@@ -173,12 +227,14 @@ const LoadedModel = struct {
     backend_pref: types.BackendPreference,
     model: llama_cpu.Model,
     execution: ExecutionResources,
+    reusable_session: llama_cpu.ReusableSession,
     startup_breakdown: types.StartupBreakdown = .{},
     last_used_ts: i64,
     warm: bool = false,
 
     fn deinit(self: *LoadedModel, allocator: std.mem.Allocator) void {
         allocator.free(self.model_path);
+        self.reusable_session.deinit(allocator);
         self.execution.deinit(allocator);
         self.model.deinit(allocator);
         self.* = undefined;
@@ -263,4 +319,42 @@ fn isRecoverableMetalError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "resident runtime reuses cached prompt prefix across turns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaModelFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama-cache.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-cache.gguf");
+    defer std.testing.allocator.free(path);
+
+    var runtime = ResidentRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    runtime.setKeepAliveSeconds(-1);
+
+    var first = try runtime.generate(path, "a", .{
+        .max_tokens = 1,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .cpu,
+    });
+    defer first.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(" b", first.generated_text);
+    try std.testing.expectEqual(@as(usize, 0), first.reused_prompt_token_count);
+
+    var second = try runtime.generate(path, "a b", .{
+        .max_tokens = 2,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .cpu,
+    });
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expect(second.reused_prompt_token_count > 0);
+    try std.testing.expectEqualStrings(" c!", second.generated_text);
 }
