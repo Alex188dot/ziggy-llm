@@ -1,6 +1,6 @@
 const std = @import("std");
 const gguf = @import("../gguf.zig");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_runtime = @import("llama_runtime.zig");
 const tiny_runtime = @import("tiny_runtime.zig");
 const types = @import("types.zig");
 
@@ -29,28 +29,7 @@ pub fn generate(
 
     const report = try gguf.inspectFile(arena.allocator(), model_path);
     if (std.mem.eql(u8, report.architecture, "llama")) {
-        if (options.backend == .metal) return error.UnsupportedBackend;
-
-        const llama_report = try llama_cpu.generate(
-            allocator,
-            model_path,
-            prompt,
-            options.max_tokens,
-            options.seed,
-            options.temperature,
-        );
-        return .{
-            .generated_text = llama_report.generated_text,
-            .prompt_token_count = llama_report.prompt_token_count,
-            .generated_token_count = llama_report.generated_token_count,
-            .startup_ns = llama_report.startup_ns,
-            .prompt_ns = llama_report.prompt_ns,
-            .ttft_ns = llama_report.ttft_ns,
-            .decode_ns = llama_report.decode_ns,
-            .seed = options.seed,
-            .temperature = options.temperature,
-            .backend = .cpu,
-        };
+        return llama_runtime.generate(allocator, model_path, prompt, options);
     }
     if (!std.mem.eql(u8, report.architecture, native_architecture)) return error.UnsupportedArchitecture;
 

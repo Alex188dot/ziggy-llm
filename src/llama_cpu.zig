@@ -1,5 +1,7 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
+const backend_api = @import("runtime/backend.zig");
+const runtime_types = @import("runtime/types.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -29,10 +31,20 @@ pub const GenerateReport = struct {
     prompt_ns: u64,
     ttft_ns: u64,
     decode_ns: u64,
+    backend: runtime_types.BackendUsed,
 
     pub fn deinit(self: *GenerateReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);
         self.* = undefined;
+    }
+};
+
+pub const DenseTensorLookup = struct {
+    ctx: ?*const anyopaque,
+    get_fn: *const fn (?*const anyopaque, TensorRef) ?[]const f32,
+
+    pub fn get(self: DenseTensorLookup, tensor: TensorRef) ?[]const f32 {
+        return self.get_fn(self.ctx, tensor);
     }
 };
 
@@ -62,7 +74,7 @@ const ValueType = enum(u32) {
     float64 = 12,
 };
 
-const TensorType = enum(u32) {
+pub const TensorType = enum(u32) {
     f32 = 0,
     f16 = 1,
     q4_k = 12,
@@ -105,18 +117,18 @@ const Parser = struct {
     }
 };
 
-const TensorRef = struct {
+pub const TensorRef = struct {
     name: []const u8,
     dims: [max_tensor_dims]u64,
     n_dims: usize,
     tensor_type: TensorType,
     offset: u64,
 
-    fn rowLen(self: TensorRef) !usize {
+    pub fn rowLen(self: TensorRef) !usize {
         return std.math.cast(usize, self.dims[0]) orelse error.InvalidTensorMetadata;
     }
 
-    fn rowCount(self: TensorRef) !usize {
+    pub fn rowCount(self: TensorRef) !usize {
         var total: u64 = 1;
         var index: usize = 1;
         while (index < self.n_dims) : (index += 1) {
@@ -131,7 +143,7 @@ const ScaleMinK4 = struct {
     min: u8,
 };
 
-const LayerRefs = struct {
+pub const LayerRefs = struct {
     attn_norm: TensorRef,
     attn_q: TensorRef,
     attn_k: TensorRef,
@@ -333,7 +345,7 @@ const Tokenizer = struct {
     }
 };
 
-const Model = struct {
+pub const Model = struct {
     bytes: []const u8,
     mapped_bytes: ?[]align(std.heap.page_size_min) const u8,
     tokenizer: Tokenizer,
@@ -354,7 +366,7 @@ const Model = struct {
     output_norm: TensorRef,
     layers: []LayerRefs,
 
-    fn deinit(self: *Model, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
         self.tokenizer.deinit(allocator);
         for (self.layers) |layer| {
             allocator.free(layer.attn_norm.name);
@@ -382,6 +394,8 @@ const Model = struct {
 
 const Session = struct {
     model: *const Model,
+    backend: ?backend_api.MatVecBackend,
+    dense_tensors: ?DenseTensorLookup,
     token_buffer: []u32,
     hidden: []f32,
     normed: []f32,
@@ -399,9 +413,17 @@ const Session = struct {
     matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
 
-    fn init(allocator: std.mem.Allocator, model: *const Model, token_capacity: usize) !Session {
+    fn init(
+        allocator: std.mem.Allocator,
+        model: *const Model,
+        backend: ?backend_api.MatVecBackend,
+        dense_tensors: ?DenseTensorLookup,
+        token_capacity: usize,
+    ) !Session {
         var session = Session{
             .model = model,
+            .backend = backend,
+            .dense_tensors = dense_tensors,
             .token_buffer = try allocator.alloc(u32, token_capacity),
             .hidden = try allocator.alloc(f32, model.embedding_length),
             .normed = try allocator.alloc(f32, model.embedding_length),
@@ -419,10 +441,12 @@ const Session = struct {
         };
         errdefer session.deinit(allocator);
 
-        const cpu_count = std.Thread.getCpuCount() catch 1;
-        const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
-        if (helper_count > 0) {
-            session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
+        if (backend == null) {
+            const cpu_count = std.Thread.getCpuCount() catch 1;
+            const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
+            if (helper_count > 0) {
+                session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
+            }
         }
 
         return session;
@@ -532,6 +556,13 @@ const Session = struct {
         const row_len = try tensor.rowLen();
         const row_count = try tensor.rowCount();
         if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
+
+        if (self.backend) |backend| {
+            const dense_tensors = self.dense_tensors orelse return error.InvalidTensorMetadata;
+            const matrix = dense_tensors.get(tensor) orelse return error.InvalidTensorMetadata;
+            try backend.matVec(out, matrix, input, row_count, row_len);
+            return;
+        }
 
         const bytes = try tensorBytes(self.model, tensor);
         const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
@@ -685,13 +716,15 @@ fn matVecWorkerMain(workers: *MatVecWorkers, worker_index: usize) void {
     }
 }
 
-pub fn generate(
+pub fn generateLoaded(
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    model: *const Model,
     prompt: []const u8,
     max_tokens: usize,
     seed: u64,
     temperature: f32,
+    backend: ?backend_api.MatVecBackend,
+    dense_tensors: ?DenseTensorLookup,
 ) !GenerateReport {
     _ = seed;
 
@@ -700,11 +733,14 @@ pub fn generate(
     try spinner.start();
     errdefer spinner.stop();
 
-    var model = try loadModel(allocator, model_path);
-    defer model.deinit(allocator);
-
     const prompt_capacity = prompt.len * 4 + max_tokens + 8;
-    var session = try Session.init(allocator, &model, @min(model.context_length, prompt_capacity));
+    var session = try Session.init(
+        allocator,
+        model,
+        backend,
+        dense_tensors,
+        @min(model.context_length, prompt_capacity),
+    );
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
@@ -739,10 +775,11 @@ pub fn generate(
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
+        .backend = if (backend == null) .cpu else .metal,
     };
 }
 
-fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
+pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const file = try std.fs.cwd().openFile(model_path, .{});
     defer file.close();
 
@@ -1034,7 +1071,7 @@ fn takeLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(Ten
     return takeTensor(allocator, tensors, name);
 }
 
-fn tensorBytes(model: *const Model, tensor: TensorRef) ![]const u8 {
+pub fn tensorBytes(model: *const Model, tensor: TensorRef) ![]const u8 {
     const start = std.math.add(usize, model.data_offset, std.math.cast(usize, tensor.offset) orelse return error.Overflow) catch return error.Overflow;
     const row_len = try tensor.rowLen();
     const row_count = try tensor.rowCount();
@@ -1045,7 +1082,7 @@ fn tensorBytes(model: *const Model, tensor: TensorRef) ![]const u8 {
     return model.bytes[start..end];
 }
 
-fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
+pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
     return switch (tensor_type) {
         .f32 => try std.math.mul(usize, row_len, 4),
         .f16 => try std.math.mul(usize, row_len, 2),
@@ -1088,7 +1125,7 @@ fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRe
     }
 }
 
-fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_len: usize) !void {
+pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_len: usize) !void {
     switch (tensor_type) {
         .f32 => {
             for (0..row_len) |index| out[index] = readF32(row[index * 4 ..][0..4]);

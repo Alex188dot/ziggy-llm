@@ -169,6 +169,12 @@ pub fn prewarm(backend: backend_api.MatVecBackend, model: *const tiny_model.Mode
     try state.prewarm(model);
 }
 
+pub fn cacheMatrix(backend: backend_api.MatVecBackend, matrix: []const f32) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    _ = try state.matrixBuffer(matrix);
+}
+
 fn metalMatVec(
     ctx: ?*anyopaque,
     out: []f32,

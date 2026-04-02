@@ -3,9 +3,9 @@ const std = @import("std");
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "ziggy-tiny";
-pub const supported_architecture = "ziggy-tiny (native CPU + Metal) and llama (native CPU)";
-pub const supported_model_family = "ziggy-tiny GGUF reference models through the CPU or Metal runtime and llama-family GGUF models through the native CPU runtime";
-pub const supported_quantization = "ziggy-tiny: F16 only; llama native CPU path: F32, F16, Q4_K, and Q6_K";
+pub const supported_architecture = "ziggy-tiny (native CPU + Metal) and llama (native CPU + Metal)";
+pub const supported_model_family = "ziggy-tiny GGUF reference models through the CPU or Metal runtime and llama-family GGUF models through the native CPU or Metal runtime";
+pub const supported_quantization = "ziggy-tiny: F16 only; llama CPU and Metal paths: F32, F16, Q4_K, and Q6_K";
 
 pub const RuntimeError = error{
     InvalidMagic,

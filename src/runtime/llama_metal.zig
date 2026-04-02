@@ -1,0 +1,66 @@
+const std = @import("std");
+const backend_api = @import("backend.zig");
+const metal_backend = @import("metal_backend.zig");
+const llama = @import("../llama_cpu.zig");
+
+pub const DenseTensorStore = struct {
+    allocator: std.mem.Allocator,
+    tensors: std.AutoHashMap(u64, []f32),
+
+    pub fn init(allocator: std.mem.Allocator) DenseTensorStore {
+        return .{
+            .allocator = allocator,
+            .tensors = std.AutoHashMap(u64, []f32).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DenseTensorStore) void {
+        var iterator = self.tensors.valueIterator();
+        while (iterator.next()) |values| self.allocator.free(values.*);
+        self.tensors.deinit();
+        self.* = undefined;
+    }
+
+    pub fn populate(self: *DenseTensorStore, model: *const llama.Model) !void {
+        try self.addTensor(model, model.output);
+        for (model.layers) |layer| {
+            try self.addTensor(model, layer.attn_q);
+            try self.addTensor(model, layer.attn_k);
+            try self.addTensor(model, layer.attn_v);
+            try self.addTensor(model, layer.attn_output);
+            try self.addTensor(model, layer.ffn_gate);
+            try self.addTensor(model, layer.ffn_down);
+            try self.addTensor(model, layer.ffn_up);
+        }
+    }
+
+    pub fn get(self: *const DenseTensorStore, tensor: llama.TensorRef) ?[]const f32 {
+        return self.tensors.get(tensor.offset);
+    }
+
+    pub fn prewarm(self: *const DenseTensorStore, backend: backend_api.MatVecBackend) !void {
+        var iterator = self.tensors.valueIterator();
+        while (iterator.next()) |matrix| {
+            try metal_backend.cacheMatrix(backend, matrix.*);
+        }
+    }
+
+    fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef) !void {
+        if (self.tensors.contains(tensor.offset)) return;
+
+        const rows = try tensor.rowCount();
+        const cols = try tensor.rowLen();
+        const row_size = try llama.tensorRowByteSize(tensor.tensor_type, cols);
+        const bytes = try llama.tensorBytes(model, tensor);
+        const dense = try self.allocator.alloc(f32, rows * cols);
+        errdefer self.allocator.free(dense);
+
+        for (0..rows) |row_index| {
+            const row_bytes = bytes[row_index * row_size ..][0..row_size];
+            const row_dense = dense[row_index * cols ..][0..cols];
+            try llama.dequantizeRow(row_dense, tensor.tensor_type, row_bytes, cols);
+        }
+
+        try self.tensors.put(tensor.offset, dense);
+    }
+};
