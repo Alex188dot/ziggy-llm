@@ -54,11 +54,16 @@ pub const DenseTensorStore = struct {
         const bytes = try llama.tensorBytes(model, tensor);
         const dense = try self.allocator.alloc(f32, rows * cols);
         errdefer self.allocator.free(dense);
+        @memset(dense, 0);
 
         for (0..rows) |row_index| {
             const row_bytes = bytes[row_index * row_size ..][0..row_size];
-            const row_dense = dense[row_index * cols ..][0..cols];
+            const row_dense = try self.allocator.alloc(f32, cols);
+            defer self.allocator.free(row_dense);
             try llama.dequantizeRow(row_dense, tensor.tensor_type, row_bytes, cols);
+            for (0..cols) |col_index| {
+                dense[row_index + col_index * rows] = row_dense[col_index];
+            }
         }
 
         try self.tensors.put(tensor.offset, dense);

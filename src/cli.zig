@@ -154,8 +154,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\
         \\Status:
         \\  Native CPU correctness path is available for ziggy-tiny fixtures.
-        \\  LLaMA-family GGUF execution uses the native CPU runtime.
-        \\  Metal acceleration and the broader native runtime are still in progress.
+        \\  LLaMA-family GGUF execution supports the native CPU runtime and Metal on Apple Silicon.
+        \\  Metal acceleration outside the implemented runtimes is still in progress.
         \\
     ,
         .{

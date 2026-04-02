@@ -30,7 +30,7 @@ Today, the codebase provides:
 - a smaller runtime module layout for backend dispatch, tiny-model loading, CPU/Metal backends, and fixtures
 - project docs, scope, and roadmap
 
-Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the first `ziggy-tiny` reference path only.
+Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the `ziggy-tiny` reference path and the implemented llama-family GGUF runtime on Apple Silicon.
 
 ## Repo Description
 

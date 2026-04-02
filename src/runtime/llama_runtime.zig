@@ -1,6 +1,7 @@
 const std = @import("std");
 const llama_cpu = @import("../llama_cpu.zig");
 const backend_api = @import("backend.zig");
+const llama_fixture = @import("llama_fixture.zig");
 const llama_metal = @import("llama_metal.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
@@ -110,4 +111,66 @@ fn isRecoverableMetalError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "llama fixture runs deterministically on cpu" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaModelFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama.gguf");
+    defer std.testing.allocator.free(path);
+
+    var report = try generate(std.testing.allocator, path, "a", .{
+        .max_tokens = 3,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .cpu,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(types.BackendUsed, .cpu), report.backend);
+    try std.testing.expectEqualStrings(" b c!", report.generated_text);
+    try std.testing.expectEqual(@as(usize, 1), report.prompt_token_count);
+    try std.testing.expectEqual(@as(usize, 3), report.generated_token_count);
+}
+
+test "llama metal backend matches cpu reference when available" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaModelFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama-metal.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-metal.gguf");
+    defer std.testing.allocator.free(path);
+
+    var cpu_report = try generate(std.testing.allocator, path, "a", .{
+        .max_tokens = 3,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .cpu,
+    });
+    defer cpu_report.deinit(std.testing.allocator);
+
+    var metal_report = try generate(std.testing.allocator, path, "a", .{
+        .max_tokens = 3,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .metal,
+    });
+    defer metal_report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(types.BackendUsed, .metal), metal_report.backend);
+    try std.testing.expectEqualStrings(cpu_report.generated_text, metal_report.generated_text);
+    try std.testing.expectEqual(cpu_report.prompt_token_count, metal_report.prompt_token_count);
+    try std.testing.expectEqual(cpu_report.generated_token_count, metal_report.generated_token_count);
 }
