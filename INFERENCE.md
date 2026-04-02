@@ -276,7 +276,7 @@ user@machine ziggy-llm %
 - [x] Add per-stage timing for startup, prompt processing, TTFT, and decode tok/s.
 - [x] Add per-kernel or per-operation timing around dense matvec, quantized matvec, attention, RMSNorm, RoPE, KV writes, residual adds, and CPU sampling.
 - [x] Distinguish prompt processing throughput from decode throughput in all measurements.
-- [ ] Keep a simple benchmark table in the document with date and result snapshots.
+- [x] Keep a simple benchmark table in the document with date and result snapshots.
 - [ ] Treat any optimization without benchmark evidence as incomplete.
 
 ## Phase 1: Measurement Before More Optimization
@@ -289,3 +289,10 @@ user@machine ziggy-llm %
 Current implementation note:
 
 - `ziggy-llm run ... --backend metal --metal-profile` and `ziggy-llm bench ... --backend metal --metal-profile` now emit aggregated per-op timing, top bottleneck lines, dominant shape entries, and per-token decode timing breakdowns for measured runs.
+
+## Benchmark Table
+
+| Date | Mode | Machine | Backend | Model | Prompt tokens | Generated tokens | Startup ms | Prompt ms | TTFT ms | Decode TPS |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-04-02 | Cold `bench --bench-runs 5` | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1864.982 | 591.401 | 2561.520 | 35.920 |
+| 2026-04-02 | Warm avg (`4` reused runs) | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.121 | 571.102 | 676.395 | 35.932 |

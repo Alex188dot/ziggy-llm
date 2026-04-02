@@ -9,6 +9,7 @@ const types = @import("types.zig");
 const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
     dense_tensors: ?llama_metal.DenseTensorStore = null,
+    startup_breakdown: types.StartupBreakdown = .{},
 
     fn deinit(self: *ExecutionResources, allocator: std.mem.Allocator) void {
         if (self.backend) |backend| backend.deinit(allocator);
@@ -23,8 +24,9 @@ pub fn generate(
     prompt: []const u8,
     options: types.GenerationOptions,
 ) !types.GenerationReport {
-    const startup_begin = std.time.nanoTimestamp();
+    const model_load_begin = std.time.nanoTimestamp();
     var model = try llama_cpu.loadModel(allocator, model_path);
+    const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
     var execution = try selectExecution(allocator, &model, options.backend);
@@ -48,9 +50,12 @@ pub fn generate(
         execution.backend,
         lookup,
     );
-    const setup_ns = types.deltaNs(startup_begin, std.time.nanoTimestamp()) -| llama_report.startup_ns;
-    llama_report.startup_ns += setup_ns;
-    llama_report.ttft_ns += setup_ns;
+    llama_report.startup_ns += model_load_ns + execution.startup_breakdown.tensor_prepare_ns + execution.startup_breakdown.backend_init_ns + execution.startup_breakdown.metal_prewarm_ns;
+    llama_report.ttft_ns += model_load_ns + execution.startup_breakdown.tensor_prepare_ns + execution.startup_breakdown.backend_init_ns + execution.startup_breakdown.metal_prewarm_ns;
+    llama_report.startup_breakdown.model_load_ns = model_load_ns;
+    llama_report.startup_breakdown.tensor_prepare_ns = execution.startup_breakdown.tensor_prepare_ns;
+    llama_report.startup_breakdown.backend_init_ns = execution.startup_breakdown.backend_init_ns;
+    llama_report.startup_breakdown.metal_prewarm_ns = execution.startup_breakdown.metal_prewarm_ns;
 
     return .{
         .generated_text = llama_report.generated_text,
@@ -63,6 +68,7 @@ pub fn generate(
         .seed = options.seed,
         .temperature = options.temperature,
         .backend = llama_report.backend,
+        .startup_breakdown = llama_report.startup_breakdown,
         .metal_profile_summary = llama_report.metal_profile_summary,
     };
 }
@@ -85,15 +91,26 @@ fn selectExecution(
 fn createMetalExecution(allocator: std.mem.Allocator, model: *const llama_cpu.Model) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
+    const tensor_prepare_begin = std.time.nanoTimestamp();
     try dense_tensors.populate(model);
+    const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
+    const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
+    const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
+    const metal_prewarm_begin = std.time.nanoTimestamp();
     try dense_tensors.prewarm(backend);
+    const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
 
     return .{
         .backend = backend,
         .dense_tensors = dense_tensors,
+        .startup_breakdown = .{
+            .tensor_prepare_ns = tensor_prepare_ns,
+            .backend_init_ns = backend_init_ns,
+            .metal_prewarm_ns = metal_prewarm_ns,
+        },
     };
 }
 

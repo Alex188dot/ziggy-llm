@@ -50,9 +50,19 @@ pub fn runCommand(
         \\generated_tokens: {d}
         \\seed: {d}
         \\temperature: {d:.3}
+        \\repeat_penalty: {d:.3}
+        \\top_k: {d}
+        \\top_p: {d:.3}
+        \\min_p: {d:.3}
         \\startup_ms: {d:.3}
+        \\startup.model_load_ms: {d:.3}
+        \\startup.tensor_prepare_ms: {d:.3}
+        \\startup.backend_init_ms: {d:.3}
+        \\startup.metal_prewarm_ms: {d:.3}
+        \\startup.session_init_ms: {d:.3}
         \\prompt_ms: {d:.3}
         \\ttft_ms: {d:.3}
+        \\first_decode_step_ms: {d:.3}
         \\tps: {d:.3}
         \\decode_tok_s: {d:.3}
         \\
@@ -64,9 +74,19 @@ pub fn runCommand(
             report.generated_token_count,
             report.seed,
             report.temperature,
+            options.repeat_penalty,
+            options.top_k,
+            options.top_p,
+            options.min_p,
             nsToMs(report.startup_ns),
+            nsToMs(report.startup_breakdown.model_load_ns),
+            nsToMs(report.startup_breakdown.tensor_prepare_ns),
+            nsToMs(report.startup_breakdown.backend_init_ns),
+            nsToMs(report.startup_breakdown.metal_prewarm_ns),
+            nsToMs(report.startup_breakdown.session_init_ns),
             nsToMs(report.prompt_ns),
             nsToMs(report.ttft_ns),
+            nsToMs(report.startup_breakdown.first_decode_step_ns),
             report.decodeTokensPerSecond(),
             report.decodeTokensPerSecond(),
         },
@@ -92,8 +112,14 @@ pub fn benchCommand(
             \\backend={s}
             \\bench_runs={d}
             \\cold.startup_ms={d:.3}
+            \\cold.startup.model_load_ms={d:.3}
+            \\cold.startup.tensor_prepare_ms={d:.3}
+            \\cold.startup.backend_init_ms={d:.3}
+            \\cold.startup.metal_prewarm_ms={d:.3}
+            \\cold.startup.session_init_ms={d:.3}
             \\cold.prompt_ms={d:.3}
             \\cold.ttft_ms={d:.3}
+            \\cold.first_decode_step_ms={d:.3}
             \\cold.decode_ms={d:.3}
             \\cold.prompt_tokens={d}
             \\cold.generated_tokens={d}
@@ -101,8 +127,14 @@ pub fn benchCommand(
             \\cold.decode_tok_s={d:.3}
             \\warm.runs={d}
             \\warm.startup_ms_avg={d:.3}
+            \\warm.startup.model_load_ms_avg={d:.3}
+            \\warm.startup.tensor_prepare_ms_avg={d:.3}
+            \\warm.startup.backend_init_ms_avg={d:.3}
+            \\warm.startup.metal_prewarm_ms_avg={d:.3}
+            \\warm.startup.session_init_ms_avg={d:.3}
             \\warm.prompt_ms_avg={d:.3}
             \\warm.ttft_ms_avg={d:.3}
+            \\warm.first_decode_step_ms_avg={d:.3}
             \\warm.decode_ms_avg={d:.3}
             \\warm.generated_tokens_avg={d}
             \\warm.tps_avg={d:.3}
@@ -113,8 +145,14 @@ pub fn benchCommand(
                 summary.cold.backend.label(),
                 bench_runs,
                 nsToMs(summary.cold.startup_ns),
+                nsToMs(summary.cold.startup_breakdown.model_load_ns),
+                nsToMs(summary.cold.startup_breakdown.tensor_prepare_ns),
+                nsToMs(summary.cold.startup_breakdown.backend_init_ns),
+                nsToMs(summary.cold.startup_breakdown.metal_prewarm_ns),
+                nsToMs(summary.cold.startup_breakdown.session_init_ns),
                 nsToMs(summary.cold.prompt_ns),
                 nsToMs(summary.cold.ttft_ns),
+                nsToMs(summary.cold.startup_breakdown.first_decode_step_ns),
                 nsToMs(summary.cold.decode_ns),
                 summary.cold.prompt_token_count,
                 summary.cold.generated_token_count,
@@ -122,8 +160,14 @@ pub fn benchCommand(
                 summary.cold.decodeTokensPerSecond(),
                 summary.warm_runs,
                 nsToMs(summary.warm_startup_ns_avg),
+                nsToMs(summary.warm_startup_breakdown_avg.model_load_ns),
+                nsToMs(summary.warm_startup_breakdown_avg.tensor_prepare_ns),
+                nsToMs(summary.warm_startup_breakdown_avg.backend_init_ns),
+                nsToMs(summary.warm_startup_breakdown_avg.metal_prewarm_ns),
+                nsToMs(summary.warm_startup_breakdown_avg.session_init_ns),
                 nsToMs(summary.warm_prompt_ns_avg),
                 nsToMs(summary.warm_ttft_ns_avg),
+                nsToMs(summary.warm_startup_breakdown_avg.first_decode_step_ns),
                 nsToMs(summary.warm_decode_ns_avg),
                 summary.warm_generated_token_count_avg,
                 summary.warmDecodeTokensPerSecond(),
@@ -141,9 +185,19 @@ pub fn benchCommand(
 
     try writer.print(
         \\backend={s}
+        \\repeat_penalty={d:.3}
+        \\top_k={d}
+        \\top_p={d:.3}
+        \\min_p={d:.3}
         \\startup_ms={d:.3}
+        \\startup.model_load_ms={d:.3}
+        \\startup.tensor_prepare_ms={d:.3}
+        \\startup.backend_init_ms={d:.3}
+        \\startup.metal_prewarm_ms={d:.3}
+        \\startup.session_init_ms={d:.3}
         \\prompt_ms={d:.3}
         \\ttft_ms={d:.3}
+        \\first_decode_step_ms={d:.3}
         \\decode_ms={d:.3}
         \\prompt_tokens={d}
         \\generated_tokens={d}
@@ -153,9 +207,19 @@ pub fn benchCommand(
     ,
         .{
             report.backend.label(),
+            options.repeat_penalty,
+            options.top_k,
+            options.top_p,
+            options.min_p,
             nsToMs(report.startup_ns),
+            nsToMs(report.startup_breakdown.model_load_ns),
+            nsToMs(report.startup_breakdown.tensor_prepare_ns),
+            nsToMs(report.startup_breakdown.backend_init_ns),
+            nsToMs(report.startup_breakdown.metal_prewarm_ns),
+            nsToMs(report.startup_breakdown.session_init_ns),
             nsToMs(report.prompt_ns),
             nsToMs(report.ttft_ns),
+            nsToMs(report.startup_breakdown.first_decode_step_ns),
             nsToMs(report.decode_ns),
             report.prompt_token_count,
             report.generated_token_count,

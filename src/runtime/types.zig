@@ -71,10 +71,21 @@ pub const GenerationOptions = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
     temperature: f32 = 0.0,
+    repeat_penalty: f32 = 1.0,
     top_k: usize = 0,
     top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
     backend: BackendPreference = .auto,
     metal_profile: bool = false,
+};
+
+pub const StartupBreakdown = struct {
+    model_load_ns: u64 = 0,
+    tensor_prepare_ns: u64 = 0,
+    backend_init_ns: u64 = 0,
+    metal_prewarm_ns: u64 = 0,
+    session_init_ns: u64 = 0,
+    first_decode_step_ns: u64 = 0,
 };
 
 pub const GenerationReport = struct {
@@ -88,6 +99,7 @@ pub const GenerationReport = struct {
     seed: u64,
     temperature: f32,
     backend: BackendUsed,
+    startup_breakdown: StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *GenerationReport, allocator: std.mem.Allocator) void {

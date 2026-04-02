@@ -22,8 +22,10 @@ pub const Config = struct {
     bench_runs: usize = 1,
     seed: u64 = 0,
     temperature: f32 = 0,
+    repeat_penalty: f32 = 1.0,
     top_k: usize = 0,
     top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
     backend: runtime.BackendPreference = .auto,
     metal_profile: bool = false,
 };
@@ -36,7 +38,9 @@ pub const ParseError = error{
     InvalidMaxTokens,
     InvalidSeed,
     InvalidTemperature,
+    InvalidRepeatPenalty,
     InvalidTopP,
+    InvalidMinP,
     InvalidBackend,
 };
 
@@ -103,6 +107,13 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.temperature = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--repeat-penalty")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.repeat_penalty = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidRepeatPenalty;
+            if (!(config.repeat_penalty >= 1.0)) return error.InvalidRepeatPenalty;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--top-k")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -114,6 +125,13 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             if (i >= args.len) return error.MissingFlagValue;
             config.top_p = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTopP;
             if (!(config.top_p > 0 and config.top_p <= 1.0)) return error.InvalidTopP;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--min-p")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.min_p = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidMinP;
+            if (!(config.min_p >= 0 and config.min_p < 1.0)) return error.InvalidMinP;
             continue;
         }
         if (std.mem.eql(u8, arg, "--backend")) {
@@ -175,8 +193,10 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --bench-runs <n>  Bench only: one cold run plus warm averages over reused runtime (default: {d})
         \\      --seed <n>        Seed for deterministic sampling (default: {d})
         \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
+        \\      --repeat-penalty  Penalize previously seen tokens; 1.0 disables it (default: {d:.1})
         \\      --top-k <n>       Sampling filter: keep top K logits; 0 disables it (default: {d})
         \\      --top-p <f>       Sampling filter: keep smallest prefix with cumulative mass >= p (default: {d:.1})
+        \\      --min-p <f>       Sampling filter: drop tokens below min_p * top token prob (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --metal-profile   Print aggregated Metal decode timing and dominant shape data
         \\      --port <port>     Port for server mode (default: {d})
@@ -195,8 +215,10 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.bench_runs,
             configDefaults.seed,
             configDefaults.temperature,
+            configDefaults.repeat_penalty,
             configDefaults.top_k,
             configDefaults.top_p,
+            configDefaults.min_p,
             configDefaults.backend.label(),
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
@@ -224,13 +246,15 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--top-k", "40", "--top-p", "0.9", "--backend", "metal", "--metal-profile" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--metal-profile" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.temperature, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), config.repeat_penalty, 0.0001);
     try std.testing.expectEqual(@as(usize, 40), config.top_k);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), config.top_p, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), config.min_p, 0.0001);
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
     try std.testing.expect(config.metal_profile);
 }

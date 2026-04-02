@@ -34,6 +34,7 @@ pub const GenerateReport = struct {
     ttft_ns: u64,
     decode_ns: u64,
     backend: runtime_types.BackendUsed,
+    startup_breakdown: runtime_types.StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *GenerateReport, allocator: std.mem.Allocator) void {
@@ -819,6 +820,7 @@ pub fn generateLoaded(
     const random = prng.random();
 
     const prompt_capacity = prompt.len * 4 + options.max_tokens + 8;
+    const session_init_begin = std.time.nanoTimestamp();
     var session = try Session.init(
         allocator,
         model,
@@ -827,6 +829,7 @@ pub fn generateLoaded(
         @min(model.context_length, prompt_capacity),
         if (profiler.enabled) &profiler else null,
     );
+    const session_init_ns = deltaNs(session_init_begin, std.time.nanoTimestamp());
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
@@ -842,12 +845,13 @@ pub fn generateLoaded(
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
+    var first_decode_step_ns: u64 = 0;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
         const sample_begin = std.time.nanoTimestamp();
-        const next_token = sampleToken(session.logits, options, random, sample_candidates);
+        const next_token = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
         profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
@@ -857,7 +861,11 @@ pub fn generateLoaded(
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
+        const step_begin = std.time.nanoTimestamp();
         _ = try session.step(next_token);
+        if (generated_token_count == 0) {
+            first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
+        }
         profiler.endDecodeToken();
     }
     const decode_end = std.time.nanoTimestamp();
@@ -872,6 +880,10 @@ pub fn generateLoaded(
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
         .backend = if (backend == null) .cpu else .metal,
+        .startup_breakdown = .{
+            .session_init_ns = session_init_ns,
+            .first_decode_step_ns = first_decode_step_ns,
+        },
         .metal_profile_summary = profile_summary,
     };
 }
@@ -1485,6 +1497,7 @@ const SampleCandidate = struct {
 
 fn sampleToken(
     logits: []const f32,
+    recent_tokens: []const u32,
     options: runtime_types.GenerationOptions,
     random: std.Random,
     candidates: []SampleCandidate,
@@ -1500,18 +1513,27 @@ fn sampleToken(
     var active = candidates[0..candidate_count];
     if (active.len == 0) return argmax(logits);
 
-    var max_logit = active[0].logit;
-    for (active[1..]) |candidate| {
-        if (candidate.logit > max_logit) max_logit = candidate.logit;
-    }
-
+    var max_logit = -std.math.inf(f32);
     var total_weight: f64 = 0;
+    for (active) |*candidate| {
+        const adjusted_logit = applyRepeatPenalty(candidate.logit, candidate.token_id, recent_tokens, options.repeat_penalty);
+        candidate.logit = adjusted_logit;
+        max_logit = @max(max_logit, adjusted_logit);
+    }
     for (active) |*candidate| {
         const shifted = (@as(f64, candidate.logit) - @as(f64, max_logit)) / @as(f64, options.temperature);
         candidate.weight = @exp(shifted);
         total_weight += candidate.weight;
     }
     if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
+
+    if (options.min_p > 0) {
+        const kept = truncateByMinP(active, options.min_p);
+        active = active[0..kept];
+        total_weight = 0;
+        for (active) |candidate| total_weight += candidate.weight;
+        if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
+    }
 
     if (options.top_p < 1.0) {
         std.mem.sort(SampleCandidate, active, {}, lessSampleCandidate);
@@ -1530,6 +1552,15 @@ fn sampleToken(
     }
 
     return active[active.len - 1].token_id;
+}
+
+fn applyRepeatPenalty(logit: f32, token_id: u32, recent_tokens: []const u32, repeat_penalty: f32) f32 {
+    if (repeat_penalty <= 1.0) return logit;
+    for (recent_tokens) |recent| {
+        if (recent != token_id) continue;
+        return if (logit < 0) logit * repeat_penalty else logit / repeat_penalty;
+    }
+    return logit;
 }
 
 fn collectAllCandidates(logits: []const f32, out: []SampleCandidate) usize {
@@ -1579,6 +1610,22 @@ fn truncateByTopP(candidates: []SampleCandidate, total_weight: f64, top_p: f32) 
     return candidates.len;
 }
 
+fn truncateByMinP(candidates: []SampleCandidate, min_p: f32) usize {
+    var max_weight: f64 = 0;
+    for (candidates) |candidate| {
+        max_weight = @max(max_weight, candidate.weight);
+    }
+    const threshold = max_weight * @as(f64, min_p);
+    var kept: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.weight >= threshold) {
+            candidates[kept] = candidate;
+            kept += 1;
+        }
+    }
+    return @max(@as(usize, 1), kept);
+}
+
 fn lessSampleCandidate(_: void, lhs: SampleCandidate, rhs: SampleCandidate) bool {
     return lhs.weight > rhs.weight;
 }
@@ -1605,9 +1652,9 @@ test "sampleToken uses seed-driven randomness when temperature is enabled" {
     var prng_b = std.Random.DefaultPrng.init(42);
     var prng_c = std.Random.DefaultPrng.init(99);
 
-    const sample_a = sampleToken(&logits, .{ .temperature = 0.8 }, prng_a.random(), &candidates_a);
-    const sample_b = sampleToken(&logits, .{ .temperature = 0.8 }, prng_b.random(), &candidates_b);
-    const sample_c = sampleToken(&logits, .{ .temperature = 0.8 }, prng_c.random(), &candidates_c);
+    const sample_a = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_a.random(), &candidates_a);
+    const sample_b = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_b.random(), &candidates_b);
+    const sample_c = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_c.random(), &candidates_c);
 
     try std.testing.expectEqual(sample_a, sample_b);
     try std.testing.expect(sample_a < logits.len);
@@ -1618,7 +1665,7 @@ test "sampleToken falls back to argmax for non-positive temperature" {
     const logits = [_]f32{ -1.0, 3.0, 0.5 };
     var candidates: [logits.len]SampleCandidate = undefined;
     var prng = std.Random.DefaultPrng.init(7);
-    try std.testing.expectEqual(@as(u32, 1), sampleToken(&logits, .{ .temperature = 0 }, prng.random(), &candidates));
+    try std.testing.expectEqual(@as(u32, 1), sampleToken(&logits, &.{}, .{ .temperature = 0 }, prng.random(), &candidates));
 }
 
 test "sampleToken top-k restricts sampling set" {
@@ -1627,7 +1674,7 @@ test "sampleToken top-k restricts sampling set" {
     var prng = std.Random.DefaultPrng.init(123);
 
     for (0..32) |_| {
-        const sample = sampleToken(&logits, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &candidates);
+        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &candidates);
         try std.testing.expect(sample == 0 or sample == 1);
     }
 }
@@ -1638,7 +1685,29 @@ test "sampleToken top-p trims low-mass tail" {
     var prng = std.Random.DefaultPrng.init(321);
 
     for (0..32) |_| {
-        const sample = sampleToken(&logits, .{ .temperature = 1.0, .top_p = 0.9 }, prng.random(), &candidates);
+        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .top_p = 0.9 }, prng.random(), &candidates);
+        try std.testing.expect(sample == 0 or sample == 1);
+    }
+}
+
+test "sampleToken repeat penalty demotes repeated tokens" {
+    const logits = [_]f32{ 4.0, 3.9, 1.0 };
+    var candidates: [logits.len]SampleCandidate = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+
+    for (0..32) |_| {
+        const sample = sampleToken(&logits, &.{0}, .{ .temperature = 0.7, .repeat_penalty = 1.5 }, prng.random(), &candidates);
+        try std.testing.expect(sample != 2);
+    }
+}
+
+test "sampleToken min-p drops low relative probability tail" {
+    const logits = [_]f32{ 6.0, 5.5, 0.5, 0.2 };
+    var candidates: [logits.len]SampleCandidate = undefined;
+    var prng = std.Random.DefaultPrng.init(777);
+
+    for (0..32) |_| {
+        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .min_p = 0.5 }, prng.random(), &candidates);
         try std.testing.expect(sample == 0 or sample == 1);
     }
 }

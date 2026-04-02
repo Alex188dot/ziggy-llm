@@ -14,6 +14,7 @@ pub const BenchSummary = struct {
     warm_ttft_ns_avg: u64 = 0,
     warm_decode_ns_avg: u64 = 0,
     warm_generated_token_count_avg: usize = 0,
+    warm_startup_breakdown_avg: types.StartupBreakdown = .{},
 
     pub fn deinit(self: *BenchSummary, allocator: std.mem.Allocator) void {
         self.cold.deinit(allocator);
@@ -31,13 +32,16 @@ const LoadedRuntime = struct {
     allocator: std.mem.Allocator,
     model: llama_cpu.Model,
     execution: ExecutionResources,
+    model_load_ns: u64,
 
     fn init(
         allocator: std.mem.Allocator,
         model_path: []const u8,
         preference: types.BackendPreference,
     ) !LoadedRuntime {
+        const model_load_begin = std.time.nanoTimestamp();
         var model = try llama_cpu.loadModel(allocator, model_path);
+        const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(allocator);
 
         var execution = try selectExecution(allocator, &model, preference);
@@ -47,6 +51,7 @@ const LoadedRuntime = struct {
             .allocator = allocator,
             .model = model,
             .execution = execution,
+            .model_load_ns = model_load_ns,
         };
     }
 
@@ -77,6 +82,10 @@ const LoadedRuntime = struct {
         );
         report.startup_ns += setup_ns;
         report.ttft_ns += setup_ns;
+        report.startup_breakdown.model_load_ns += setup_ns;
+        report.startup_breakdown.tensor_prepare_ns = self.execution.startup_breakdown.tensor_prepare_ns;
+        report.startup_breakdown.backend_init_ns = self.execution.startup_breakdown.backend_init_ns;
+        report.startup_breakdown.metal_prewarm_ns = self.execution.startup_breakdown.metal_prewarm_ns;
 
         return .{
             .generated_text = report.generated_text,
@@ -89,6 +98,7 @@ const LoadedRuntime = struct {
             .seed = options.seed,
             .temperature = options.temperature,
             .backend = report.backend,
+            .startup_breakdown = report.startup_breakdown,
             .metal_profile_summary = report.metal_profile_summary,
         };
     }
@@ -97,6 +107,7 @@ const LoadedRuntime = struct {
 const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
     dense_tensors: ?llama_metal.DenseTensorStore = null,
+    startup_breakdown: types.StartupBreakdown = .{},
 
     fn deinit(self: *ExecutionResources, allocator: std.mem.Allocator) void {
         if (self.backend) |backend| backend.deinit(allocator);
@@ -114,13 +125,11 @@ pub fn runWarmBench(
 ) !BenchSummary {
     std.debug.assert(bench_runs > 0);
 
-    const setup_begin = std.time.nanoTimestamp();
     var runtime = try LoadedRuntime.init(allocator, model_path, options.backend);
     defer runtime.deinit();
-    const setup_ns = types.deltaNs(setup_begin, std.time.nanoTimestamp());
-
-    var cold = try runtime.generate(prompt, options, setup_ns);
+    var cold = try runtime.generate(prompt, options, runtime.model_load_ns);
     errdefer cold.deinit(allocator);
+    cold.startup_breakdown.model_load_ns = runtime.model_load_ns;
 
     if (bench_runs == 1) {
         return .{ .cold = cold };
@@ -131,6 +140,7 @@ pub fn runWarmBench(
     var warm_ttft_total: u128 = 0;
     var warm_decode_total: u128 = 0;
     var warm_generated_token_total: u128 = 0;
+    var warm_startup_breakdown_total = types.StartupBreakdown{};
 
     for (1..bench_runs) |_| {
         var warm = try runtime.generate(prompt, options, 0);
@@ -139,6 +149,12 @@ pub fn runWarmBench(
         warm_ttft_total += warm.ttft_ns;
         warm_decode_total += warm.decode_ns;
         warm_generated_token_total += warm.generated_token_count;
+        warm_startup_breakdown_total.model_load_ns += warm.startup_breakdown.model_load_ns;
+        warm_startup_breakdown_total.tensor_prepare_ns += warm.startup_breakdown.tensor_prepare_ns;
+        warm_startup_breakdown_total.backend_init_ns += warm.startup_breakdown.backend_init_ns;
+        warm_startup_breakdown_total.metal_prewarm_ns += warm.startup_breakdown.metal_prewarm_ns;
+        warm_startup_breakdown_total.session_init_ns += warm.startup_breakdown.session_init_ns;
+        warm_startup_breakdown_total.first_decode_step_ns += warm.startup_breakdown.first_decode_step_ns;
         warm.deinit(allocator);
     }
 
@@ -151,6 +167,14 @@ pub fn runWarmBench(
         .warm_ttft_ns_avg = @intCast(warm_ttft_total / warm_runs),
         .warm_decode_ns_avg = @intCast(warm_decode_total / warm_runs),
         .warm_generated_token_count_avg = @intCast(warm_generated_token_total / warm_runs),
+        .warm_startup_breakdown_avg = .{
+            .model_load_ns = @intCast(warm_startup_breakdown_total.model_load_ns / warm_runs),
+            .tensor_prepare_ns = @intCast(warm_startup_breakdown_total.tensor_prepare_ns / warm_runs),
+            .backend_init_ns = @intCast(warm_startup_breakdown_total.backend_init_ns / warm_runs),
+            .metal_prewarm_ns = @intCast(warm_startup_breakdown_total.metal_prewarm_ns / warm_runs),
+            .session_init_ns = @intCast(warm_startup_breakdown_total.session_init_ns / warm_runs),
+            .first_decode_step_ns = @intCast(warm_startup_breakdown_total.first_decode_step_ns / warm_runs),
+        },
     };
 }
 
@@ -172,15 +196,26 @@ fn selectExecution(
 fn createMetalExecution(allocator: std.mem.Allocator, model: *const llama_cpu.Model) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
+    const tensor_prepare_begin = std.time.nanoTimestamp();
     try dense_tensors.populate(model);
+    const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
+    const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
+    const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
+    const metal_prewarm_begin = std.time.nanoTimestamp();
     try dense_tensors.prewarm(backend);
+    const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
 
     return .{
         .backend = backend,
         .dense_tensors = dense_tensors,
+        .startup_breakdown = .{
+            .tensor_prepare_ns = tensor_prepare_ns,
+            .backend_init_ns = backend_init_ns,
+            .metal_prewarm_ns = metal_prewarm_ns,
+        },
     };
 }
 
