@@ -10,7 +10,7 @@ pub fn serve(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.C
     const model_path = config.model_path orelse return error.MissingModelPath;
     var cache = resident_runtime.ResidentRuntime.init(allocator);
     defer cache.deinit();
-    cache.setKeepAliveSeconds(300);
+    cache.setKeepAliveSeconds(-1);
 
     const address = try std.net.Address.parseIp4("127.0.0.1", config.port);
     var server = try address.listen(.{ .reuse_address = true });

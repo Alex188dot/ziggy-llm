@@ -50,12 +50,42 @@ pub fn buildPrompt(
 }
 
 pub fn trimAssistantReply(reply: []const u8) []const u8 {
-    const markers = [_][]const u8{ "\nUser:", "\nAssistant:" };
     var end = reply.len;
-    for (markers) |marker| {
-        if (std.mem.indexOf(u8, reply, marker)) |idx| end = @min(end, idx);
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    var offset: usize = 0;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (offset > 0 and isDialogueBoundary(trimmed)) {
+            end = @min(end, offset);
+            break;
+        }
+        offset += line.len + 1;
     }
     return std.mem.trim(u8, reply[0..end], " \n\r\t");
+}
+
+fn isDialogueBoundary(line: []const u8) bool {
+    if (line.len == 0) return false;
+
+    const explicit = [_][]const u8{
+        "User:",
+        "Assistant:",
+        "System:",
+        "Human:",
+        "Customer:",
+        "Question:",
+        "Answer:",
+    };
+    for (explicit) |marker| {
+        if (std.mem.startsWith(u8, line, marker)) return true;
+    }
+
+    const colon_index = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    if (colon_index == 0 or colon_index > 24) return false;
+    for (line[0..colon_index]) |char| {
+        if (!(std.ascii.isAlphabetic(char) or char == ' ' or char == '_' or char == '-')) return false;
+    }
+    return true;
 }
 
 fn renderMessages(allocator: std.mem.Allocator, messages: []const Message) ![]u8 {
@@ -73,4 +103,13 @@ fn renderMessages(allocator: std.mem.Allocator, messages: []const Message) ![]u8
     }
     try writer.print("Assistant:", .{});
     return buf.toOwnedSlice(allocator);
+}
+
+test "trimAssistantReply stops at generic dialogue boundary" {
+    const reply =
+        \\Hi there! My name is Asa.
+        \\
+        \\Customer: I want to place an order.
+    ;
+    try std.testing.expectEqualStrings("Hi there! My name is Asa.", trimAssistantReply(reply));
 }
