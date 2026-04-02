@@ -27,6 +27,7 @@ const State = if (build_enabled_value) struct {
     input_buffer: ?BufferHandle = null,
     output_buffer: ?BufferHandle = null,
     matrix_buffers: std.AutoHashMap(MatrixKey, BufferHandle),
+    raw_buffers: std.AutoHashMap(MatrixKey, BufferHandle),
 
     fn init(allocator: std.mem.Allocator) !*State {
         var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
@@ -46,6 +47,7 @@ const State = if (build_enabled_value) struct {
             .allocator = allocator,
             .context = raw_context.?,
             .matrix_buffers = std.AutoHashMap(MatrixKey, BufferHandle).init(allocator),
+            .raw_buffers = std.AutoHashMap(MatrixKey, BufferHandle).init(allocator),
         };
         return state;
     }
@@ -57,6 +59,9 @@ const State = if (build_enabled_value) struct {
         var iterator = self.matrix_buffers.valueIterator();
         while (iterator.next()) |buffer| c.ziggy_metal_destroy_buffer(buffer.raw);
         self.matrix_buffers.deinit();
+        iterator = self.raw_buffers.valueIterator();
+        while (iterator.next()) |buffer| c.ziggy_metal_destroy_buffer(buffer.raw);
+        self.raw_buffers.deinit();
         c.ziggy_metal_destroy_context(self.context);
         self.allocator.destroy(self);
     }
@@ -132,6 +137,22 @@ const State = if (build_enabled_value) struct {
         slot.* = buffer;
         return buffer;
     }
+
+    fn rawBuffer(self: *State, bytes: []const u8) !BufferHandle {
+        const key = MatrixKey{
+            .address = @intFromPtr(bytes.ptr),
+            .len = bytes.len,
+        };
+        if (self.raw_buffers.get(key)) |buffer| return buffer;
+
+        const raw = try createRawBuffer(self.context, bytes);
+        const buffer = BufferHandle{
+            .raw = raw,
+            .byte_len = bytes.len,
+        };
+        try self.raw_buffers.put(key, buffer);
+        return buffer;
+    }
 } else struct {};
 
 pub fn buildEnabled() bool {
@@ -175,6 +196,12 @@ pub fn cacheMatrix(backend: backend_api.MatVecBackend, matrix: []const f32) !voi
     _ = try state.matrixBuffer(matrix);
 }
 
+pub fn cacheRawMatrix(backend: backend_api.MatVecBackend, bytes: []const u8) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    _ = try state.rawBuffer(bytes);
+}
+
 pub fn createScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) !BufferHandle {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -215,6 +242,30 @@ pub fn runMatVecToBuffer(
     const state = stateFromCtx(backend.ctx);
     const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
     try mapStatus(c.ziggy_metal_run_matvec_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        null,
+        0,
+    ));
+}
+
+pub fn runMatVecQ4KToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_f32(
         state.context,
         matrix_buffer.raw,
         input.raw,
@@ -272,11 +323,12 @@ pub fn applyRoPE(
     ));
 }
 
-pub fn attentionScores(
+pub fn attentionFused(
     backend: backend_api.MatVecBackend,
     q: BufferHandle,
     k_cache: BufferHandle,
-    scores: BufferHandle,
+    v_cache: BufferHandle,
+    output: BufferHandle,
     head_count: usize,
     head_count_kv: usize,
     head_dim: usize,
@@ -288,42 +340,10 @@ pub fn attentionScores(
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
-    try mapStatus(c.ziggy_metal_attention_scores_f32(
+    try mapStatus(c.ziggy_metal_attention_fused_f32(
         state.context,
         q.raw,
         k_cache.raw,
-        scores.raw,
-        @intCast(head_count),
-        @intCast(head_count_kv),
-        @intCast(head_dim),
-        @intCast(kv_dim),
-        @intCast(context_length),
-        @intCast(position),
-        @intCast(layer_base),
-        scale,
-        null,
-        0,
-    ));
-}
-
-pub fn attentionValues(
-    backend: backend_api.MatVecBackend,
-    scores: BufferHandle,
-    v_cache: BufferHandle,
-    output: BufferHandle,
-    head_count: usize,
-    head_count_kv: usize,
-    head_dim: usize,
-    kv_dim: usize,
-    context_length: usize,
-    position: usize,
-    layer_base: usize,
-) !void {
-    if (!build_enabled_value) return error.MetalDisabled;
-    const state = stateFromCtx(backend.ctx);
-    try mapStatus(c.ziggy_metal_attention_values_f32(
-        state.context,
-        scores.raw,
         v_cache.raw,
         output.raw,
         @intCast(head_count),
@@ -333,6 +353,7 @@ pub fn attentionValues(
         @intCast(context_length),
         @intCast(position),
         @intCast(layer_base),
+        scale,
         null,
         0,
     ));
@@ -386,6 +407,21 @@ fn createBuffer(context: *c.ZiggyMetalContext, values: []const f32) !*c.ZiggyMet
         context,
         values.ptr,
         values.len * @sizeOf(f32),
+        &raw,
+        &error_buf,
+        error_buf.len,
+    );
+    try mapStatus(status);
+    return raw.?;
+}
+
+fn createRawBuffer(context: *c.ZiggyMetalContext, bytes: []const u8) !*c.ZiggyMetalBuffer {
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    var raw: ?*c.ZiggyMetalBuffer = null;
+    const status = c.ziggy_metal_create_buffer(
+        context,
+        bytes.ptr,
+        bytes.len,
         &raw,
         &error_buf,
         error_buf.len,

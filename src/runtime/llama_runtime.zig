@@ -35,6 +35,7 @@ pub fn generate(
             .ctx = dense_tensors,
             .get_fn = lookupDenseTensor,
             .get_by_offset_fn = lookupDenseTensorByOffset,
+            .get_raw_by_offset_fn = lookupRawTensorByOffset,
         }
     else
         null;
@@ -105,6 +106,11 @@ fn lookupDenseTensor(ctx: ?*const anyopaque, tensor: llama_cpu.TensorRef) ?[]con
 fn lookupDenseTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const f32 {
     const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
     return dense_tensors.getByOffset(offset);
+}
+
+fn lookupRawTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const u8 {
+    const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
+    return dense_tensors.getRawByOffset(offset);
 }
 
 fn isRecoverableMetalError(err: anyerror) bool {

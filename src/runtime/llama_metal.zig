@@ -6,11 +6,13 @@ const llama = @import("../llama_cpu.zig");
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,
     tensors: std.AutoHashMap(u64, []f32),
+    raw_tensors: std.AutoHashMap(u64, []const u8),
 
     pub fn init(allocator: std.mem.Allocator) DenseTensorStore {
         return .{
             .allocator = allocator,
             .tensors = std.AutoHashMap(u64, []f32).init(allocator),
+            .raw_tensors = std.AutoHashMap(u64, []const u8).init(allocator),
         };
     }
 
@@ -18,6 +20,7 @@ pub const DenseTensorStore = struct {
         var iterator = self.tensors.valueIterator();
         while (iterator.next()) |values| self.allocator.free(values.*);
         self.tensors.deinit();
+        self.raw_tensors.deinit();
         self.* = undefined;
     }
 
@@ -42,15 +45,28 @@ pub const DenseTensorStore = struct {
         return self.tensors.get(offset);
     }
 
+    pub fn getRawByOffset(self: *const DenseTensorStore, offset: u64) ?[]const u8 {
+        return self.raw_tensors.get(offset);
+    }
+
     pub fn prewarm(self: *const DenseTensorStore, backend: backend_api.MatVecBackend) !void {
         var iterator = self.tensors.valueIterator();
         while (iterator.next()) |matrix| {
             try metal_backend.cacheMatrix(backend, matrix.*);
         }
+        var raw_iterator = self.raw_tensors.valueIterator();
+        while (raw_iterator.next()) |matrix| {
+            try metal_backend.cacheRawMatrix(backend, matrix.*);
+        }
     }
 
     fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef) !void {
-        if (self.tensors.contains(tensor.offset)) return;
+        if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset)) return;
+
+        if (tensor.tensor_type == .q4_k) {
+            try self.raw_tensors.put(tensor.offset, try llama.tensorBytes(model, tensor));
+            return;
+        }
 
         const rows = try tensor.rowCount();
         const cols = try tensor.rowLen();

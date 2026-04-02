@@ -44,6 +44,7 @@ pub const DenseTensorLookup = struct {
     ctx: ?*const anyopaque,
     get_fn: *const fn (?*const anyopaque, TensorRef) ?[]const f32,
     get_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const f32,
+    get_raw_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const u8,
 
     pub fn get(self: DenseTensorLookup, tensor: TensorRef) ?[]const f32 {
         return self.get_fn(self.ctx, tensor);
@@ -51,6 +52,10 @@ pub const DenseTensorLookup = struct {
 
     pub fn getByOffset(self: DenseTensorLookup, offset: u64) ?[]const f32 {
         return self.get_by_offset_fn(self.ctx, offset);
+    }
+
+    pub fn getRawByOffset(self: DenseTensorLookup, offset: u64) ?[]const u8 {
+        return self.get_raw_by_offset_fn(self.ctx, offset);
     }
 };
 
@@ -622,7 +627,8 @@ const Session = struct {
 fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
     return .{
         .ctx = lookup.ctx,
-        .get_fn = lookup.get_by_offset_fn,
+        .get_dense_fn = lookup.get_by_offset_fn,
+        .get_raw_fn = lookup.get_raw_by_offset_fn,
     };
 }
 
@@ -631,6 +637,7 @@ fn adaptTensorDesc(tensor: TensorRef) llama_gpu.TensorDesc {
         .offset = tensor.offset,
         .rows = tensor.rowCount() catch unreachable,
         .cols = tensor.rowLen() catch unreachable,
+        .tensor_type = @intFromEnum(tensor.tensor_type),
     };
 }
 
