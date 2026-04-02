@@ -231,15 +231,7 @@ pub const Session = struct {
             .depth = position + 1,
             .extra = self.model.head_count_kv,
         });
-        try self.runProjection(layer.attn_output, self.attn, self.tmp);
-        const add_start = std.time.nanoTimestamp();
-        try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
-        self.recordCategoryWithShape(.elementwise_ops, add_start, .{
-            .rows = 1,
-            .cols = self.model.embedding_length,
-            .depth = layer_index,
-            .extra = position + 1,
-        });
+        try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
     }
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
@@ -253,14 +245,7 @@ pub const Session = struct {
             .cols = self.model.feed_forward_length,
             .depth = 2,
         });
-        try self.runProjection(layer.ffn_down, self.gate, self.tmp);
-        const add_start = std.time.nanoTimestamp();
-        try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
-        self.recordCategoryWithShape(.elementwise_ops, add_start, .{
-            .rows = 1,
-            .cols = self.model.embedding_length,
-            .depth = 1,
-        });
+        try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
     }
 
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
@@ -329,6 +314,37 @@ pub const Session = struct {
             .rows = tensor.rows,
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
+        });
+    }
+
+    fn runProjectionAdd(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        switch (tensor.tensor_type) {
+            12 => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
+                    try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                }
+            },
+            else => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
+                try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+            },
+        }
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+            .extra = 1,
         });
     }
 

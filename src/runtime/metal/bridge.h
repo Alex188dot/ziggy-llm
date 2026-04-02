@@ -102,6 +102,17 @@ int ziggy_metal_run_matvec_moonq_q4k_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_moonq_q4k_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_copy_buffer_region(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *src,
