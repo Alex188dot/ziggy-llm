@@ -55,6 +55,8 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .max_tokens = config.max_tokens,
         .seed = config.seed,
         .temperature = config.temperature,
+        .top_k = config.top_k,
+        .top_p = config.top_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
     });
@@ -68,6 +70,8 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .max_tokens = config.max_tokens,
         .seed = config.seed,
         .temperature = config.temperature,
+        .top_k = config.top_k,
+        .top_p = config.top_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
     }, config.bench_runs);

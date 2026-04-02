@@ -71,6 +71,8 @@ pub const GenerationOptions = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
     temperature: f32 = 0.0,
+    top_k: usize = 0,
+    top_p: f32 = 1.0,
     backend: BackendPreference = .auto,
     metal_profile: bool = false,
 };

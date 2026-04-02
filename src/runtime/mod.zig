@@ -91,19 +91,19 @@ pub fn benchCommand(
         try writer.print(
             \\backend={s}
             \\bench_runs={d}
-            \\cold.startup_ns={d}
-            \\cold.prompt_ns={d}
-            \\cold.ttft_ns={d}
-            \\cold.decode_ns={d}
+            \\cold.startup_ms={d:.3}
+            \\cold.prompt_ms={d:.3}
+            \\cold.ttft_ms={d:.3}
+            \\cold.decode_ms={d:.3}
             \\cold.prompt_tokens={d}
             \\cold.generated_tokens={d}
             \\cold.tps={d:.3}
             \\cold.decode_tok_s={d:.3}
             \\warm.runs={d}
-            \\warm.startup_ns_avg={d}
-            \\warm.prompt_ns_avg={d}
-            \\warm.ttft_ns_avg={d}
-            \\warm.decode_ns_avg={d}
+            \\warm.startup_ms_avg={d:.3}
+            \\warm.prompt_ms_avg={d:.3}
+            \\warm.ttft_ms_avg={d:.3}
+            \\warm.decode_ms_avg={d:.3}
             \\warm.generated_tokens_avg={d}
             \\warm.tps_avg={d:.3}
             \\warm.decode_tok_s_avg={d:.3}
@@ -112,19 +112,19 @@ pub fn benchCommand(
             .{
                 summary.cold.backend.label(),
                 bench_runs,
-                summary.cold.startup_ns,
-                summary.cold.prompt_ns,
-                summary.cold.ttft_ns,
-                summary.cold.decode_ns,
+                nsToMs(summary.cold.startup_ns),
+                nsToMs(summary.cold.prompt_ns),
+                nsToMs(summary.cold.ttft_ns),
+                nsToMs(summary.cold.decode_ns),
                 summary.cold.prompt_token_count,
                 summary.cold.generated_token_count,
                 summary.cold.decodeTokensPerSecond(),
                 summary.cold.decodeTokensPerSecond(),
                 summary.warm_runs,
-                summary.warm_startup_ns_avg,
-                summary.warm_prompt_ns_avg,
-                summary.warm_ttft_ns_avg,
-                summary.warm_decode_ns_avg,
+                nsToMs(summary.warm_startup_ns_avg),
+                nsToMs(summary.warm_prompt_ns_avg),
+                nsToMs(summary.warm_ttft_ns_avg),
+                nsToMs(summary.warm_decode_ns_avg),
                 summary.warm_generated_token_count_avg,
                 summary.warmDecodeTokensPerSecond(),
                 summary.warmDecodeTokensPerSecond(),
@@ -141,10 +141,10 @@ pub fn benchCommand(
 
     try writer.print(
         \\backend={s}
-        \\startup_ns={d}
-        \\prompt_ns={d}
-        \\ttft_ns={d}
-        \\decode_ns={d}
+        \\startup_ms={d:.3}
+        \\prompt_ms={d:.3}
+        \\ttft_ms={d:.3}
+        \\decode_ms={d:.3}
         \\prompt_tokens={d}
         \\generated_tokens={d}
         \\tps={d:.3}
@@ -153,10 +153,10 @@ pub fn benchCommand(
     ,
         .{
             report.backend.label(),
-            report.startup_ns,
-            report.prompt_ns,
-            report.ttft_ns,
-            report.decode_ns,
+            nsToMs(report.startup_ns),
+            nsToMs(report.prompt_ns),
+            nsToMs(report.ttft_ns),
+            nsToMs(report.decode_ns),
             report.prompt_token_count,
             report.generated_token_count,
             report.decodeTokensPerSecond(),

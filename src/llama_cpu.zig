@@ -809,14 +809,14 @@ pub fn generateLoaded(
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
 ) !GenerateReport {
-    _ = options.seed;
-
     const startup_begin = std.time.nanoTimestamp();
     var spinner = terminal.Spinner{};
     try spinner.start();
     errdefer spinner.stop();
     var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
     defer profiler.deinit();
+    var prng = std.Random.DefaultPrng.init(options.seed);
+    const random = prng.random();
 
     const prompt_capacity = prompt.len * 4 + options.max_tokens + 8;
     var session = try Session.init(
@@ -838,6 +838,8 @@ pub fn generateLoaded(
 
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
+    const sample_candidates = try allocator.alloc(SampleCandidate, session.logits.len);
+    defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
 
@@ -845,7 +847,7 @@ pub fn generateLoaded(
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
         const sample_begin = std.time.nanoTimestamp();
-        const next_token = sampleToken(session.logits, options.temperature);
+        const next_token = sampleToken(session.logits, options, random, sample_candidates);
         profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
@@ -1475,9 +1477,110 @@ fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize,
     }
 }
 
-fn sampleToken(logits: []const f32, temperature: f32) u32 {
-    _ = temperature;
-    return argmax(logits);
+const SampleCandidate = struct {
+    token_id: u32 = 0,
+    logit: f32 = 0,
+    weight: f64 = 0,
+};
+
+fn sampleToken(
+    logits: []const f32,
+    options: runtime_types.GenerationOptions,
+    random: std.Random,
+    candidates: []SampleCandidate,
+) u32 {
+    if (options.temperature <= 0) return argmax(logits);
+
+    const top_k = if (options.top_k == 0) logits.len else @min(options.top_k, logits.len);
+    const candidate_count = if (top_k < logits.len)
+        collectTopKCandidates(logits, top_k, candidates[0..top_k])
+    else
+        collectAllCandidates(logits, candidates[0..logits.len]);
+
+    var active = candidates[0..candidate_count];
+    if (active.len == 0) return argmax(logits);
+
+    var max_logit = active[0].logit;
+    for (active[1..]) |candidate| {
+        if (candidate.logit > max_logit) max_logit = candidate.logit;
+    }
+
+    var total_weight: f64 = 0;
+    for (active) |*candidate| {
+        const shifted = (@as(f64, candidate.logit) - @as(f64, max_logit)) / @as(f64, options.temperature);
+        candidate.weight = @exp(shifted);
+        total_weight += candidate.weight;
+    }
+    if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
+
+    if (options.top_p < 1.0) {
+        std.mem.sort(SampleCandidate, active, {}, lessSampleCandidate);
+        const kept = truncateByTopP(active, total_weight, options.top_p);
+        active = active[0..kept];
+        total_weight = 0;
+        for (active) |candidate| total_weight += candidate.weight;
+        if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
+    }
+
+    const target = random.float(f64) * total_weight;
+    var cumulative: f64 = 0;
+    for (active) |candidate| {
+        cumulative += candidate.weight;
+        if (target <= cumulative) return candidate.token_id;
+    }
+
+    return active[active.len - 1].token_id;
+}
+
+fn collectAllCandidates(logits: []const f32, out: []SampleCandidate) usize {
+    for (logits, 0..) |logit, index| {
+        out[index] = .{
+            .token_id = @intCast(index),
+            .logit = logit,
+        };
+    }
+    return logits.len;
+}
+
+fn collectTopKCandidates(logits: []const f32, top_k: usize, out: []SampleCandidate) usize {
+    var count: usize = 0;
+    for (logits, 0..) |logit, index| {
+        const candidate = SampleCandidate{
+            .token_id = @intCast(index),
+            .logit = logit,
+        };
+
+        if (count < top_k) {
+            out[count] = candidate;
+            count += 1;
+            var pos = count - 1;
+            while (pos > 0 and out[pos].logit > out[pos - 1].logit) : (pos -= 1) {
+                std.mem.swap(SampleCandidate, &out[pos], &out[pos - 1]);
+            }
+            continue;
+        }
+
+        if (candidate.logit <= out[top_k - 1].logit) continue;
+        out[top_k - 1] = candidate;
+        var pos = top_k - 1;
+        while (pos > 0 and out[pos].logit > out[pos - 1].logit) : (pos -= 1) {
+            std.mem.swap(SampleCandidate, &out[pos], &out[pos - 1]);
+        }
+    }
+    return count;
+}
+
+fn truncateByTopP(candidates: []SampleCandidate, total_weight: f64, top_p: f32) usize {
+    var cumulative: f64 = 0;
+    for (candidates, 0..) |candidate, index| {
+        cumulative += candidate.weight;
+        if (cumulative / total_weight >= @as(f64, top_p)) return index + 1;
+    }
+    return candidates.len;
+}
+
+fn lessSampleCandidate(_: void, lhs: SampleCandidate, rhs: SampleCandidate) bool {
+    return lhs.weight > rhs.weight;
 }
 
 fn argmax(values: []const f32) u32 {
@@ -1490,6 +1593,54 @@ fn argmax(values: []const f32) u32 {
         }
     }
     return @intCast(best_index);
+}
+
+test "sampleToken uses seed-driven randomness when temperature is enabled" {
+    const logits = [_]f32{ 2.0, 1.8, 1.7, 1.6 };
+    var candidates_a: [logits.len]SampleCandidate = undefined;
+    var candidates_b: [logits.len]SampleCandidate = undefined;
+    var candidates_c: [logits.len]SampleCandidate = undefined;
+
+    var prng_a = std.Random.DefaultPrng.init(42);
+    var prng_b = std.Random.DefaultPrng.init(42);
+    var prng_c = std.Random.DefaultPrng.init(99);
+
+    const sample_a = sampleToken(&logits, .{ .temperature = 0.8 }, prng_a.random(), &candidates_a);
+    const sample_b = sampleToken(&logits, .{ .temperature = 0.8 }, prng_b.random(), &candidates_b);
+    const sample_c = sampleToken(&logits, .{ .temperature = 0.8 }, prng_c.random(), &candidates_c);
+
+    try std.testing.expectEqual(sample_a, sample_b);
+    try std.testing.expect(sample_a < logits.len);
+    try std.testing.expect(sample_c < logits.len);
+}
+
+test "sampleToken falls back to argmax for non-positive temperature" {
+    const logits = [_]f32{ -1.0, 3.0, 0.5 };
+    var candidates: [logits.len]SampleCandidate = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    try std.testing.expectEqual(@as(u32, 1), sampleToken(&logits, .{ .temperature = 0 }, prng.random(), &candidates));
+}
+
+test "sampleToken top-k restricts sampling set" {
+    const logits = [_]f32{ 10.0, 9.0, 1.0, 0.5 };
+    var candidates: [logits.len]SampleCandidate = undefined;
+    var prng = std.Random.DefaultPrng.init(123);
+
+    for (0..32) |_| {
+        const sample = sampleToken(&logits, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &candidates);
+        try std.testing.expect(sample == 0 or sample == 1);
+    }
+}
+
+test "sampleToken top-p trims low-mass tail" {
+    const logits = [_]f32{ 8.0, 7.5, 1.0, 0.2 };
+    var candidates: [logits.len]SampleCandidate = undefined;
+    var prng = std.Random.DefaultPrng.init(321);
+
+    for (0..32) |_| {
+        const sample = sampleToken(&logits, .{ .temperature = 1.0, .top_p = 0.9 }, prng.random(), &candidates);
+        try std.testing.expect(sample == 0 or sample == 1);
+    }
 }
 
 fn addInPlace(dst: []f32, src: []const f32) void {
