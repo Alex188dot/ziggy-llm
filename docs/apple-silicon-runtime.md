@@ -45,6 +45,7 @@ zig build moon-quant-guardrail -- \
 ```
 
 That command is the intended local check and can be dropped into CI unchanged once a benchmark model path is available in the environment.
+It is also the canonical MoonQuant comparison workflow now: the output carries a stable workflow marker and warm per-op decode deltas, including decode time directly attributable to MoonQuant-backed projection calls.
 
 To generate synthetic `Q4_K` and `Q6_K` benchmark fixtures with TinyLlama-like decode shapes:
 
@@ -112,6 +113,8 @@ Notes:
 - `--backend auto` will try Metal first on Apple Silicon and fall back to CPU if Metal initialization fails
 - `--backend cpu` remains the correctness and comparison path
 - `--moon-quant disabled` keeps the same Metal runtime but bypasses the packed `Q4_K` MoonQuant path, which makes it the direct comparison switch for benchmark and regression work
+- `zig build moon-quant-guardrail -- ...` is the canonical MoonQuant comparison command to preserve across optimization work
 - `Q6_K` Metal runs now stay on a raw quantized matvec path instead of dequantizing through the dense fallback first
+- `Q6_K` residual-add projections now stay on the direct quantized Metal path instead of paying for a temp-buffer add round-trip
 - prefer `bench` over `run` for published numbers, because `bench --bench-runs N` separates cold startup from warm reused-runtime measurements
 - compare CPU and Metal with the same prompt, token count, seed, and model when tracking regressions

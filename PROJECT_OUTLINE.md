@@ -333,7 +333,7 @@ This is not the flagship path, but it gives us a reference implementation for va
 - polished README
 - benchmark tables
 - startup latency measurements
-- comparison page vs `llama.cpp` and `ollama`
+- comparison page vs established local runtimes
 - demo recordings on the M3 MacBook Pro
 
 ## What success looks like
@@ -355,7 +355,7 @@ This is not the flagship path, but it gives us a reference implementation for va
 ### Community success
 
 - people share benchmarks
-- people compare it directly against `llama.cpp` and `ollama`
+- people compare it directly against other serious local runtimes
 - Zig users point to it as a serious systems project
 
 ## Repo strategy for attention

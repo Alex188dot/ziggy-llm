@@ -289,10 +289,12 @@ pub const Session = struct {
         output: metal_backend.BufferHandle,
     ) !void {
         const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
         switch (tensor.tensor_type) {
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    used_moon_quant = true;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                     try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
@@ -314,11 +316,17 @@ pub const Session = struct {
                 );
             },
         }
-        self.recordCategoryWithShape(.projections, start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = tensor.rows,
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
-        });
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+        }
     }
 
     fn runProjectionAdd(
@@ -328,10 +336,12 @@ pub const Session = struct {
         output: metal_backend.BufferHandle,
     ) !void {
         const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
         switch (tensor.tensor_type) {
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    used_moon_quant = true;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                     try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
@@ -340,8 +350,7 @@ pub const Session = struct {
             },
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
-                try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                try metal_backend.runMatVecQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -349,12 +358,18 @@ pub const Session = struct {
                 try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
             },
         }
-        self.recordCategoryWithShape(.projections, start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = tensor.rows,
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
             .extra = 1,
-        });
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+        }
     }
 
     fn recordCategoryWithShape(

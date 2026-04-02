@@ -128,8 +128,7 @@ Definition of done for v0.6.0:
 - [ ] Measure TTFT on the M3 MacBook Pro
 - [ ] Measure decode tok/s on the M3 MacBook Pro
 - [ ] Measure memory footprint on the M3 MacBook Pro
-- [ ] Compare results against `llama.cpp`
-- [ ] Compare results against `ollama` where the comparison is fair
+- [ ] Compare results against established local runtimes where the comparison is fair
 - [ ] Publish benchmark caveats and methodology clearly
 
 Definition of done for v0.7.0:

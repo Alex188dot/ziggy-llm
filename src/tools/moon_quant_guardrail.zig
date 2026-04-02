@@ -56,6 +56,11 @@ pub fn main() !void {
         .max_warm_ttft_regression_pct = config.max_warm_ttft_regression_pct,
     };
     try moon_quant_bench.printSuiteReport(&stdout.interface, results, guardrail);
+    try stdout.interface.print("moon_quant.workflow=canonical_guardrail_v1\n", .{});
+    try stdout.interface.print(
+        "moon_quant.workflow.command=zig build moon-quant-guardrail -- --model <path> --bench-runs 5 --backend metal --min-warm-decode-speedup-pct 0 --max-warm-ttft-regression-pct 25\n",
+        .{},
+    );
 
     if (moon_quant_bench.findViolation(results, guardrail)) |violation| {
         try stdout.interface.print(

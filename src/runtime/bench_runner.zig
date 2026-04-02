@@ -15,9 +15,11 @@ pub const BenchSummary = struct {
     warm_decode_ns_avg: u64 = 0,
     warm_generated_token_count_avg: usize = 0,
     warm_startup_breakdown_avg: types.StartupBreakdown = .{},
+    warm_metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *BenchSummary, allocator: std.mem.Allocator) void {
         self.cold.deinit(allocator);
+        if (self.warm_metal_profile_summary) |summary| allocator.free(summary);
         self.* = undefined;
     }
 
@@ -152,6 +154,7 @@ pub fn runWarmBench(
     var warm_decode_total: u128 = 0;
     var warm_generated_token_total: u128 = 0;
     var warm_startup_breakdown_total = types.StartupBreakdown{};
+    var warm_metal_profile_summary: ?[]u8 = null;
 
     for (1..bench_runs) |_| {
         var warm = try runtime.generate(prompt, options, 0);
@@ -166,6 +169,10 @@ pub fn runWarmBench(
         warm_startup_breakdown_total.metal_prewarm_ns += warm.startup_breakdown.metal_prewarm_ns;
         warm_startup_breakdown_total.session_init_ns += warm.startup_breakdown.session_init_ns;
         warm_startup_breakdown_total.first_decode_step_ns += warm.startup_breakdown.first_decode_step_ns;
+        if (warm_metal_profile_summary == null and warm.metal_profile_summary != null) {
+            warm_metal_profile_summary = warm.metal_profile_summary;
+            warm.metal_profile_summary = null;
+        }
         warm.deinit(allocator);
     }
 
@@ -186,6 +193,7 @@ pub fn runWarmBench(
             .session_init_ns = @intCast(warm_startup_breakdown_total.session_init_ns / warm_runs),
             .first_decode_step_ns = @intCast(warm_startup_breakdown_total.first_decode_step_ns / warm_runs),
         },
+        .warm_metal_profile_summary = warm_metal_profile_summary,
     };
 }
 
