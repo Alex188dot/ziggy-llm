@@ -207,7 +207,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --min-p <f>       Sampling filter: drop tokens below min_p * top token prob (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
-        \\      --metal-profile   Print aggregated Metal decode timing and dominant shape data
+        \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:

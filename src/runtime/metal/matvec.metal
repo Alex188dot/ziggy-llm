@@ -187,12 +187,12 @@ kernel void matvec_q6k_f32(
     for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
         const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
         const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint half = block_chunk / 32;
+        const uint block_half = block_chunk / 32;
         const uint l = block_chunk % 32;
         const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
-        const device uchar *ql = block + half * 64;
-        const device uchar *qh = block + 128 + half * 32;
-        const device uchar *scales = block + 192 + half * 8;
+        const device uchar *ql = block + block_half * 64;
+        const device uchar *qh = block + 128 + block_half * 32;
+        const device uchar *scales = block + 192 + block_half * 8;
         const float d = read_half_le(block, 208);
         const uint scale_index = l / 16;
         const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
@@ -206,7 +206,7 @@ kernel void matvec_q6k_f32(
         const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
         const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
         const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
-        const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + half * 128 + l;
+        const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
 
         local_sum += s0 * q1 * input[input_offset + 0];
         local_sum += s2 * q2 * input[input_offset + 32];

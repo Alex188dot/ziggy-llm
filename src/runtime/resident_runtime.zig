@@ -63,7 +63,7 @@ pub const ResidentRuntime = struct {
         stream_callback: ?llama_cpu.StreamCallback,
     ) !types.GenerationReport {
         self.unloadIfExpired();
-        try self.ensureLoaded(model_path, options.backend);
+        try self.ensureLoaded(model_path, options.backend, options.metal_profile);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
 
@@ -134,6 +134,13 @@ pub const ResidentRuntime = struct {
             report.startup_breakdown.metal_prewarm_ns = 0;
         }
 
+        const combined_profile_summary = try combineProfileSummaries(
+            self.allocator,
+            loaded.execution.startup_profile_summary,
+            report.metal_profile_summary,
+        );
+        if (report.metal_profile_summary) |summary| self.allocator.free(summary);
+
         return .{
             .generated_text = report.generated_text,
             .prompt_token_count = report.prompt_token_count,
@@ -147,17 +154,17 @@ pub const ResidentRuntime = struct {
             .temperature = options.temperature,
             .backend = report.backend,
             .startup_breakdown = report.startup_breakdown,
-            .metal_profile_summary = report.metal_profile_summary,
+            .metal_profile_summary = combined_profile_summary,
         };
     }
 
     pub fn promptTokenCount(self: *ResidentRuntime, model_path: []const u8, prompt: []const u8, backend: types.BackendPreference) !usize {
-        try self.ensureLoaded(model_path, backend);
+        try self.ensureLoaded(model_path, backend, false);
         const loaded = &self.loaded.?;
         return llama_cpu.countPromptTokens(self.allocator, &loaded.model, prompt);
     }
 
-    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference) !void {
+    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, startup_profile_enabled: bool) !void {
         if (self.loaded) |loaded| {
             if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref) return;
             self.unload();
@@ -168,7 +175,7 @@ pub const ResidentRuntime = struct {
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 
-        var execution = try selectExecution(self.allocator, &model, backend_pref);
+        var execution = try selectExecution(self.allocator, &model, backend_pref, startup_profile_enabled);
         errdefer execution.deinit(self.allocator);
 
         const owned_model_path = try self.allocator.dupe(u8, model_path);
@@ -248,10 +255,12 @@ const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
     dense_tensors: ?llama_metal.DenseTensorStore = null,
     startup_breakdown: types.StartupBreakdown = .{},
+    startup_profile_summary: ?[]u8 = null,
 
     fn deinit(self: *ExecutionResources, allocator: std.mem.Allocator) void {
         if (self.backend) |backend| backend.deinit(allocator);
         if (self.dense_tensors) |*dense_tensors| dense_tensors.deinit();
+        if (self.startup_profile_summary) |summary| allocator.free(summary);
         self.* = undefined;
     }
 };
@@ -260,11 +269,12 @@ fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
     preference: types.BackendPreference,
+    startup_profile_enabled: bool,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, .enabled),
-        .auto => createMetalExecution(allocator, model, .enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, .enabled, startup_profile_enabled),
+        .auto => createMetalExecution(allocator, model, .enabled, startup_profile_enabled) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -275,11 +285,13 @@ fn createMetalExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
     moon_quant_mode: types.MoonQuantMode,
+    startup_profile_enabled: bool,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
+    var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model, moon_quant_mode);
+    try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();
@@ -287,8 +299,9 @@ fn createMetalExecution(
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
     const metal_prewarm_begin = std.time.nanoTimestamp();
-    try dense_tensors.prewarm(backend);
+    try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
     const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    const startup_profile_summary = if (startup_profiler.enabled) try startup_profiler.renderSummary(allocator) else null;
 
     return .{
         .backend = backend,
@@ -298,7 +311,27 @@ fn createMetalExecution(
             .backend_init_ns = backend_init_ns,
             .metal_prewarm_ns = metal_prewarm_ns,
         },
+        .startup_profile_summary = startup_profile_summary,
     };
+}
+
+fn combineProfileSummaries(
+    allocator: std.mem.Allocator,
+    startup_summary: ?[]const u8,
+    decode_summary: ?[]const u8,
+) !?[]u8 {
+    const startup = startup_summary orelse "";
+    const decode = decode_summary orelse "";
+    if (startup.len == 0 and decode.len == 0) return null;
+
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    if (startup.len > 0) try buffer.appendSlice(allocator, startup);
+    if (startup.len > 0 and decode.len > 0 and startup[startup.len - 1] != '\n') {
+        try buffer.append(allocator, '\n');
+    }
+    if (decode.len > 0) try buffer.appendSlice(allocator, decode);
+    return try buffer.toOwnedSlice(allocator);
 }
 
 fn lookupDenseTensor(ctx: ?*const anyopaque, tensor: llama_cpu.TensorRef) ?[]const f32 {

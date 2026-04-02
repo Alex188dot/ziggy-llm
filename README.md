@@ -196,6 +196,7 @@ Current Metal-specific limitations:
 - Apple Silicon macOS builds only
 - Metal acceleration is currently implemented for the `llama` runtime only
 - quantized Metal fast paths now cover generic `Q4_K`, packed MoonQuant `Q4_K`, and raw `Q6_K`
+- `--metal-profile` now reports startup tensor-prepare / prewarm cost alongside the decode profile
 - performance notes and current benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Planned HTTP API
