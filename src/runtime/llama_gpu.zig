@@ -24,10 +24,12 @@ pub const TensorDesc = struct {
 };
 
 pub const LayerDesc = struct {
+    attn_norm: TensorDesc,
     attn_q: TensorDesc,
     attn_k: TensorDesc,
     attn_v: TensorDesc,
     attn_output: TensorDesc,
+    ffn_norm: TensorDesc,
     ffn_gate: TensorDesc,
     ffn_down: TensorDesc,
     ffn_up: TensorDesc,
@@ -45,13 +47,15 @@ pub const ModelDesc = struct {
     kv_dimension: usize,
     rope_freq_base: f32,
     vocab_size: usize,
+    rms_norm_eps: f32,
 };
 
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
     dense_lookup: DenseLookup,
     model: ModelDesc,
-    input: metal_backend.BufferHandle,
+    hidden: metal_backend.BufferHandle,
+    normed: metal_backend.BufferHandle,
     q: metal_backend.BufferHandle,
     k: metal_backend.BufferHandle,
     v: metal_backend.BufferHandle,
@@ -70,8 +74,10 @@ pub const Session = struct {
         const max_input = @max(model.embedding_length, model.feed_forward_length);
         const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.vocab_size));
         const cache_len = model.block_count * model.context_length * model.kv_dimension;
-        const input = try metal_backend.createScratchBuffer(backend, max_input);
-        errdefer metal_backend.destroyBuffer(input);
+        const hidden = try metal_backend.createScratchBuffer(backend, max_input);
+        errdefer metal_backend.destroyBuffer(hidden);
+        const normed = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        errdefer metal_backend.destroyBuffer(normed);
         const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
         const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
@@ -95,7 +101,8 @@ pub const Session = struct {
             .backend = backend,
             .dense_lookup = dense_lookup,
             .model = model,
-            .input = input,
+            .hidden = hidden,
+            .normed = normed,
             .q = q,
             .k = k,
             .v = v,
@@ -109,7 +116,8 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        metal_backend.destroyBuffer(self.input);
+        metal_backend.destroyBuffer(self.hidden);
+        metal_backend.destroyBuffer(self.normed);
         metal_backend.destroyBuffer(self.q);
         metal_backend.destroyBuffer(self.k);
         metal_backend.destroyBuffer(self.v);
@@ -122,18 +130,21 @@ pub const Session = struct {
         self.* = undefined;
     }
 
+    pub fn beginToken(self: *Session, input: []const f32) !void {
+        try metal_backend.writeBufferF32(self.hidden, input);
+        try metal_backend.beginSequence(self.backend);
+    }
+
     pub fn runAttentionBlock(
         self: *Session,
-        input: []const f32,
         layer: LayerDesc,
         layer_index: usize,
         position: usize,
-        out: []f32,
     ) !void {
-        try metal_backend.writeBufferF32(self.input, input);
-        try self.runProjection(layer.attn_q, self.input, self.q);
-        try self.runProjection(layer.attn_k, self.input, self.k);
-        try self.runProjection(layer.attn_v, self.input, self.v);
+        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+        try self.runProjection(layer.attn_q, self.normed, self.q);
+        try self.runProjection(layer.attn_k, self.normed, self.k);
+        try self.runProjection(layer.attn_v, self.normed, self.v);
 
         try metal_backend.applyRoPE(
             self.backend,
@@ -176,22 +187,40 @@ pub const Session = struct {
             @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
         );
         try self.runProjection(layer.attn_output, self.attn, self.tmp);
-        try metal_backend.readBufferF32(self.tmp, out);
+        try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
     }
 
-    pub fn runFfnBlock(self: *Session, input: []const f32, layer: LayerDesc, out: []f32) !void {
-        try metal_backend.writeBufferF32(self.input, input);
-        try self.runProjection(layer.ffn_gate, self.input, self.gate);
-        try self.runProjection(layer.ffn_up, self.input, self.up);
+    pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
+        try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
+        try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+        try self.runProjection(layer.ffn_up, self.normed, self.up);
         try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
         try self.runProjection(layer.ffn_down, self.gate, self.tmp);
+        try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+    }
+
+    pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        try metal_backend.commitSequence(self.backend);
         try metal_backend.readBufferF32(self.tmp, out);
     }
 
-    pub fn runOutput(self: *Session, input: []const f32, tensor: TensorDesc, out: []f32) !void {
-        try metal_backend.writeBufferF32(self.input, input);
-        try self.runProjection(tensor, self.input, self.tmp);
-        try metal_backend.readBufferF32(self.tmp, out);
+    fn runRmsNorm(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+    ) !void {
+        const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        try metal_backend.rmsNorm(
+            self.backend,
+            input,
+            weights,
+            output,
+            self.model.embedding_length,
+            self.model.rms_norm_eps,
+        );
     }
 
     fn runProjection(

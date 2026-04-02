@@ -141,4 +141,36 @@ int ziggy_metal_silu_mul_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_begin_sequence(
+    ZiggyMetalContext *ctx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_commit_sequence(
+    ZiggyMetalContext *ctx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_add_in_place_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *src,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_rms_norm_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t count,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif

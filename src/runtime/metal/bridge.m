@@ -13,6 +13,9 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> ropePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> attentionFusedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPipeline;
+@property(nonatomic, strong) id<MTLCommandBuffer> pendingCommandBuffer;
 @end
 
 @implementation ZiggyMetalState
@@ -57,6 +60,39 @@ static id<MTLComputePipelineState> ziggy_pipeline(
     return [device newComputePipelineStateWithFunction:function error:error];
 }
 
+static void ziggy_dispatch_standard(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger grid_width
+) {
+    NSUInteger thread_width = pipeline.threadExecutionWidth;
+    if (thread_width == 0) thread_width = 1;
+    NSUInteger threads_per_group = thread_width < grid_width ? thread_width : grid_width;
+    if (threads_per_group == 0) threads_per_group = 1;
+    MTLSize grid_size = MTLSizeMake(grid_width, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+}
+
+static int ziggy_commit_pending(
+    ZiggyMetalState *state,
+    char *error_message,
+    size_t error_message_len
+) {
+    id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+    if (command_buffer == nil) return ZIGGY_METAL_OK;
+
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    state.pendingCommandBuffer = nil;
+
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+    return ZIGGY_METAL_OK;
+}
+
 static int ziggy_run_compute(
     ZiggyMetalState *state,
     id<MTLComputePipelineState> pipeline,
@@ -65,7 +101,9 @@ static int ziggy_run_compute(
     char *error_message,
     size_t error_message_len
 ) {
-    id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
+    id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+    const bool has_pending = command_buffer != nil;
+    if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
     if (command_buffer == nil) {
         ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
         return ZIGGY_METAL_EXECUTION_FAILED;
@@ -79,15 +117,10 @@ static int ziggy_run_compute(
 
     [encoder setComputePipelineState:pipeline];
     encode(encoder);
-
-    NSUInteger thread_width = pipeline.threadExecutionWidth;
-    if (thread_width == 0) thread_width = 1;
-    NSUInteger threads_per_group = thread_width < grid_width ? thread_width : grid_width;
-    if (threads_per_group == 0) threads_per_group = 1;
-    MTLSize grid_size = MTLSizeMake(grid_width, 1, 1);
-    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
-    [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+    ziggy_dispatch_standard(encoder, pipeline, grid_width);
     [encoder endEncoding];
+
+    if (has_pending) return ZIGGY_METAL_OK;
 
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
@@ -169,6 +202,18 @@ int ziggy_metal_create_context(
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
 
+        id<MTLComputePipelineState> add_in_place_pipeline = ziggy_pipeline(device, library, @"add_in_place_f32", &pipeline_error);
+        if (add_in_place_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal add pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> rms_norm_pipeline = ziggy_pipeline(device, library, @"rms_norm_f32", &pipeline_error);
+        if (rms_norm_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal RMSNorm pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
         ZiggyMetalState *state = [ZiggyMetalState new];
         state.device = device;
         state.queue = queue;
@@ -177,6 +222,8 @@ int ziggy_metal_create_context(
         state.ropePipeline = rope_pipeline;
         state.attentionFusedPipeline = attention_fused_pipeline;
         state.siluMulPipeline = silu_mul_pipeline;
+        state.addInPlacePipeline = add_in_place_pipeline;
+        state.rmsNormPipeline = rms_norm_pipeline;
         *out_ctx = (__bridge_retained void *)state;
 
         if (out_info != NULL) {
@@ -411,6 +458,18 @@ int ziggy_metal_copy_buffer_region(
             return ZIGGY_METAL_BUFFER_FAILED;
         }
 
+        if (state.pendingCommandBuffer != nil) {
+            id<MTLBlitCommandEncoder> encoder = [state.pendingCommandBuffer blitCommandEncoder];
+            if (encoder == nil) {
+                ziggy_write_error(error_message, error_message_len, @"failed to create Metal blit encoder");
+                return ZIGGY_METAL_EXECUTION_FAILED;
+            }
+
+            [encoder copyFromBuffer:src_buffer.buffer sourceOffset:src_offset toBuffer:dst_buffer.buffer destinationOffset:dst_offset size:length];
+            [encoder endEncoding];
+            return ZIGGY_METAL_OK;
+        }
+
         id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
         if (command_buffer == nil) {
             ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
@@ -504,7 +563,9 @@ int ziggy_metal_attention_fused_f32(
         const ZiggyMetalBufferState *k_buffer = ziggy_const_buffer(k_cache);
         const ZiggyMetalBufferState *v_buffer = ziggy_const_buffer(v_cache);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-        id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
         if (command_buffer == nil) {
             ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
             return ZIGGY_METAL_EXECUTION_FAILED;
@@ -537,6 +598,8 @@ int ziggy_metal_attention_fused_f32(
         MTLSize grid_size = MTLSizeMake(head_count, 1, 1);
         [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
         [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
 
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
@@ -574,6 +637,116 @@ int ziggy_metal_silu_mul_f32(
                 [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:up_buffer.buffer offset:0 atIndex:1];
                 [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_begin_sequence(
+    ZiggyMetalContext *ctx,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sequence request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        if (state.pendingCommandBuffer != nil) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sequence already active");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        state.pendingCommandBuffer = [state.queue commandBuffer];
+        if (state.pendingCommandBuffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_commit_sequence(
+    ZiggyMetalContext *ctx,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sequence commit request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        return ziggy_commit_pending(state, error_message, error_message_len);
+    }
+}
+
+int ziggy_metal_add_in_place_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *src,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || dst == NULL || src == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal add request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+        const ZiggyMetalBufferState *src_buffer = ziggy_const_buffer(src);
+        return ziggy_run_compute(
+            state,
+            state.addInPlacePipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:src_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_rms_norm_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t count,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || input == NULL || weights == NULL || output == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal RMSNorm request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(weights);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
+        return ziggy_run_compute(
+            state,
+            state.rmsNormPipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&count length:sizeof(count) atIndex:3];
+                [encoder setBytes:&eps length:sizeof(eps) atIndex:4];
             },
             error_message,
             error_message_len

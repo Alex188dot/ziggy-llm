@@ -504,11 +504,11 @@ const Session = struct {
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
         for (self.model.layers, 0..) |layer, layer_index| {
-            try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
             if (self.gpu_session) |*gpu_session| {
-                try gpu_session.runAttentionBlock(self.normed, adaptLayerDesc(layer), layer_index, self.position, self.attn_tmp);
-                addInPlace(self.hidden, self.attn_tmp);
+                if (layer_index == 0) try gpu_session.beginToken(self.hidden);
+                try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else {
+                try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 try self.matVec(self.q, layer.attn_q, self.normed);
                 try self.matVec(self.k, layer.attn_k, self.normed);
                 try self.matVec(self.v, layer.attn_v, self.normed);
@@ -520,10 +520,10 @@ const Session = struct {
                 addInPlace(self.hidden, self.attn_tmp);
             }
 
-            try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
             if (self.gpu_session) |*gpu_session| {
-                try gpu_session.runFfnBlock(self.normed, adaptLayerDesc(layer), self.attn_tmp);
+                try gpu_session.runFfnBlock(adaptLayerDesc(layer));
             } else {
+                try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
                 try self.matVec(self.gate, layer.ffn_gate, self.normed);
                 try self.matVec(self.up, layer.ffn_up, self.normed);
                 for (self.gate, self.up) |*gate, up| {
@@ -534,10 +534,10 @@ const Session = struct {
             addInPlace(self.hidden, self.attn_tmp);
         }
 
-        try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
         if (self.gpu_session) |*gpu_session| {
-            try gpu_session.runOutput(self.normed, adaptTensorDesc(self.model.output), self.logits);
+            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
         } else {
+            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
             try self.matVec(self.logits, self.model.output, self.normed);
         }
 
@@ -643,10 +643,12 @@ fn adaptTensorDesc(tensor: TensorRef) llama_gpu.TensorDesc {
 
 fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     return .{
+        .attn_norm = adaptTensorDesc(layer.attn_norm),
         .attn_q = adaptTensorDesc(layer.attn_q),
         .attn_k = adaptTensorDesc(layer.attn_k),
         .attn_v = adaptTensorDesc(layer.attn_v),
         .attn_output = adaptTensorDesc(layer.attn_output),
+        .ffn_norm = adaptTensorDesc(layer.ffn_norm),
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
         .ffn_down = adaptTensorDesc(layer.ffn_down),
         .ffn_up = adaptTensorDesc(layer.ffn_up),
@@ -666,6 +668,7 @@ fn adaptModelDesc(model: *const Model) llama_gpu.ModelDesc {
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
         .vocab_size = model.tokenizer.tokens.len,
+        .rms_norm_eps = model.rms_norm_eps,
     };
 }
 

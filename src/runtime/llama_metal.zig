@@ -26,11 +26,14 @@ pub const DenseTensorStore = struct {
 
     pub fn populate(self: *DenseTensorStore, model: *const llama.Model) !void {
         try self.addTensor(model, model.output);
+        try self.addTensor(model, model.output_norm);
         for (model.layers) |layer| {
+            try self.addTensor(model, layer.attn_norm);
             try self.addTensor(model, layer.attn_q);
             try self.addTensor(model, layer.attn_k);
             try self.addTensor(model, layer.attn_v);
             try self.addTensor(model, layer.attn_output);
+            try self.addTensor(model, layer.ffn_norm);
             try self.addTensor(model, layer.ffn_gate);
             try self.addTensor(model, layer.ffn_down);
             try self.addTensor(model, layer.ffn_up);

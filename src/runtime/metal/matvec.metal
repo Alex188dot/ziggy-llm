@@ -177,3 +177,32 @@ kernel void silu_mul_f32(
     const float value = gate[index];
     gate[index] = (value / (1.0f + exp(-value))) * up[index];
 }
+
+kernel void add_in_place_f32(
+    device float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    dst[index] += src[index];
+}
+
+kernel void rms_norm_f32(
+    device const float *input [[buffer(0)]],
+    device const float *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+
+    float sum = 0.0f;
+    for (uint i = 0; i < count; i += 1) {
+        const float value = input[i];
+        sum += value * value;
+    }
+    const float scale = 1.0f / sqrt(sum / float(count) + eps);
+    output[index] = input[index] * scale * weights[index];
+}

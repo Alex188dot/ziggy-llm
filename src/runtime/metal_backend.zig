@@ -229,6 +229,26 @@ pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     try readBuffer(buffer.raw, out);
 }
 
+pub fn beginSequence(backend: backend_api.MatVecBackend) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_begin_sequence(
+        state.context,
+        null,
+        0,
+    ));
+}
+
+pub fn commitSequence(backend: backend_api.MatVecBackend) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_commit_sequence(
+        state.context,
+        null,
+        0,
+    ));
+}
+
 pub fn runMatVecToBuffer(
     backend: backend_api.MatVecBackend,
     matrix: []const f32,
@@ -372,6 +392,47 @@ pub fn siluMul(
         gate.raw,
         up.raw,
         @intCast(count),
+        null,
+        0,
+    ));
+}
+
+pub fn addInPlace(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    src: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    try mapStatus(c.ziggy_metal_add_in_place_f32(
+        state.context,
+        dst.raw,
+        src.raw,
+        @intCast(count),
+        null,
+        0,
+    ));
+}
+
+pub fn rmsNorm(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    weights: []const f32,
+    output: BufferHandle,
+    count: usize,
+    eps: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const weights_buffer = try state.matrixBuffer(weights[0..count]);
+    try mapStatus(c.ziggy_metal_rms_norm_f32(
+        state.context,
+        input.raw,
+        weights_buffer.raw,
+        output.raw,
+        @intCast(count),
+        eps,
         null,
         0,
     ));
