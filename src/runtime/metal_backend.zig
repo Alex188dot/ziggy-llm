@@ -16,7 +16,7 @@ const MatrixKey = struct {
     len: usize,
 };
 
-const MetalBuffer = if (build_enabled_value) struct {
+pub const BufferHandle = if (build_enabled_value) struct {
     raw: *c.ZiggyMetalBuffer,
     byte_len: usize,
 } else struct {};
@@ -24,9 +24,9 @@ const MetalBuffer = if (build_enabled_value) struct {
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
-    input_buffer: ?MetalBuffer = null,
-    output_buffer: ?MetalBuffer = null,
-    matrix_buffers: std.AutoHashMap(MatrixKey, MetalBuffer),
+    input_buffer: ?BufferHandle = null,
+    output_buffer: ?BufferHandle = null,
+    matrix_buffers: std.AutoHashMap(MatrixKey, BufferHandle),
 
     fn init(allocator: std.mem.Allocator) !*State {
         var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
@@ -45,7 +45,7 @@ const State = if (build_enabled_value) struct {
         state.* = .{
             .allocator = allocator,
             .context = raw_context.?,
-            .matrix_buffers = std.AutoHashMap(MatrixKey, MetalBuffer).init(allocator),
+            .matrix_buffers = std.AutoHashMap(MatrixKey, BufferHandle).init(allocator),
         };
         return state;
     }
@@ -100,7 +100,7 @@ const State = if (build_enabled_value) struct {
         try readBuffer(output_buffer.raw, out[0..rows]);
     }
 
-    fn matrixBuffer(self: *State, matrix: []const f32) !MetalBuffer {
+    fn matrixBuffer(self: *State, matrix: []const f32) !BufferHandle {
         const key = MatrixKey{
             .address = @intFromPtr(matrix.ptr),
             .len = matrix.len,
@@ -108,7 +108,7 @@ const State = if (build_enabled_value) struct {
         if (self.matrix_buffers.get(key)) |buffer| return buffer;
 
         const raw = try createBuffer(self.context, matrix);
-        const buffer = MetalBuffer{
+        const buffer = BufferHandle{
             .raw = raw,
             .byte_len = matrix.len * @sizeOf(f32),
         };
@@ -116,7 +116,7 @@ const State = if (build_enabled_value) struct {
         return buffer;
     }
 
-    fn ensureScratchBuffer(self: *State, slot: *?MetalBuffer, elements: usize) !MetalBuffer {
+    fn ensureScratchBuffer(self: *State, slot: *?BufferHandle, elements: usize) !BufferHandle {
         const required_len = elements * @sizeOf(f32);
         if (slot.*) |existing| {
             if (existing.byte_len >= required_len) return existing;
@@ -125,7 +125,7 @@ const State = if (build_enabled_value) struct {
         }
 
         const raw = try createEmptyBuffer(self.context, required_len);
-        const buffer = MetalBuffer{
+        const buffer = BufferHandle{
             .raw = raw,
             .byte_len = required_len,
         };
@@ -173,6 +173,57 @@ pub fn cacheMatrix(backend: backend_api.MatVecBackend, matrix: []const f32) !voi
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
     _ = try state.matrixBuffer(matrix);
+}
+
+pub fn createScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) !BufferHandle {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const raw = try createEmptyBuffer(state.context, elements * @sizeOf(f32));
+    return .{
+        .raw = raw,
+        .byte_len = elements * @sizeOf(f32),
+    };
+}
+
+pub fn destroyBuffer(buffer: BufferHandle) void {
+    if (!build_enabled_value) return;
+    c.ziggy_metal_destroy_buffer(buffer.raw);
+}
+
+pub fn writeBufferF32(buffer: BufferHandle, values: []const f32) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (values.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
+    try writeBuffer(buffer.raw, values);
+}
+
+pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (out.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
+    try readBuffer(buffer.raw, out);
+}
+
+pub fn runMatVecToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
+    try mapStatus(c.ziggy_metal_run_matvec_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        null,
+        0,
+    ));
 }
 
 fn metalMatVec(
