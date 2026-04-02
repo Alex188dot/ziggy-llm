@@ -3,6 +3,7 @@ const terminal = @import("terminal.zig");
 const backend_api = @import("runtime/backend.zig");
 const llama_gpu = @import("runtime/llama_gpu.zig");
 const metal_profile = @import("runtime/metal_profile.zig");
+const moon_quant_calibration = @import("moon_quant_calibration.zig");
 const runtime_types = @import("runtime/types.zig");
 
 pub const GenerateError = error{
@@ -431,6 +432,7 @@ pub const ReusableSession = struct {
             dense_tensors,
             model.context_length,
             null,
+            null,
         );
         errdefer session.deinit(allocator);
         return .{ .session = session };
@@ -465,6 +467,7 @@ const Session = struct {
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
+    moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
 
@@ -475,6 +478,7 @@ const Session = struct {
         dense_tensors: ?DenseTensorLookup,
         token_capacity: usize,
         profiler: ?*metal_profile.Profiler,
+        moon_quant_calibrator: ?*moon_quant_calibration.Calibrator,
     ) !Session {
         var session = Session{
             .model = model,
@@ -494,6 +498,7 @@ const Session = struct {
             .scores = try allocator.alloc(f32, model.context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
             .v_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
+            .moon_quant_calibrator = moon_quant_calibrator,
         };
         errdefer session.deinit(allocator);
 
@@ -553,6 +558,9 @@ const Session = struct {
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
+                try self.recordCalibration(layer.attn_q, .attn_q, self.normed);
+                try self.recordCalibration(layer.attn_k, .attn_k, self.normed);
+                try self.recordCalibration(layer.attn_v, .attn_v, self.normed);
                 try self.matVec(self.q, layer.attn_q, self.normed);
                 try self.matVec(self.k, layer.attn_k, self.normed);
                 try self.matVec(self.v, layer.attn_v, self.normed);
@@ -560,6 +568,7 @@ const Session = struct {
                 applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
+                try self.recordCalibration(layer.attn_output, .attn_output, self.attn_out);
                 try self.matVec(self.attn_tmp, layer.attn_output, self.attn_out);
                 addInPlace(self.hidden, self.attn_tmp);
             }
@@ -568,11 +577,14 @@ const Session = struct {
                 try gpu_session.runFfnBlock(adaptLayerDesc(layer));
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
+                try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
+                try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
                 try self.matVec(self.gate, layer.ffn_gate, self.normed);
                 try self.matVec(self.up, layer.ffn_up, self.normed);
                 for (self.gate, self.up) |*gate, up| {
                     gate.* = silu(gate.*) * up;
                 }
+                try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
                 try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
             }
             addInPlace(self.hidden, self.attn_tmp);
@@ -582,12 +594,30 @@ const Session = struct {
             try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
         } else {
             try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
+            try self.recordCalibration(self.model.output, .output, self.normed);
             try self.matVec(self.logits, self.model.output, self.normed);
         }
 
         self.token_buffer[self.position] = token_id;
         self.position += 1;
         return self.logits;
+    }
+
+    fn recordCalibration(self: *Session, tensor: TensorRef, role: moon_quant_calibration.Role, input: []const f32) !void {
+        const calibrator = self.moon_quant_calibrator orelse return;
+        try calibrator.observe(.{
+            .name = tensor.name,
+            .role = role,
+            .rows = tensor.rowCount() catch return error.InvalidTensorMetadata,
+            .cols = tensor.rowLen() catch return error.InvalidTensorMetadata,
+            .current_format = switch (tensor.tensor_type) {
+                .f32 => .f32_reference,
+                .f16 => .f16_reference,
+                .q4_k => .legacy_q4_k,
+                .q6_k => .legacy_q6_k,
+            },
+            .values = input,
+        });
     }
 
     fn storeKv(self: *Session, layer_index: usize) void {
@@ -881,6 +911,7 @@ pub fn generateLoadedStreaming(
         dense_tensors,
         @min(model.context_length, prompt_capacity),
         if (profiler.enabled) &profiler else null,
+        null,
     );
     const session_init_ns = deltaNs(session_init_begin, std.time.nanoTimestamp());
     defer session.deinit(allocator);
@@ -1049,6 +1080,42 @@ pub fn generateLoadedStreamingCached(
     };
 }
 
+pub const CalibrationSession = struct {
+    session: Session,
+
+    pub fn deinit(self: *CalibrationSession, allocator: std.mem.Allocator) void {
+        self.session.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn tokenBuffer(self: *CalibrationSession) []u32 {
+        return self.session.token_buffer;
+    }
+
+    pub fn runPrompt(self: *CalibrationSession, prompt_tokens: []const u32) !void {
+        try self.session.runPrompt(prompt_tokens);
+    }
+};
+
+pub fn initCalibrationSession(
+    allocator: std.mem.Allocator,
+    model: *const Model,
+    token_capacity: usize,
+    calibrator: *moon_quant_calibration.Calibrator,
+) !CalibrationSession {
+    var session = try Session.init(
+        allocator,
+        model,
+        null,
+        null,
+        token_capacity,
+        null,
+        calibrator,
+    );
+    errdefer session.deinit(allocator);
+    return .{ .session = session };
+}
+
 fn commonPrefixLen(lhs: []const u32, rhs: []const u32) usize {
     const max_len = @min(lhs.len, rhs.len);
     var index: usize = 0;
@@ -1169,6 +1236,10 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
     const token_buf = try allocator.alloc(u32, model.context_length);
     defer allocator.free(token_buf);
     return model.tokenizer.encodeInto(allocator, prompt, token_buf);
+}
+
+pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
+    return model.tokenizer.encodeInto(allocator, prompt, out);
 }
 
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
