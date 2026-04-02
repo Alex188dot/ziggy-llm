@@ -52,6 +52,7 @@ pub const DenseTensorLookup = struct {
     get_fn: *const fn (?*const anyopaque, TensorRef) ?[]const f32,
     get_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const f32,
     get_raw_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const u8,
+    get_moon_quant_by_offset_fn: *const fn (?*const anyopaque, u64) ?[]const u8,
 
     pub fn get(self: DenseTensorLookup, tensor: TensorRef) ?[]const f32 {
         return self.get_fn(self.ctx, tensor);
@@ -63,6 +64,10 @@ pub const DenseTensorLookup = struct {
 
     pub fn getRawByOffset(self: DenseTensorLookup, offset: u64) ?[]const u8 {
         return self.get_raw_by_offset_fn(self.ctx, offset);
+    }
+
+    pub fn getMoonQuantByOffset(self: DenseTensorLookup, offset: u64) ?[]const u8 {
+        return self.get_moon_quant_by_offset_fn(self.ctx, offset);
     }
 };
 
@@ -420,13 +425,13 @@ pub const ReusableSession = struct {
         dense_tensors: ?DenseTensorLookup,
     ) !ReusableSession {
         var session = try Session.init(
-                allocator,
-                model,
-                backend,
-                dense_tensors,
-                model.context_length,
-                null,
-            );
+            allocator,
+            model,
+            backend,
+            dense_tensors,
+            model.context_length,
+            null,
+        );
         errdefer session.deinit(allocator);
         return .{ .session = session };
     }
@@ -668,6 +673,7 @@ fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
         .ctx = lookup.ctx,
         .get_dense_fn = lookup.get_by_offset_fn,
         .get_raw_fn = lookup.get_raw_by_offset_fn,
+        .get_moon_quant_fn = lookup.get_moon_quant_by_offset_fn,
     };
 }
 

@@ -9,8 +9,8 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 - [x] Surface `MoonQuant` status in `inspect` so supported-vs-planned formats are explicit.
 - [x] Define the first Metal-native packed layout contract for `Q4_K_M`.
 - [x] Implement a loader-side packer that turns GGUF `Q4_K` rows into the fixed-stride `MoonQuant` `Q4_K_M` layout.
-- [ ] Thread the packed `MoonQuant` tensors through the full runtime hot path.
-- [ ] Add a dedicated Metal kernel that consumes the packed `MoonQuant` `Q4_K_M` layout directly.
+- [x] Thread the packed `MoonQuant` tensors through the full runtime hot path.
+- [x] Add a dedicated Metal kernel that consumes the packed `MoonQuant` `Q4_K_M` layout directly.
 - [ ] Specialize that kernel for static extents that matter on Apple Silicon decode.
 - [ ] Add postfix fusion around the packed `MoonQuant` path where it measurably reduces memory traffic.
 - [ ] Implement per-layer or non-uniform bit allocation instead of one global quant choice.

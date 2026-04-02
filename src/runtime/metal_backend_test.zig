@@ -1,6 +1,7 @@
 const std = @import("std");
 const metal_backend = @import("metal_backend.zig");
 const llama_cpu = @import("../llama_cpu.zig");
+const moon_quant = @import("../moon_quant.zig");
 
 test "metal q4k matvec matches cpu dequantized reference" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
@@ -36,6 +37,48 @@ test "metal q4k matvec matches cpu dequantized reference" {
     const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
     for (0..rows) |row| {
         const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(&dequantized_row, .q4_k, row_bytes, cols);
+        expected[row] = dot(&dequantized_row, &input);
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.01);
+    }
+}
+
+test "metal MoonQuant q4k matvec matches cpu dequantized reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const rows = 3;
+    const cols = 512;
+    var raw_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&raw_matrix, rows, cols);
+    var packed_matrix = try moon_quant.packQ4KTensor(std.testing.allocator, &raw_matrix, rows, cols);
+    defer packed_matrix.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.125) + 0.1;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.runMatVecMoonQuantQ4KToBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, rows, cols);
+
+    var actual: [rows]f32 = undefined;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected: [rows]f32 = undefined;
+    var dequantized_row: [cols]f32 = undefined;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    for (0..rows) |row| {
+        const row_bytes = raw_matrix[row * row_size ..][0..row_size];
         try llama_cpu.dequantizeRow(&dequantized_row, .q4_k, row_bytes, cols);
         expected[row] = dot(&dequantized_row, &input);
         try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.01);

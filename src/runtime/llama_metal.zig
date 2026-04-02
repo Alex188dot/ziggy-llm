@@ -62,6 +62,11 @@ pub const DenseTensorStore = struct {
         return self.moon_quant_tensors.get(offset);
     }
 
+    pub fn getMoonQuantBytesByOffset(self: *const DenseTensorStore, offset: u64) ?[]const u8 {
+        const tensor = self.moon_quant_tensors.get(offset) orelse return null;
+        return tensor.bytes;
+    }
+
     pub fn prewarm(self: *const DenseTensorStore, backend: backend_api.MatVecBackend) !void {
         var iterator = self.tensors.valueIterator();
         while (iterator.next()) |matrix| {
@@ -70,6 +75,10 @@ pub const DenseTensorStore = struct {
         var raw_iterator = self.raw_tensors.valueIterator();
         while (raw_iterator.next()) |matrix| {
             try metal_backend.cacheRawMatrix(backend, matrix.*);
+        }
+        var moon_quant_iterator = self.moon_quant_tensors.valueIterator();
+        while (moon_quant_iterator.next()) |tensor| {
+            try metal_backend.cacheRawMatrix(backend, tensor.bytes);
         }
     }
 

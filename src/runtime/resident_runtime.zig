@@ -73,6 +73,7 @@ pub const ResidentRuntime = struct {
                 .get_fn = lookupDenseTensor,
                 .get_by_offset_fn = lookupDenseTensorByOffset,
                 .get_raw_by_offset_fn = lookupRawTensorByOffset,
+                .get_moon_quant_by_offset_fn = lookupMoonQuantTensorByOffset,
             }
         else
             null;
@@ -183,6 +184,7 @@ pub const ResidentRuntime = struct {
                     .get_fn = lookupDenseTensor,
                     .get_by_offset_fn = lookupDenseTensorByOffset,
                     .get_raw_by_offset_fn = lookupRawTensorByOffset,
+                    .get_moon_quant_by_offset_fn = lookupMoonQuantTensorByOffset,
                 }
             else
                 null,
@@ -212,6 +214,7 @@ pub const ResidentRuntime = struct {
                 .get_fn = lookupDenseTensor,
                 .get_by_offset_fn = lookupDenseTensorByOffset,
                 .get_raw_by_offset_fn = lookupRawTensorByOffset,
+                .get_moon_quant_by_offset_fn = lookupMoonQuantTensorByOffset,
             };
             if (loaded.reusable_session.session.gpu_session) |*gpu_session| {
                 gpu_session.dense_lookup.ctx = dense_tensors;
@@ -307,6 +310,11 @@ fn lookupDenseTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const f32 {
 fn lookupRawTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const u8 {
     const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
     return dense_tensors.getRawByOffset(offset);
+}
+
+fn lookupMoonQuantTensorByOffset(ctx: ?*const anyopaque, offset: u64) ?[]const u8 {
+    const dense_tensors: *const llama_metal.DenseTensorStore = @ptrCast(@alignCast(ctx orelse return null));
+    return dense_tensors.getMoonQuantBytesByOffset(offset);
 }
 
 fn isRecoverableMetalError(err: anyerror) bool {

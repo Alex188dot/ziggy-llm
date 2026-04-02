@@ -7,6 +7,7 @@ pub const DenseLookup = struct {
     ctx: ?*const anyopaque,
     get_dense_fn: *const fn (?*const anyopaque, u64) ?[]const f32,
     get_raw_fn: *const fn (?*const anyopaque, u64) ?[]const u8,
+    get_moon_quant_fn: *const fn (?*const anyopaque, u64) ?[]const u8,
 
     pub fn getDense(self: DenseLookup, offset: u64) ?[]const f32 {
         return self.get_dense_fn(self.ctx, offset);
@@ -14,6 +15,10 @@ pub const DenseLookup = struct {
 
     pub fn getRaw(self: DenseLookup, offset: u64) ?[]const u8 {
         return self.get_raw_fn(self.ctx, offset);
+    }
+
+    pub fn getMoonQuant(self: DenseLookup, offset: u64) ?[]const u8 {
+        return self.get_moon_quant_fn(self.ctx, offset);
     }
 };
 
@@ -301,8 +306,12 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         switch (tensor.tensor_type) {
             12 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                }
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
