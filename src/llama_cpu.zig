@@ -448,6 +448,28 @@ pub const ReusableSession = struct {
     }
 };
 
+pub fn reusableSessionReplay(self: *ReusableSession, tokens: []const u32) !void {
+    self.reset();
+    if (tokens.len == 0) return;
+    try self.session.runPrompt(tokens);
+}
+
+pub fn reusableSessionNextTokenArgmax(self: *const ReusableSession) u32 {
+    return argmaxToken(self.session.logits);
+}
+
+pub fn reusableSessionAcceptToken(self: *ReusableSession, token_id: u32) !void {
+    _ = try self.session.step(token_id);
+}
+
+pub fn reusableSessionPosition(self: *const ReusableSession) usize {
+    return self.session.position;
+}
+
+pub fn reusableSessionVocabSize(self: *const ReusableSession) usize {
+    return self.session.logits.len;
+}
+
 const Session = struct {
     model: *const Model,
     backend: ?backend_api.MatVecBackend,
@@ -1242,6 +1264,10 @@ pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, promp
     return model.tokenizer.encodeInto(allocator, prompt, out);
 }
 
+pub fn eosTokenId(model: *const Model) ?u32 {
+    return model.tokenizer.eos_token_id;
+}
+
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
@@ -1797,6 +1823,18 @@ fn sampleToken(
     }
 
     return active[active.len - 1].token_id;
+}
+
+fn argmaxToken(logits: []const f32) u32 {
+    var best_index: u32 = 0;
+    var best_value = logits[0];
+    for (logits[1..], 1..) |value, index| {
+        if (value > best_value) {
+            best_value = value;
+            best_index = @intCast(index);
+        }
+    }
+    return best_index;
 }
 
 fn applyRepeatPenalty(logit: f32, token_id: u32, recent_tokens: []const u32, repeat_penalty: f32) f32 {

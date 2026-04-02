@@ -47,6 +47,21 @@ zig build moon-quant-guardrail -- \
 That command is the intended local check and can be dropped into CI unchanged once a benchmark model path is available in the environment.
 It is also the canonical MoonQuant comparison workflow now: the output carries a stable workflow marker and warm per-op decode deltas, including decode time directly attributable to MoonQuant-backed projection calls.
 
+For the current llama-first speculative decode bench, use the dedicated target. It stays intentionally narrow: llama GGUF only, deterministic decode, and single-user decode-first metrics for acceptance rate, verifier overhead, and throughput.
+
+```bash
+zig build llama-spec-bench -- \
+  --model /absolute/path/to/model.gguf \
+  --prompt "Hello" \
+  --max-tokens 64 \
+  --draft-tokens 4 \
+  --bench-runs 5 \
+  --backend metal \
+  --mismatch-mode exact
+```
+
+The same tool can exercise lower-acceptance cases with `--mismatch-mode reject-last-token-every-round` or `--mismatch-mode reject-last-token-every-other-round`.
+
 To generate synthetic `Q4_K` and `Q6_K` benchmark fixtures with TinyLlama-like decode shapes:
 
 ```bash

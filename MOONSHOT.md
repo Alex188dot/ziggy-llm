@@ -31,8 +31,8 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 
 ## Pillar 2: Speculative Decoding
 
-- [ ] Keep speculative decoding scoped to a narrow llama-first path.
-- [ ] Build decode-first benchmarks for acceptance rate, verifier overhead, and throughput.
+- [x] Keep speculative decoding scoped to a narrow llama-first path.
+- [x] Build decode-first benchmarks for acceptance rate, verifier overhead, and throughput.
 - [ ] Implement low-overhead verification on top of the strong base runtime.
 - [ ] Validate single-user local inference before any serving-oriented work.
 

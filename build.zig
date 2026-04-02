@@ -64,6 +64,18 @@ pub fn build(b: *std.Build) void {
     configureCompileStep(b, moon_quant_guardrail, build_options, enable_metal);
     b.installArtifact(moon_quant_guardrail);
 
+    const llama_speculative_bench = b.addExecutable(.{
+        .name = "llama-speculative-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/llama_speculative_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    llama_speculative_bench.root_module.addImport("ziggy_runtime", runtime_module);
+    configureCompileStep(b, llama_speculative_bench, build_options, enable_metal);
+    b.installArtifact(llama_speculative_bench);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -85,6 +97,13 @@ pub fn build(b: *std.Build) void {
     }
     const moon_quant_guardrail_step = b.step("moon-quant-guardrail", "Run the multi-case MoonQuant benchmark guardrail");
     moon_quant_guardrail_step.dependOn(&moon_quant_guardrail_run.step);
+
+    const llama_speculative_bench_run = b.addRunArtifact(llama_speculative_bench);
+    if (b.args) |args| {
+        llama_speculative_bench_run.addArgs(args);
+    }
+    const llama_speculative_bench_step = b.step("llama-spec-bench", "Run the llama-first speculative decode benchmark");
+    llama_speculative_bench_step.dependOn(&llama_speculative_bench_run.step);
 
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{

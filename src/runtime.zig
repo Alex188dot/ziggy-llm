@@ -14,6 +14,7 @@ pub const GenerationOptions = mod.GenerationOptions;
 pub const GenerationReport = mod.GenerationReport;
 pub const BenchSummary = mod.BenchSummary;
 pub const moon_quant_bench = @import("runtime/moon_quant_bench.zig");
+pub const llama_speculative = @import("runtime/llama_speculative.zig");
 pub const deltaNs = mod.deltaNs;
 pub const nsToMs = mod.nsToMs;
 pub const generate = mod.generate;
