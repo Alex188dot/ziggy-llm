@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const runtime = @import("runtime.zig");
 const gguf = @import("gguf.zig");
+const moon_quant = @import("moon_quant.zig");
 const chat_runtime = @import("chat_runtime.zig");
 const server = @import("server.zig");
 const server_runtime = @import("server_runtime.zig");
@@ -32,6 +33,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .top_p = config.top_p,
         .min_p = config.min_p,
         .backend = config.backend,
+        .moon_quant = config.moon_quant,
         .metal_profile = config.metal_profile,
     });
 }
@@ -49,6 +51,7 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .top_p = config.top_p,
         .min_p = config.min_p,
         .backend = config.backend,
+        .moon_quant = config.moon_quant,
         .metal_profile = config.metal_profile,
     }, config.bench_runs);
 }
@@ -61,4 +64,5 @@ fn printInspect(writer: *std.Io.Writer, config: cli.Config) !void {
 
     const report = try gguf.inspectFile(arena.allocator(), model_path);
     try gguf.printInspectReport(writer, model_path, report);
+    try moon_quant.printInspectSummary(writer, report);
 }

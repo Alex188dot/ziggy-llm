@@ -1,11 +1,12 @@
 const std = @import("std");
+const moon_quant = @import("../moon_quant.zig");
 
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "llama";
 pub const supported_architecture = "llama (native CPU + Metal)";
 pub const supported_model_family = "llama-family GGUF models through the native CPU or Metal runtime";
-pub const supported_quantization = "llama CPU and Metal paths: F32, F16, Q4_K, and Q6_K";
+pub const supported_quantization = moon_quant.supported_quantization;
 
 pub const RuntimeError = error{
     InvalidMagic,
@@ -67,6 +68,24 @@ pub const BackendUsed = enum {
     }
 };
 
+pub const MoonQuantMode = enum {
+    enabled,
+    disabled,
+
+    pub fn parse(name: []const u8) ?MoonQuantMode {
+        if (std.mem.eql(u8, name, "enabled")) return .enabled;
+        if (std.mem.eql(u8, name, "disabled")) return .disabled;
+        return null;
+    }
+
+    pub fn label(self: MoonQuantMode) []const u8 {
+        return switch (self) {
+            .enabled => "enabled",
+            .disabled => "disabled",
+        };
+    }
+};
+
 pub const GenerationOptions = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
@@ -76,6 +95,7 @@ pub const GenerationOptions = struct {
     top_p: f32 = 1.0,
     min_p: f32 = 0.0,
     backend: BackendPreference = .auto,
+    moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
 };
 

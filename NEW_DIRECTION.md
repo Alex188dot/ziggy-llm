@@ -147,7 +147,7 @@ These should stay out of the first moonshot phase:
 
 - trying to support all GGUF variants
 - trying to beat every backend on every metric
-- building a broad `ollama`-style product surface first
+- building a broad chat-platform-style product surface first
 - optimizing for generic portability over Apple-specific performance
 - expanding into server orchestration before decode throughput is excellent
 

@@ -1,5 +1,7 @@
 # ziggy-llm
 
+![ziggy-llm logo](assets/ziggy-llm-logo.png)
+
 A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal support.
 
 `ziggy-llm` is a deliberately narrow local LLM inference engine:
@@ -143,6 +145,7 @@ zig build run
 zig build run -- inspect -m /path/to/model.gguf
 zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend auto
 zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend cpu
+zig build moon-quant-guardrail -- --model /path/to/model.gguf
 zig build run -- serve -m /path/to/model.gguf --port 8080
 ```
 
@@ -188,12 +191,15 @@ The implemented runtime path is intentionally focused:
 - tokenizer: native `llama` tokenizer path with GGUF vocab, scores, and byte fallback
 - forward pass: native CPU and Metal incremental decode with RMSNorm, RoPE, GQA attention, SiLU-gated FFN, and KV cache
 - currently implemented tensor types: `F32`, `F16`, `Q4_K`, and `Q6_K`
-- intended use: real TinyLlama/LLaMA-family GGUF execution without `ollama` or `llama.cpp`
+- intended use: real TinyLlama/LLaMA-family GGUF execution through the native runtime
 
 Current Metal-specific limitations:
 
 - Apple Silicon macOS builds only
 - Metal acceleration is currently implemented for the `llama` runtime only
+- quantized Metal fast paths now cover generic `Q4_K`, packed MoonQuant `Q4_K`, and raw `Q6_K`
+- the canonical MoonQuant comparison path is `zig build moon-quant-guardrail -- --model ...`, and it now reports warm per-op decode deltas plus MoonQuant-attributable projection time
+- `--metal-profile` now reports startup tensor-prepare / prewarm cost alongside the decode profile
 - performance notes and current benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Planned HTTP API
@@ -315,7 +321,7 @@ Product success:
 
 Community success:
 
-- people benchmark it against `llama.cpp` and `ollama`
+- people benchmark it against other serious local runtimes
 - people share MacBook results
 - the repo becomes a credible Zig systems project rather than just an experiment
 

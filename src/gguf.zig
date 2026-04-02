@@ -46,7 +46,7 @@ const ValueType = enum(u32) {
     float64 = 12,
 };
 
-const TensorType = enum(u32) {
+pub const TensorType = enum(u32) {
     f32 = 0,
     f16 = 1,
     q4_0 = 2,
