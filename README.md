@@ -22,15 +22,14 @@ Today, the codebase provides:
 - a working Zig build
 - a CLI surface for the core commands
 - a working `inspect` command for GGUF metadata and tensor-table validation
-- a narrow native CPU reference runtime for `ziggy-tiny` GGUF fixtures
-- a narrow Metal matvec runtime for `ziggy-tiny` GGUF fixtures on Apple Silicon
 - a native CPU `llama` GGUF runtime in Zig
+- a native Metal `llama` GGUF runtime on Apple Silicon
 - deterministic `run` and `bench` execution with seed, backend selection, and timing output
 - explicit TTFT reporting in `run` and `bench`
-- a smaller runtime module layout for backend dispatch, tiny-model loading, CPU/Metal backends, and fixtures
+- a smaller runtime module layout for backend dispatch, llama loading, and CPU/Metal backends
 - project docs, scope, and roadmap
 
-Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the `ziggy-tiny` reference path and the implemented llama-family GGUF runtime on Apple Silicon.
+Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the implemented llama-family GGUF runtime on Apple Silicon.
 
 ## Repo Description
 
@@ -149,7 +148,7 @@ zig build run -- serve -m /path/to/model.gguf --port 8080
 
 Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
 
-`--backend auto` is the default. On Apple Silicon builds with Metal enabled, the `ziggy-tiny` path will use Metal when it can initialize and fall back to CPU otherwise. The `llama` path remains CPU-only for now.
+`--backend auto` is the default. On Apple Silicon builds with Metal enabled, the `llama` path will use Metal when it can initialize and fall back to CPU otherwise.
 
 ## GGUF Support
 
@@ -181,44 +180,21 @@ Unsupported or rejected today:
 - malformed tensor metadata
 - truncated metadata or tensor payloads
 
-## CPU Reference Path
+## Runtime Support
 
-The first implemented runtime path is intentionally narrow:
+The implemented runtime path is intentionally focused:
 
-- architecture: `ziggy-tiny`
-- model family: small GGUF reference fixtures used for CPU validation
-- quantization: `F16` tensors only with `general.file_type=1`
-- tokenizer source: `tokenizer.ggml.tokens`
-- runtime surface: `run` and `bench`
-
-This path exists to make prompt processing, decode behavior, seeded sampling, and timing instrumentation testable before broader Metal coverage lands.
-
-## First Metal Path
-
-The first Metal runtime is intentionally narrow:
-
-- architecture: `ziggy-tiny`
-- accelerated kernel boundary: matrix-vector multiply
-- shader strategy: compile an embedded `.metal` shader source at runtime
-- buffer strategy: upload model matrices once and reuse shared input/output buffers across dispatches
-- fallback behavior: `--backend auto` drops to CPU if Metal is unavailable, disabled at build time, or fails to initialize
-
-This keeps the backend boundary tied to the actual hot path without introducing a large generic tensor abstraction too early.
+- architecture: `llama`
+- tokenizer: native `llama` tokenizer path with GGUF vocab, scores, and byte fallback
+- forward pass: native CPU and Metal incremental decode with RMSNorm, RoPE, GQA attention, SiLU-gated FFN, and KV cache
+- currently implemented tensor types: `F32`, `F16`, `Q4_K`, and `Q6_K`
+- intended use: real TinyLlama/LLaMA-family GGUF execution without `ollama` or `llama.cpp`
 
 Current Metal-specific limitations:
 
 - Apple Silicon macOS builds only
-- only the `ziggy-tiny` reference runtime uses Metal today
-- the `llama` runtime is still CPU-only
-- performance notes and first benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
-
-There is also a pragmatic real-model path:
-
-- architecture: `llama`
-- tokenizer: native `llama` tokenizer path with GGUF vocab, scores, and byte fallback
-- forward pass: native CPU-only incremental decode with RMSNorm, RoPE, GQA attention, SiLU-gated FFN, and KV cache
-- currently implemented tensor types: `F32`, `F16`, `Q4_K`, and `Q6_K`
-- intended use: real TinyLlama/LLaMA-family GGUF execution without `ollama` or `llama.cpp`
+- Metal acceleration is currently implemented for the `llama` runtime only
+- performance notes and current benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Planned HTTP API
 
@@ -245,8 +221,7 @@ Core technical choices:
 
 Current implemented quantization support:
 
-- `F16` for `ziggy-tiny`
-- `F32`, `F16`, `Q4_K`, and `Q6_K` for the native `llama` CPU path
+- `F32`, `F16`, `Q4_K`, and `Q6_K` for the native `llama` CPU and Metal paths
 
 Planned broader quantization target set after the reference path stabilizes:
 
@@ -288,26 +263,18 @@ Run an implemented CPU reference command:
 zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
 ```
 
-Create a reproducible `ziggy-tiny` benchmark fixture:
-
-```bash
-zig build tiny-fixture -- --loop /tmp/ziggy-tiny-loop.gguf
-```
-
 Run the implemented Metal path on Apple Silicon:
 
 ```bash
-./zig-out/bin/ziggy-llm run -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 32 --seed 7 --backend metal
+./zig-out/bin/ziggy-llm run -m /path/to/llama-model.gguf -p "Hello" --max-tokens 32 --seed 7 --backend metal
 ```
 
-Benchmark CPU vs Metal on the same fixture:
+Benchmark CPU vs Metal on the same model:
 
 ```bash
-./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend cpu
-./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend metal
+./zig-out/bin/ziggy-llm bench -m /path/to/llama-model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend cpu
+./zig-out/bin/ziggy-llm bench -m /path/to/llama-model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend metal
 ```
-
-Real `llama` GGUF models still run on CPU only. `--backend auto` will pick Metal only for the `ziggy-tiny` path today.
 
 Run tests:
 
@@ -356,8 +323,7 @@ Community success:
 
 - finish the repo scaffold
 - implement GGUF inspection and validation
-- broaden the CPU correctness path beyond `ziggy-tiny`
-- wire the Metal backend
+- improve llama CPU and Metal throughput
 - add a minimal OpenAI-compatible server
 - publish honest M3 benchmark results
 

@@ -1,6 +1,6 @@
 # Apple Silicon Runtime Notes
 
-This document records the first measured `ziggy-tiny` Metal results on the primary target machine and the current optimization notes for the macOS path.
+This document records the current Apple Silicon runtime notes for the `llama` Metal path.
 
 ## Target Machine
 
@@ -20,75 +20,41 @@ Build the default release binary:
 zig build
 ```
 
-Create the looping `ziggy-tiny` benchmark fixture used for the Metal path:
+Benchmark the CPU and Metal backends on the same llama-family GGUF model:
 
 ```bash
-zig build tiny-fixture -- --loop /tmp/ziggy-tiny-loop.gguf
+./zig-out/bin/ziggy-llm bench -m /path/to/model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend cpu
+./zig-out/bin/ziggy-llm bench -m /path/to/model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend metal
 ```
 
-Benchmark the CPU and Metal backends:
+Recent local llama Metal work on the primary machine reached roughly `21.6` decode tok/s in the current path.
 
-```bash
-./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend cpu
-./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend metal
-```
+## Current Metal Notes
 
-Average of 5 runs on this machine:
+The active Metal path is the llama decode runtime:
 
-| Backend | Avg TTFT | Avg decode tok/s |
-| --- | ---: | ---: |
-| CPU | 0.293 ms | 591139.158 |
-| Metal | 61.382 ms | 1135.149 |
+- hidden-state, RMSNorm, residual adds, RoPE, attention, FFN, and output projection run on the GPU
+- command submission is batched so a token step waits at final readback rather than after each tiny op
+- CPU remains responsible for prompt orchestration, model loading, and token sampling
 
-Interpretation:
+Current limitations:
 
-- the Metal path is functionally correct on Apple Silicon
-- the current `ziggy-tiny` Metal implementation is not yet performance-competitive with the CPU reference path
-- TTFT is dominated by Metal device and pipeline setup plus per-dispatch synchronization overhead
-
-## macOS Profiling Notes
-
-Profile command used on macOS:
-
-```bash
-./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 300 --seed 7 --backend metal
-```
-
-Host-side profile captured with `sample` because `xcrun xctrace` was not installed in the active command-line tools environment:
-
-```bash
-zsh -lc './zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 300 --seed 7 --backend metal >/tmp/ziggy-metal-debug-bench.out & pid=$!; sleep 0.3; sample $pid 1 1 -mayDie; wait $pid'
-```
-
-Key findings from `/tmp/ziggy-llm_2026-04-02_085337_W1V3.sample.txt`:
-
-- the hottest host stack repeatedly lands in [`bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) `ziggy_metal_run_matvec_f32`, especially the `waitUntilCompleted` call at line 288
-- command-buffer creation and compute-encoder creation also appear repeatedly in the sampled stacks
-- the Zig-side call path is [`tiny_runtime.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/tiny_runtime.zig) `Session.step` -> [`metal_backend.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal_backend.zig) `State.matVec` -> [`bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) `ziggy_metal_run_matvec_f32`
-- `writeBuffer` and `readBuffer` show up in the sampled call tree, confirming the current path pays CPU-GPU transfer overhead for every matvec invocation
-
-Optimization notes recorded from the current profile:
-
-- stop synchronizing each matvec independently; batch multiple ops into a single command buffer per token
-- stop round-tripping activations through shared CPU memory after every kernel; keep intermediate activations resident on the GPU
-- fuse the current small-matrix sequence where practical instead of issuing many tiny command buffers from the host
-- keep the one-time Metal context creation cost out of steady-state benchmarking when measuring decode throughput
-- add a richer GPU profiler pass with Instruments once `xctrace` or the full Xcode toolchain is available
+- Apple Silicon macOS builds only
+- llama-family GGUF models only
+- sampling still happens on CPU
+- more kernel fusion is still available, especially around projection and sampling work
 
 ## Running Inference On GPU
-
-Today, GPU inference is available only for the `ziggy-tiny` Metal path.
 
 Example:
 
 ```bash
 zig build
-zig build tiny-fixture -- --loop /tmp/ziggy-tiny-loop.gguf
-./zig-out/bin/ziggy-llm run -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 32 --seed 7 --backend metal
+./zig-out/bin/ziggy-llm run -m /path/to/model.gguf -p "Hello" --max-tokens 32 --seed 7 --backend metal
 ```
 
 Notes:
 
 - `--backend auto` will try Metal first on Apple Silicon and fall back to CPU if Metal initialization fails
-- real `llama` GGUF models still run on the native CPU backend only
-- for example, `./zig-out/bin/ziggy-llm run -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -p "Hello" --backend auto` currently resolves to CPU, not Metal
+- `--backend cpu` remains the correctness and comparison path
+- compare CPU and Metal with the same prompt, token count, seed, and model when tracking regressions

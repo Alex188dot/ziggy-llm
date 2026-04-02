@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const backend_api = @import("backend.zig");
-const tiny_model = @import("tiny_model.zig");
 
 const shader_source = @embedFile("metal/matvec.metal");
 const err_buf_len: usize = 256;
@@ -64,16 +63,6 @@ const State = if (build_enabled_value) struct {
         self.raw_buffers.deinit();
         c.ziggy_metal_destroy_context(self.context);
         self.allocator.destroy(self);
-    }
-
-    fn prewarm(self: *State, model: *const tiny_model.Model) !void {
-        _ = try self.matrixBuffer(model.attn_q);
-        _ = try self.matrixBuffer(model.attn_k);
-        _ = try self.matrixBuffer(model.attn_v);
-        _ = try self.matrixBuffer(model.attn_out);
-        _ = try self.matrixBuffer(model.ffn_up);
-        _ = try self.matrixBuffer(model.ffn_down);
-        _ = try self.matrixBuffer(model.output);
     }
 
     fn matVec(
@@ -182,12 +171,6 @@ pub fn create(allocator: std.mem.Allocator) !backend_api.MatVecBackend {
         .mat_vec_fn = metalMatVec,
         .deinit_fn = metalDeinit,
     };
-}
-
-pub fn prewarm(backend: backend_api.MatVecBackend, model: *const tiny_model.Model) !void {
-    if (!build_enabled_value) return error.MetalDisabled;
-    const state = stateFromCtx(backend.ctx);
-    try state.prewarm(model);
 }
 
 pub fn cacheMatrix(backend: backend_api.MatVecBackend, matrix: []const f32) !void {
@@ -437,6 +420,7 @@ pub fn rmsNorm(
         0,
     ));
 }
+
 
 fn metalMatVec(
     ctx: ?*anyopaque,

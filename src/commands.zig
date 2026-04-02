@@ -42,7 +42,7 @@ fn printRuntimeStub(writer: *std.Io.Writer, name: []const u8, config: cli.Config
             config.prompt orelse "<unset>",
             runtime.supported_architecture,
             runtime.supported_quantization,
-            "Interactive chat is still scaffold-only. Use `run` or `bench` with a ziggy-tiny fixture or a native llama-family GGUF model for the current implemented paths.",
+            "Interactive chat is still scaffold-only. Use `run` or `bench` with a native llama-family GGUF model for the current implemented path.",
         },
     );
 }

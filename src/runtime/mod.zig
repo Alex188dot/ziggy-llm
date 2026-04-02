@@ -1,7 +1,6 @@
 const std = @import("std");
 const gguf = @import("../gguf.zig");
 const llama_runtime = @import("llama_runtime.zig");
-const tiny_runtime = @import("tiny_runtime.zig");
 const types = @import("types.zig");
 
 pub const primary_target = types.primary_target;
@@ -28,12 +27,8 @@ pub fn generate(
     defer arena.deinit();
 
     const report = try gguf.inspectFile(arena.allocator(), model_path);
-    if (std.mem.eql(u8, report.architecture, "llama")) {
-        return llama_runtime.generate(allocator, model_path, prompt, options);
-    }
     if (!std.mem.eql(u8, report.architecture, native_architecture)) return error.UnsupportedArchitecture;
-
-    return tiny_runtime.generate(allocator, model_path, prompt, options);
+    return llama_runtime.generate(allocator, model_path, prompt, options);
 }
 
 pub fn runCommand(
