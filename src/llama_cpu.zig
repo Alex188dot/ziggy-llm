@@ -997,6 +997,12 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     };
 }
 
+pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8) !usize {
+    const token_buf = try allocator.alloc(u32, model.context_length);
+    defer allocator.free(token_buf);
+    return model.tokenizer.encodeInto(allocator, prompt, token_buf);
+}
+
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
