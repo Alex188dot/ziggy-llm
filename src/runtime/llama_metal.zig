@@ -2,17 +2,20 @@ const std = @import("std");
 const backend_api = @import("backend.zig");
 const metal_backend = @import("metal_backend.zig");
 const llama = @import("../llama_cpu.zig");
+const moon_quant = @import("../moon_quant.zig");
 
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,
     tensors: std.AutoHashMap(u64, []f32),
     raw_tensors: std.AutoHashMap(u64, []const u8),
+    moon_quant_tensors: std.AutoHashMap(u64, moon_quant.PackedTensor),
 
     pub fn init(allocator: std.mem.Allocator) DenseTensorStore {
         return .{
             .allocator = allocator,
             .tensors = std.AutoHashMap(u64, []f32).init(allocator),
             .raw_tensors = std.AutoHashMap(u64, []const u8).init(allocator),
+            .moon_quant_tensors = std.AutoHashMap(u64, moon_quant.PackedTensor).init(allocator),
         };
     }
 
@@ -21,6 +24,9 @@ pub const DenseTensorStore = struct {
         while (iterator.next()) |values| self.allocator.free(values.*);
         self.tensors.deinit();
         self.raw_tensors.deinit();
+        var moon_quant_iterator = self.moon_quant_tensors.valueIterator();
+        while (moon_quant_iterator.next()) |tensor| tensor.deinit(self.allocator);
+        self.moon_quant_tensors.deinit();
         self.* = undefined;
     }
 
@@ -52,6 +58,10 @@ pub const DenseTensorStore = struct {
         return self.raw_tensors.get(offset);
     }
 
+    pub fn getMoonQuantByOffset(self: *const DenseTensorStore, offset: u64) ?moon_quant.PackedTensor {
+        return self.moon_quant_tensors.get(offset);
+    }
+
     pub fn prewarm(self: *const DenseTensorStore, backend: backend_api.MatVecBackend) !void {
         var iterator = self.tensors.valueIterator();
         while (iterator.next()) |matrix| {
@@ -64,10 +74,17 @@ pub const DenseTensorStore = struct {
     }
 
     fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef) !void {
-        if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset)) return;
+        if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset) or self.moon_quant_tensors.contains(tensor.offset)) return;
 
         if (tensor.tensor_type == .q4_k) {
-            try self.raw_tensors.put(tensor.offset, try llama.tensorBytes(model, tensor));
+            const tensor_bytes = try llama.tensorBytes(model, tensor);
+            try self.raw_tensors.put(tensor.offset, tensor_bytes);
+            try self.moon_quant_tensors.put(tensor.offset, try moon_quant.packQ4KTensor(
+                self.allocator,
+                tensor_bytes,
+                try tensor.rowCount(),
+                try tensor.rowLen(),
+            ));
             return;
         }
 

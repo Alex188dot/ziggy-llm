@@ -1,11 +1,12 @@
 const std = @import("std");
+const moon_quant = @import("../moon_quant.zig");
 
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "llama";
 pub const supported_architecture = "llama (native CPU + Metal)";
 pub const supported_model_family = "llama-family GGUF models through the native CPU or Metal runtime";
-pub const supported_quantization = "llama CPU and Metal paths: F32, F16, Q4_K, and Q6_K";
+pub const supported_quantization = moon_quant.supported_quantization;
 
 pub const RuntimeError = error{
     InvalidMagic,
