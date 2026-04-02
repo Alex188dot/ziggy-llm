@@ -143,6 +143,7 @@ zig build run
 zig build run -- inspect -m /path/to/model.gguf
 zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend auto
 zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend cpu
+zig build moon-quant-guardrail -- --model /path/to/model.gguf
 zig build run -- serve -m /path/to/model.gguf --port 8080
 ```
 
@@ -194,6 +195,7 @@ Current Metal-specific limitations:
 
 - Apple Silicon macOS builds only
 - Metal acceleration is currently implemented for the `llama` runtime only
+- quantized Metal fast paths now cover generic `Q4_K`, packed MoonQuant `Q4_K`, and raw `Q6_K`
 - performance notes and current benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Planned HTTP API

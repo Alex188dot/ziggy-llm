@@ -280,6 +280,30 @@ pub fn runMatVecQ4KToBuffer(
     ));
 }
 
+pub fn runMatVecQ6KToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    try mapStatus(c.ziggy_metal_run_matvec_q6k_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        null,
+        0,
+    ));
+}
+
 pub fn runMatVecMoonQuantQ4KToBuffer(
     backend: backend_api.MatVecBackend,
     matrix_bytes: []const u8,

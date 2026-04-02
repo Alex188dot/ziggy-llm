@@ -87,10 +87,10 @@ pub const DenseTensorStore = struct {
     fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef, moon_quant_mode: types.MoonQuantMode) !void {
         if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset) or self.moon_quant_tensors.contains(tensor.offset)) return;
 
-        if (tensor.tensor_type == .q4_k) {
+        if (tensor.tensor_type == .q4_k or tensor.tensor_type == .q6_k) {
             const tensor_bytes = try llama.tensorBytes(model, tensor);
             try self.raw_tensors.put(tensor.offset, tensor_bytes);
-            if (moon_quant_mode == .enabled) {
+            if (tensor.tensor_type == .q4_k and moon_quant_mode == .enabled) {
                 try self.moon_quant_tensors.put(tensor.offset, try moon_quant.packQ4KTensor(
                     self.allocator,
                     tensor_bytes,

@@ -18,6 +18,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const runtime_module = b.createModule(.{
+        .root_source_file = b.path("src/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_module.addOptions("build_options", build_options);
+    if (enable_metal and target.result.os.tag == .macos and target.result.cpu.arch == .aarch64) {
+        runtime_module.addIncludePath(b.path("src/runtime/metal"));
+    }
 
     const exe = b.addExecutable(.{
         .name = "ziggy-llm",
@@ -43,6 +52,18 @@ pub fn build(b: *std.Build) void {
     configureCompileStep(b, bench_fixture, build_options, enable_metal);
     b.installArtifact(bench_fixture);
 
+    const moon_quant_guardrail = b.addExecutable(.{
+        .name = "moon-quant-guardrail",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/moon_quant_guardrail.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    moon_quant_guardrail.root_module.addImport("ziggy_runtime", runtime_module);
+    configureCompileStep(b, moon_quant_guardrail, build_options, enable_metal);
+    b.installArtifact(moon_quant_guardrail);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -57,6 +78,13 @@ pub fn build(b: *std.Build) void {
     }
     const bench_fixture_step = b.step("bench-fixture", "Write a synthetic GGUF benchmark fixture");
     bench_fixture_step.dependOn(&bench_fixture_run.step);
+
+    const moon_quant_guardrail_run = b.addRunArtifact(moon_quant_guardrail);
+    if (b.args) |args| {
+        moon_quant_guardrail_run.addArgs(args);
+    }
+    const moon_quant_guardrail_step = b.step("moon-quant-guardrail", "Run the multi-case MoonQuant benchmark guardrail");
+    moon_quant_guardrail_step.dependOn(&moon_quant_guardrail_run.step);
 
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -20,9 +20,9 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 
 ### MoonQuant Next Pass
 
-- [ ] Add real-model benchmark coverage for more than one prompt and generation-length pair.
-- [ ] Add benchmark guardrails so MoonQuant regressions are visible in CI or in a scripted local check.
-- [ ] Expand optimized paths beyond the current `Q4_K` packing focus.
+- [x] Add real-model benchmark coverage for more than one prompt and generation-length pair.
+- [x] Add benchmark guardrails so MoonQuant regressions are visible in CI or in a scripted local check.
+- [x] Expand optimized paths beyond the current `Q4_K` packing focus.
 - [ ] Verify whether `Q6_K` should get a real Metal fast path instead of serving only as a baseline.
 - [ ] Profile tensor-prepare and Metal prewarm cost and reduce the largest startup regressions.
 - [ ] Record per-op deltas specifically attributable to MoonQuant in the real decode loop.

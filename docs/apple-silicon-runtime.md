@@ -33,6 +33,19 @@ To force the legacy generic `Q4_K` Metal path for comparison, disable MoonQuant 
 ./zig-out/bin/ziggy-llm bench -m /path/to/model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend metal --moon-quant disabled
 ```
 
+For the canonical multi-case real-model MoonQuant check, use the scripted guardrail target. It runs three prompt and generation-length pairs against the same model, compares MoonQuant-enabled versus disabled Metal runs, and exits non-zero if the configured thresholds are missed:
+
+```bash
+zig build moon-quant-guardrail -- \
+  --model /absolute/path/to/model.gguf \
+  --bench-runs 5 \
+  --backend metal \
+  --min-warm-decode-speedup-pct 0 \
+  --max-warm-ttft-regression-pct 25
+```
+
+That command is the intended local check and can be dropped into CI unchanged once a benchmark model path is available in the environment.
+
 To generate synthetic `Q4_K` and `Q6_K` benchmark fixtures with TinyLlama-like decode shapes:
 
 ```bash
@@ -45,7 +58,7 @@ Those fixtures use a short `16`-token context, so the reproducible comparison co
 ```bash
 ./zig-out/bin/ziggy-llm bench -m /tmp/moonbench-q4.gguf -p a --max-tokens 12 --seed 0 --temperature 0 --bench-runs 5 --backend metal
 ./zig-out/bin/ziggy-llm bench -m /tmp/moonbench-q4.gguf -p a --max-tokens 12 --seed 0 --temperature 0 --bench-runs 5 --backend metal --moon-quant disabled
-./zig-out/bin/ziggy-llm bench -m /tmp/moonbench-q6.gguf -p a --max-tokens 12 --seed 0 --temperature 0 --bench-runs 5 --backend cpu
+./zig-out/bin/ziggy-llm bench -m /tmp/moonbench-q6.gguf -p a --max-tokens 12 --seed 0 --temperature 0 --bench-runs 5 --backend metal
 ```
 
 Recent local llama Metal work on the primary machine reached roughly `27.2` warm decode tok/s on the current MoonQuant-enabled TinyLlama path.
@@ -82,6 +95,7 @@ Current limitations:
 - Apple Silicon macOS builds only
 - llama-family GGUF models only
 - sampling still happens on CPU
+- MoonQuant packing remains specific to `Q4_K`, while `Q6_K` now has a direct raw Metal matvec fast path instead of forcing dense `f32` expansion
 - more kernel fusion is still available, especially around projection and sampling work
 
 ## Running Inference On GPU
@@ -98,5 +112,6 @@ Notes:
 - `--backend auto` will try Metal first on Apple Silicon and fall back to CPU if Metal initialization fails
 - `--backend cpu` remains the correctness and comparison path
 - `--moon-quant disabled` keeps the same Metal runtime but bypasses the packed `Q4_K` MoonQuant path, which makes it the direct comparison switch for benchmark and regression work
+- `Q6_K` Metal runs now stay on a raw quantized matvec path instead of dequantizing through the dense fallback first
 - prefer `bench` over `run` for published numbers, because `bench --bench-runs N` separates cold startup from warm reused-runtime measurements
 - compare CPU and Metal with the same prompt, token count, seed, and model when tracking regressions

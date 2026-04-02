@@ -298,6 +298,10 @@ pub const Session = struct {
                     try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
                 }
             },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecToBuffer(
@@ -333,6 +337,11 @@ pub const Session = struct {
                     try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
                     try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
                 }
+            },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
+                try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
