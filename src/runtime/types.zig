@@ -68,6 +68,24 @@ pub const BackendUsed = enum {
     }
 };
 
+pub const MoonQuantMode = enum {
+    enabled,
+    disabled,
+
+    pub fn parse(name: []const u8) ?MoonQuantMode {
+        if (std.mem.eql(u8, name, "enabled")) return .enabled;
+        if (std.mem.eql(u8, name, "disabled")) return .disabled;
+        return null;
+    }
+
+    pub fn label(self: MoonQuantMode) []const u8 {
+        return switch (self) {
+            .enabled => "enabled",
+            .disabled => "disabled",
+        };
+    }
+};
+
 pub const GenerationOptions = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
@@ -77,6 +95,7 @@ pub const GenerationOptions = struct {
     top_p: f32 = 1.0,
     min_p: f32 = 0.0,
     backend: BackendPreference = .auto,
+    moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
 };
 

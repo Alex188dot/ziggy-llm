@@ -15,8 +15,19 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 - [x] Add postfix fusion around the packed `MoonQuant` path where it measurably reduces memory traffic.
 - [x] Implement per-layer or non-uniform bit allocation instead of one global quant choice.
 - [x] Implement imatrix-style calibration to drive the per-layer quant decisions.
-- [ ] Add end-to-end correctness tests for GGUF-to-MoonQuant packing and execution parity.
-- [ ] Benchmark `MoonQuant` against current generic `Q4_K` / `Q6_K` baselines on Apple Silicon.
+- [x] Add end-to-end correctness tests for GGUF-to-MoonQuant packing and execution parity.
+- [x] Benchmark `MoonQuant` against current generic `Q4_K` / `Q6_K` baselines on Apple Silicon.
+
+### MoonQuant Next Pass
+
+- [ ] Add real-model benchmark coverage for more than one prompt and generation-length pair.
+- [ ] Add benchmark guardrails so MoonQuant regressions are visible in CI or in a scripted local check.
+- [ ] Expand optimized paths beyond the current `Q4_K` packing focus.
+- [ ] Verify whether `Q6_K` should get a real Metal fast path instead of serving only as a baseline.
+- [ ] Profile tensor-prepare and Metal prewarm cost and reduce the largest startup regressions.
+- [ ] Record per-op deltas specifically attributable to MoonQuant in the real decode loop.
+- [ ] Tighten benchmark discipline around one canonical MoonQuant comparison workflow.
+- [ ] Run one more optimization pass on real-model decode hotspots before shifting the main focus to speculative decoding.
 
 ## Pillar 2: Speculative Decoding
 

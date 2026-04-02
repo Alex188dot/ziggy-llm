@@ -13,6 +13,12 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_metal", enable_metal);
     build_options.addOption([]const u8, "version", version);
 
+    const lib_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "ziggy-llm",
         .root_module = b.createModule(.{
@@ -25,6 +31,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const bench_fixture = b.addExecutable(.{
+        .name = "write-bench-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/write_bench_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bench_fixture.root_module.addImport("ziggy_lib", lib_module);
+    configureCompileStep(b, bench_fixture, build_options, enable_metal);
+    b.installArtifact(bench_fixture);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -32,6 +50,13 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run ziggy-llm");
     run_step.dependOn(&run_cmd.step);
+
+    const bench_fixture_run = b.addRunArtifact(bench_fixture);
+    if (b.args) |args| {
+        bench_fixture_run.addArgs(args);
+    }
+    const bench_fixture_step = b.step("bench-fixture", "Write a synthetic GGUF benchmark fixture");
+    bench_fixture_step.dependOn(&bench_fixture_run.step);
 
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{

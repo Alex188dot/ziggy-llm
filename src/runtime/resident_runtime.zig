@@ -263,19 +263,23 @@ fn selectExecution(
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model),
-        .auto => createMetalExecution(allocator, model) catch |err| {
+        .metal => try createMetalExecution(allocator, model, .enabled),
+        .auto => createMetalExecution(allocator, model, .enabled) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
     };
 }
 
-fn createMetalExecution(allocator: std.mem.Allocator, model: *const llama_cpu.Model) !ExecutionResources {
+fn createMetalExecution(
+    allocator: std.mem.Allocator,
+    model: *const llama_cpu.Model,
+    moon_quant_mode: types.MoonQuantMode,
+) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model);
+    try dense_tensors.populate(model, moon_quant_mode);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();

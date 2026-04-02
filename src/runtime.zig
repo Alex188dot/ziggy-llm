@@ -9,6 +9,7 @@ pub const supported_quantization = mod.supported_quantization;
 pub const RuntimeError = mod.RuntimeError;
 pub const BackendPreference = mod.BackendPreference;
 pub const BackendUsed = mod.BackendUsed;
+pub const MoonQuantMode = mod.MoonQuantMode;
 pub const GenerationOptions = mod.GenerationOptions;
 pub const GenerationReport = mod.GenerationReport;
 pub const BenchSummary = mod.BenchSummary;

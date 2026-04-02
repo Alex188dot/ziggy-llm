@@ -1,8 +1,10 @@
 const std = @import("std");
 const backend_api = @import("backend.zig");
 const metal_backend = @import("metal_backend.zig");
+const types = @import("types.zig");
 const llama = @import("../llama_cpu.zig");
 const moon_quant = @import("../moon_quant.zig");
+const llama_fixture = @import("llama_fixture.zig");
 
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,
@@ -30,19 +32,19 @@ pub const DenseTensorStore = struct {
         self.* = undefined;
     }
 
-    pub fn populate(self: *DenseTensorStore, model: *const llama.Model) !void {
-        try self.addTensor(model, model.output);
-        try self.addTensor(model, model.output_norm);
+    pub fn populate(self: *DenseTensorStore, model: *const llama.Model, moon_quant_mode: types.MoonQuantMode) !void {
+        try self.addTensor(model, model.output, moon_quant_mode);
+        try self.addTensor(model, model.output_norm, moon_quant_mode);
         for (model.layers) |layer| {
-            try self.addTensor(model, layer.attn_norm);
-            try self.addTensor(model, layer.attn_q);
-            try self.addTensor(model, layer.attn_k);
-            try self.addTensor(model, layer.attn_v);
-            try self.addTensor(model, layer.attn_output);
-            try self.addTensor(model, layer.ffn_norm);
-            try self.addTensor(model, layer.ffn_gate);
-            try self.addTensor(model, layer.ffn_down);
-            try self.addTensor(model, layer.ffn_up);
+            try self.addTensor(model, layer.attn_norm, moon_quant_mode);
+            try self.addTensor(model, layer.attn_q, moon_quant_mode);
+            try self.addTensor(model, layer.attn_k, moon_quant_mode);
+            try self.addTensor(model, layer.attn_v, moon_quant_mode);
+            try self.addTensor(model, layer.attn_output, moon_quant_mode);
+            try self.addTensor(model, layer.ffn_norm, moon_quant_mode);
+            try self.addTensor(model, layer.ffn_gate, moon_quant_mode);
+            try self.addTensor(model, layer.ffn_down, moon_quant_mode);
+            try self.addTensor(model, layer.ffn_up, moon_quant_mode);
         }
     }
 
@@ -82,18 +84,20 @@ pub const DenseTensorStore = struct {
         }
     }
 
-    fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef) !void {
+    fn addTensor(self: *DenseTensorStore, model: *const llama.Model, tensor: llama.TensorRef, moon_quant_mode: types.MoonQuantMode) !void {
         if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset) or self.moon_quant_tensors.contains(tensor.offset)) return;
 
         if (tensor.tensor_type == .q4_k) {
             const tensor_bytes = try llama.tensorBytes(model, tensor);
             try self.raw_tensors.put(tensor.offset, tensor_bytes);
-            try self.moon_quant_tensors.put(tensor.offset, try moon_quant.packQ4KTensor(
-                self.allocator,
-                tensor_bytes,
-                try tensor.rowCount(),
-                try tensor.rowLen(),
-            ));
+            if (moon_quant_mode == .enabled) {
+                try self.moon_quant_tensors.put(tensor.offset, try moon_quant.packQ4KTensor(
+                    self.allocator,
+                    tensor_bytes,
+                    try tensor.rowCount(),
+                    try tensor.rowLen(),
+                ));
+            }
             return;
         }
 
@@ -118,3 +122,30 @@ pub const DenseTensorStore = struct {
         try self.tensors.put(tensor.offset, dense);
     }
 };
+
+test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaQ4KFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama-q4k.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-q4k.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    var packed_store = DenseTensorStore.init(std.testing.allocator);
+    defer packed_store.deinit();
+    try packed_store.populate(&model, .enabled);
+    try std.testing.expect(packed_store.getRawByOffset(model.output.offset) != null);
+    try std.testing.expect(packed_store.getMoonQuantBytesByOffset(model.output.offset) != null);
+
+    var generic_store = DenseTensorStore.init(std.testing.allocator);
+    defer generic_store.deinit();
+    try generic_store.populate(&model, .disabled);
+    try std.testing.expect(generic_store.getRawByOffset(model.output.offset) != null);
+    try std.testing.expect(generic_store.getMoonQuantBytesByOffset(model.output.offset) == null);
+}

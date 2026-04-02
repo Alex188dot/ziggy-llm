@@ -29,7 +29,7 @@ pub fn generate(
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
-    var execution = try selectExecution(allocator, &model, options.backend);
+    var execution = try selectExecution(allocator, &model, options.backend, options.moon_quant);
     defer execution.deinit(allocator);
 
     const lookup = if (execution.dense_tensors) |*dense_tensors|
@@ -79,22 +79,27 @@ fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
     preference: types.BackendPreference,
+    moon_quant_mode: types.MoonQuantMode,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model),
-        .auto => createMetalExecution(allocator, model) catch |err| {
+        .metal => try createMetalExecution(allocator, model, moon_quant_mode),
+        .auto => createMetalExecution(allocator, model, moon_quant_mode) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
     };
 }
 
-fn createMetalExecution(allocator: std.mem.Allocator, model: *const llama_cpu.Model) !ExecutionResources {
+fn createMetalExecution(
+    allocator: std.mem.Allocator,
+    model: *const llama_cpu.Model,
+    moon_quant_mode: types.MoonQuantMode,
+) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model);
+    try dense_tensors.populate(model, moon_quant_mode);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();
@@ -208,4 +213,58 @@ test "llama metal backend matches cpu reference when available" {
     try std.testing.expectEqualStrings(cpu_report.generated_text, metal_report.generated_text);
     try std.testing.expectEqual(cpu_report.prompt_token_count, metal_report.prompt_token_count);
     try std.testing.expectEqual(cpu_report.generated_token_count, metal_report.generated_token_count);
+}
+
+test "llama q4_k MoonQuant metal path matches cpu and generic q4 metal execution" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaQ4KFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama-q4k.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-q4k.gguf");
+    defer std.testing.allocator.free(path);
+
+    const options = types.GenerationOptions{
+        .max_tokens = 6,
+        .seed = 0,
+        .temperature = 0,
+        .backend = .cpu,
+    };
+
+    var cpu_report = try generate(std.testing.allocator, path, "a", options);
+    defer cpu_report.deinit(std.testing.allocator);
+
+    var moon_quant_report = try generate(std.testing.allocator, path, "a", .{
+        .max_tokens = options.max_tokens,
+        .seed = options.seed,
+        .temperature = options.temperature,
+        .backend = .metal,
+        .moon_quant = .enabled,
+    });
+    defer moon_quant_report.deinit(std.testing.allocator);
+
+    var generic_q4_report = try generate(std.testing.allocator, path, "a", .{
+        .max_tokens = options.max_tokens,
+        .seed = options.seed,
+        .temperature = options.temperature,
+        .backend = .metal,
+        .moon_quant = .disabled,
+    });
+    defer generic_q4_report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(types.BackendUsed, .metal), moon_quant_report.backend);
+    try std.testing.expectEqual(@as(types.BackendUsed, .metal), generic_q4_report.backend);
+    try std.testing.expectEqualStrings(cpu_report.generated_text, moon_quant_report.generated_text);
+    try std.testing.expectEqualStrings(cpu_report.generated_text, generic_q4_report.generated_text);
+    try std.testing.expectEqualStrings(moon_quant_report.generated_text, generic_q4_report.generated_text);
+    try std.testing.expectEqual(cpu_report.prompt_token_count, moon_quant_report.prompt_token_count);
+    try std.testing.expectEqual(cpu_report.generated_token_count, moon_quant_report.generated_token_count);
+    try std.testing.expectEqual(cpu_report.prompt_token_count, generic_q4_report.prompt_token_count);
+    try std.testing.expectEqual(cpu_report.generated_token_count, generic_q4_report.generated_token_count);
 }

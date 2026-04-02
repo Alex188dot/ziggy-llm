@@ -27,6 +27,7 @@ pub const Config = struct {
     top_p: f32 = 1.0,
     min_p: f32 = 0.0,
     backend: runtime.BackendPreference = .auto,
+    moon_quant: runtime.MoonQuantMode = .enabled,
     metal_profile: bool = false,
 };
 
@@ -42,6 +43,7 @@ pub const ParseError = error{
     InvalidTopP,
     InvalidMinP,
     InvalidBackend,
+    InvalidMoonQuant,
 };
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
@@ -140,6 +142,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.backend = runtime.BackendPreference.parse(args[i]) orelse return error.InvalidBackend;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--moon-quant")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.moon_quant = runtime.MoonQuantMode.parse(args[i]) orelse return error.InvalidMoonQuant;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--metal-profile")) {
             config.metal_profile = true;
             continue;
@@ -198,6 +206,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --top-p <f>       Sampling filter: keep smallest prefix with cumulative mass >= p (default: {d:.1})
         \\      --min-p <f>       Sampling filter: drop tokens below min_p * top token prob (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
+        \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
         \\      --metal-profile   Print aggregated Metal decode timing and dominant shape data
         \\      --port <port>     Port for server mode (default: {d})
         \\
@@ -220,6 +229,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.top_p,
             configDefaults.min_p,
             configDefaults.backend.label(),
+            configDefaults.moon_quant.label(),
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
@@ -246,7 +256,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--metal-profile" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
@@ -256,5 +266,6 @@ test "runtime flags parse correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), config.top_p, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), config.min_p, 0.0001);
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
+    try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
     try std.testing.expect(config.metal_profile);
 }

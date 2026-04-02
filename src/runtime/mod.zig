@@ -13,6 +13,7 @@ pub const supported_quantization = types.supported_quantization;
 pub const RuntimeError = types.RuntimeError;
 pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;
+pub const MoonQuantMode = types.MoonQuantMode;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationReport = types.GenerationReport;
 pub const BenchSummary = bench_runner.BenchSummary;
