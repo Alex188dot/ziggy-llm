@@ -1,5 +1,6 @@
 const std = @import("std");
 const gguf = @import("../gguf.zig");
+const bench_runner = @import("bench_runner.zig");
 const llama_runtime = @import("llama_runtime.zig");
 const types = @import("types.zig");
 
@@ -14,6 +15,7 @@ pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationReport = types.GenerationReport;
+pub const BenchSummary = bench_runner.BenchSummary;
 pub const deltaNs = types.deltaNs;
 pub const nsToMs = types.nsToMs;
 
@@ -69,6 +71,9 @@ pub fn runCommand(
             report.decodeTokensPerSecond(),
         },
     );
+    if (report.metal_profile_summary) |summary| {
+        try writer.print("metal_profile:\n{s}", .{summary});
+    }
 }
 
 pub fn benchCommand(
@@ -77,7 +82,60 @@ pub fn benchCommand(
     model_path: []const u8,
     prompt: []const u8,
     options: GenerationOptions,
+    bench_runs: usize,
 ) !void {
+    if (bench_runs > 1) {
+        var summary = try bench_runner.runWarmBench(allocator, model_path, prompt, options, bench_runs);
+        defer summary.deinit(allocator);
+
+        try writer.print(
+            \\backend={s}
+            \\bench_runs={d}
+            \\cold.startup_ns={d}
+            \\cold.prompt_ns={d}
+            \\cold.ttft_ns={d}
+            \\cold.decode_ns={d}
+            \\cold.prompt_tokens={d}
+            \\cold.generated_tokens={d}
+            \\cold.tps={d:.3}
+            \\cold.decode_tok_s={d:.3}
+            \\warm.runs={d}
+            \\warm.startup_ns_avg={d}
+            \\warm.prompt_ns_avg={d}
+            \\warm.ttft_ns_avg={d}
+            \\warm.decode_ns_avg={d}
+            \\warm.generated_tokens_avg={d}
+            \\warm.tps_avg={d:.3}
+            \\warm.decode_tok_s_avg={d:.3}
+            \\
+        ,
+            .{
+                summary.cold.backend.label(),
+                bench_runs,
+                summary.cold.startup_ns,
+                summary.cold.prompt_ns,
+                summary.cold.ttft_ns,
+                summary.cold.decode_ns,
+                summary.cold.prompt_token_count,
+                summary.cold.generated_token_count,
+                summary.cold.decodeTokensPerSecond(),
+                summary.cold.decodeTokensPerSecond(),
+                summary.warm_runs,
+                summary.warm_startup_ns_avg,
+                summary.warm_prompt_ns_avg,
+                summary.warm_ttft_ns_avg,
+                summary.warm_decode_ns_avg,
+                summary.warm_generated_token_count_avg,
+                summary.warmDecodeTokensPerSecond(),
+                summary.warmDecodeTokensPerSecond(),
+            },
+        );
+        if (summary.cold.metal_profile_summary) |summary_text| {
+            try writer.print("cold.metal_profile:\n{s}", .{summary_text});
+        }
+        return;
+    }
+
     var report = try generate(allocator, model_path, prompt, options);
     defer report.deinit(allocator);
 
@@ -105,4 +163,7 @@ pub fn benchCommand(
             report.decodeTokensPerSecond(),
         },
     );
+    if (report.metal_profile_summary) |summary| {
+        try writer.print("{s}", .{summary});
+    }
 }

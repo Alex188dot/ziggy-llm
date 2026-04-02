@@ -44,9 +44,7 @@ pub fn generate(
         allocator,
         &model,
         prompt,
-        options.max_tokens,
-        options.seed,
-        options.temperature,
+        options,
         execution.backend,
         lookup,
     );
@@ -65,6 +63,7 @@ pub fn generate(
         .seed = options.seed,
         .temperature = options.temperature,
         .backend = llama_report.backend,
+        .metal_profile_summary = llama_report.metal_profile_summary,
     };
 }
 

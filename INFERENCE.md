@@ -203,7 +203,7 @@ This is the current benchmark to preserve as a documented baseline.
 
 ### Benchmark As Of 02 Apr 2026, 2:50 PM CEST
 
-- Machine context: primary Apple Silicon benchmark machine
+- Machine context: Macbook Pro M3 18GB
 - Backend: `metal`
 - Model: `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`
 - Prompt: `Write one short paragraph about Zig.`
@@ -269,11 +269,23 @@ decode_tok_s: 35.827
 user@machine ziggy-llm %
 ```
 
-## Assumptions And Defaults
+## Benchmark Discipline
 
-- The file lives at the repo root as `INFERENCE.md`.
-- The tone should match the existing docs: direct, technical, honest, and benchmark-oriented.
-- The file is public-safe and must not mention other inference projects by name.
-- The document is a working optimization plan, not a marketing page.
-- All action items are checkboxes; no major work item should be written as plain prose only.
-- The plan should prioritize end-to-end decode TPS over isolated microbenchmark wins, while still requiring correctness and TTFT tracking.
+- [x] Define one canonical decode benchmark command and keep it stable across optimization work.
+- [ ] Record machine, OS, Zig version, model, quantization, prompt length, generated length, temperature, seed, and backend for every published result.
+- [x] Add per-stage timing for startup, prompt processing, TTFT, and decode tok/s.
+- [x] Add per-kernel or per-operation timing around dense matvec, quantized matvec, attention, RMSNorm, RoPE, KV writes, residual adds, and CPU sampling.
+- [x] Distinguish prompt processing throughput from decode throughput in all measurements.
+- [ ] Keep a simple benchmark table in the document with date and result snapshots.
+- [ ] Treat any optimization without benchmark evidence as incomplete.
+
+## Phase 1: Measurement Before More Optimization
+
+- [x] Add low-overhead instrumentation around the Metal decode path so each token step can report time spent in projections, attention, KV writes, normalization, elementwise ops, readback, and CPU sampling.
+- [x] Add a benchmark mode or debug flag that can print aggregated per-op timings without changing correctness behavior.
+- [ ] Identify the top three decode bottlenecks from measured time share before starting the next major optimization pass.
+- [ ] Record which tensor shapes dominate real runs so later kernel specialization targets real workloads rather than synthetic shapes.
+
+Current implementation note:
+
+- `ziggy-llm run ... --backend metal --metal-profile` and `ziggy-llm bench ... --backend metal --metal-profile` now emit aggregated per-op timing, top bottleneck lines, dominant shape entries, and per-token decode timing breakdowns for measured runs.

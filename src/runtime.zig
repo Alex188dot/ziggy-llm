@@ -11,6 +11,7 @@ pub const BackendPreference = mod.BackendPreference;
 pub const BackendUsed = mod.BackendUsed;
 pub const GenerationOptions = mod.GenerationOptions;
 pub const GenerationReport = mod.GenerationReport;
+pub const BenchSummary = mod.BenchSummary;
 pub const deltaNs = mod.deltaNs;
 pub const nsToMs = mod.nsToMs;
 pub const generate = mod.generate;

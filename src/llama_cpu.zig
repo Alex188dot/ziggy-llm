@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal = @import("terminal.zig");
 const backend_api = @import("runtime/backend.zig");
 const llama_gpu = @import("runtime/llama_gpu.zig");
+const metal_profile = @import("runtime/metal_profile.zig");
 const runtime_types = @import("runtime/types.zig");
 
 pub const GenerateError = error{
@@ -33,9 +34,11 @@ pub const GenerateReport = struct {
     ttft_ns: u64,
     decode_ns: u64,
     backend: runtime_types.BackendUsed,
+    metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *GenerateReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);
+        if (self.metal_profile_summary) |summary| allocator.free(summary);
         self.* = undefined;
     }
 };
@@ -431,6 +434,7 @@ const Session = struct {
         backend: ?backend_api.MatVecBackend,
         dense_tensors: ?DenseTensorLookup,
         token_capacity: usize,
+        profiler: ?*metal_profile.Profiler,
     ) !Session {
         var session = Session{
             .model = model,
@@ -456,7 +460,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model));
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model), profiler);
             }
         }
 
@@ -801,26 +805,27 @@ pub fn generateLoaded(
     allocator: std.mem.Allocator,
     model: *const Model,
     prompt: []const u8,
-    max_tokens: usize,
-    seed: u64,
-    temperature: f32,
+    options: runtime_types.GenerationOptions,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
 ) !GenerateReport {
-    _ = seed;
+    _ = options.seed;
 
     const startup_begin = std.time.nanoTimestamp();
     var spinner = terminal.Spinner{};
     try spinner.start();
     errdefer spinner.stop();
+    var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
+    defer profiler.deinit();
 
-    const prompt_capacity = prompt.len * 4 + max_tokens + 8;
+    const prompt_capacity = prompt.len * 4 + options.max_tokens + 8;
     var session = try Session.init(
         allocator,
         model,
         backend,
         dense_tensors,
         @min(model.context_length, prompt_capacity),
+        if (profiler.enabled) &profiler else null,
     );
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
@@ -837,16 +842,24 @@ pub fn generateLoaded(
     var ttft_ns = deltaNs(startup_begin, prompt_end);
 
     const decode_begin = std.time.nanoTimestamp();
-    while (generated_token_count < max_tokens) : (generated_token_count += 1) {
-        const next_token = sampleToken(session.logits, temperature);
-        if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) break;
+    while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
+        profiler.beginDecodeToken();
+        const sample_begin = std.time.nanoTimestamp();
+        const next_token = sampleToken(session.logits, options.temperature);
+        profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+        if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
+            profiler.endDecodeToken();
+            break;
+        }
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
         _ = try session.step(next_token);
+        profiler.endDecodeToken();
     }
     const decode_end = std.time.nanoTimestamp();
+    const profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -857,6 +870,7 @@ pub fn generateLoaded(
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
         .backend = if (backend == null) .cpu else .metal,
+        .metal_profile_summary = profile_summary,
     };
 }
 

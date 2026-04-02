@@ -1,6 +1,7 @@
 const std = @import("std");
 const backend_api = @import("backend.zig");
 const metal_backend = @import("metal_backend.zig");
+const metal_profile = @import("metal_profile.zig");
 
 pub const DenseLookup = struct {
     ctx: ?*const anyopaque,
@@ -65,11 +66,13 @@ pub const Session = struct {
     tmp: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
+    profiler: ?*metal_profile.Profiler = null,
 
     pub fn init(
         backend: backend_api.MatVecBackend,
         dense_lookup: DenseLookup,
         model: ModelDesc,
+        profiler: ?*metal_profile.Profiler,
     ) !Session {
         const max_input = @max(model.embedding_length, model.feed_forward_length);
         const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.vocab_size));
@@ -112,6 +115,7 @@ pub const Session = struct {
             .tmp = tmp,
             .k_cache = k_cache,
             .v_cache = v_cache,
+            .profiler = profiler,
         };
     }
 
@@ -146,6 +150,7 @@ pub const Session = struct {
         try self.runProjection(layer.attn_k, self.normed, self.k);
         try self.runProjection(layer.attn_v, self.normed, self.v);
 
+        const q_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
             self.backend,
             self.q,
@@ -155,6 +160,14 @@ pub const Session = struct {
             position,
             self.model.rope_freq_base,
         );
+        self.recordCategoryWithShape(.elementwise_ops, q_rope_start, .{
+            .rows = self.model.head_count,
+            .cols = self.model.head_dimension,
+            .depth = self.model.rope_dimension_count,
+            .extra = position + 1,
+        });
+
+        const k_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
             self.backend,
             self.k,
@@ -164,13 +177,34 @@ pub const Session = struct {
             position,
             self.model.rope_freq_base,
         );
+        self.recordCategoryWithShape(.elementwise_ops, k_rope_start, .{
+            .rows = self.model.head_count_kv,
+            .cols = self.model.head_dimension,
+            .depth = self.model.rope_dimension_count,
+            .extra = position + 1,
+        });
 
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
         const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
+        const kv_k_start = std.time.nanoTimestamp();
         try metal_backend.copyBufferRegion(self.backend, self.k, 0, self.k_cache, kv_offset, kv_bytes);
+        self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
+            .rows = 1,
+            .cols = self.model.kv_dimension,
+            .depth = layer_index,
+            .extra = position + 1,
+        });
+        const kv_v_start = std.time.nanoTimestamp();
         try metal_backend.copyBufferRegion(self.backend, self.v, 0, self.v_cache, kv_offset, kv_bytes);
+        self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
+            .rows = 1,
+            .cols = self.model.kv_dimension,
+            .depth = layer_index,
+            .extra = position + 1,
+        });
 
+        const attention_start = std.time.nanoTimestamp();
         try metal_backend.attentionFused(
             self.backend,
             self.q,
@@ -186,24 +220,54 @@ pub const Session = struct {
             layer_base,
             @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
         );
+        self.recordCategoryWithShape(.attention, attention_start, .{
+            .rows = self.model.head_count,
+            .cols = self.model.head_dimension,
+            .depth = position + 1,
+            .extra = self.model.head_count_kv,
+        });
         try self.runProjection(layer.attn_output, self.attn, self.tmp);
+        const add_start = std.time.nanoTimestamp();
         try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+        self.recordCategoryWithShape(.elementwise_ops, add_start, .{
+            .rows = 1,
+            .cols = self.model.embedding_length,
+            .depth = layer_index,
+            .extra = position + 1,
+        });
     }
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
         try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
         try self.runProjection(layer.ffn_gate, self.normed, self.gate);
         try self.runProjection(layer.ffn_up, self.normed, self.up);
+        const silu_start = std.time.nanoTimestamp();
         try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+        self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
+            .rows = 1,
+            .cols = self.model.feed_forward_length,
+            .depth = 2,
+        });
         try self.runProjection(layer.ffn_down, self.gate, self.tmp);
+        const add_start = std.time.nanoTimestamp();
         try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+        self.recordCategoryWithShape(.elementwise_ops, add_start, .{
+            .rows = 1,
+            .cols = self.model.embedding_length,
+            .depth = 1,
+        });
     }
 
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
+        const readback_start = std.time.nanoTimestamp();
         try metal_backend.commitSequence(self.backend);
         try metal_backend.readBufferF32(self.tmp, out);
+        self.recordCategoryWithShape(.readback, readback_start, .{
+            .rows = 1,
+            .cols = out.len,
+        });
     }
 
     fn runRmsNorm(
@@ -213,6 +277,7 @@ pub const Session = struct {
         output: metal_backend.BufferHandle,
     ) !void {
         const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
         try metal_backend.rmsNorm(
             self.backend,
             input,
@@ -221,6 +286,10 @@ pub const Session = struct {
             self.model.embedding_length,
             self.model.rms_norm_eps,
         );
+        self.recordCategoryWithShape(.normalization, start, .{
+            .rows = 1,
+            .cols = self.model.embedding_length,
+        });
     }
 
     fn runProjection(
@@ -229,6 +298,7 @@ pub const Session = struct {
         input: metal_backend.BufferHandle,
         output: metal_backend.BufferHandle,
     ) !void {
+        const start = std.time.nanoTimestamp();
         switch (tensor.tensor_type) {
             12 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -246,5 +316,25 @@ pub const Session = struct {
                 );
             },
         }
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+        });
+    }
+
+    fn recordCategoryWithShape(
+        self: *Session,
+        category: metal_profile.Category,
+        start_ns: i128,
+        shape: metal_profile.ShapeDesc,
+    ) void {
+        if (self.profiler) |profiler| {
+            profiler.recordWithShape(category, elapsedSince(start_ns), shape);
+        }
+    }
+
+    fn elapsedSince(start_ns: i128) u64 {
+        return @intCast(@max(@as(i128, 0), std.time.nanoTimestamp() - start_ns));
     }
 };

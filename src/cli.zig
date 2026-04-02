@@ -19,9 +19,11 @@ pub const Config = struct {
     prompt: ?[]const u8 = null,
     port: u16 = server.default_port,
     max_tokens: usize = 16,
+    bench_runs: usize = 1,
     seed: u64 = 0,
     temperature: f32 = 0,
     backend: runtime.BackendPreference = .auto,
+    metal_profile: bool = false,
 };
 
 pub const ParseError = error{
@@ -80,6 +82,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.max_tokens = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--bench-runs")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.bench_runs = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--seed")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -96,6 +104,10 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config.backend = runtime.BackendPreference.parse(args[i]) orelse return error.InvalidBackend;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--metal-profile")) {
+            config.metal_profile = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -144,9 +156,11 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  -m, --model <path>    Path to a GGUF model
         \\  -p, --prompt <text>   Prompt text for one-shot generation
         \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
+        \\      --bench-runs <n>  Bench only: one cold run plus warm averages over reused runtime (default: {d})
         \\      --seed <n>        Seed for deterministic sampling (default: {d})
         \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
+        \\      --metal-profile   Print aggregated Metal decode timing and dominant shape data
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -160,6 +174,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         .{
             build_options.version,
             configDefaults.max_tokens,
+            configDefaults.bench_runs,
             configDefaults.seed,
             configDefaults.temperature,
             configDefaults.backend.label(),
@@ -189,9 +204,11 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "run", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--seed", "9", "--temperature", "0.5", "--backend", "metal" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--backend", "metal", "--metal-profile" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
+    try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.temperature, 0.0001);
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
+    try std.testing.expect(config.metal_profile);
 }

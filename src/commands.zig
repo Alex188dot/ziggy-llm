@@ -56,6 +56,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .seed = config.seed,
         .temperature = config.temperature,
         .backend = config.backend,
+        .metal_profile = config.metal_profile,
     });
 }
 
@@ -68,7 +69,8 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .seed = config.seed,
         .temperature = config.temperature,
         .backend = config.backend,
-    });
+        .metal_profile = config.metal_profile,
+    }, config.bench_runs);
 }
 
 fn printInspect(writer: *std.Io.Writer, config: cli.Config) !void {

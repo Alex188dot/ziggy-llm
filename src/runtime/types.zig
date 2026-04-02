@@ -72,6 +72,7 @@ pub const GenerationOptions = struct {
     seed: u64 = 0,
     temperature: f32 = 0.0,
     backend: BackendPreference = .auto,
+    metal_profile: bool = false,
 };
 
 pub const GenerationReport = struct {
@@ -85,9 +86,11 @@ pub const GenerationReport = struct {
     seed: u64,
     temperature: f32,
     backend: BackendUsed,
+    metal_profile_summary: ?[]u8 = null,
 
     pub fn deinit(self: *GenerationReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);
+        if (self.metal_profile_summary) |summary| allocator.free(summary);
         self.* = undefined;
     }
 
