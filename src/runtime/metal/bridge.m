@@ -74,6 +74,46 @@ static void ziggy_dispatch_standard(
     [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
 }
 
+static void ziggy_dispatch_q4k_rows(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count
+) {
+    NSUInteger thread_width = pipeline.threadExecutionWidth;
+    if (thread_width == 0) thread_width = 1;
+    NSUInteger max_total_threads = pipeline.maxTotalThreadsPerThreadgroup;
+    NSUInteger threads_per_group = thread_width * 4;
+    if (threads_per_group > max_total_threads) {
+        threads_per_group = max_total_threads - (max_total_threads % thread_width);
+    }
+    if (threads_per_group == 0) threads_per_group = thread_width;
+    if (threads_per_group > 256) threads_per_group = 256;
+
+    MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
+}
+
+static void ziggy_dispatch_rowwise(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count
+) {
+    NSUInteger thread_width = pipeline.threadExecutionWidth;
+    if (thread_width == 0) thread_width = 1;
+    NSUInteger max_total_threads = pipeline.maxTotalThreadsPerThreadgroup;
+    NSUInteger threads_per_group = thread_width * 4;
+    if (threads_per_group > max_total_threads) {
+        threads_per_group = max_total_threads - (max_total_threads % thread_width);
+    }
+    if (threads_per_group == 0) threads_per_group = thread_width;
+    if (threads_per_group > 256) threads_per_group = 256;
+
+    MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
+}
+
 static int ziggy_commit_pending(
     ZiggyMetalState *state,
     char *error_message,
@@ -380,20 +420,39 @@ int ziggy_metal_run_matvec_f32(
         const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-        return ziggy_run_compute(
-            state,
-            state.matvecPipeline,
-            rows,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-                [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
-                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-                [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-                [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-            },
-            error_message,
-            error_message_len
-        );
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
+        if (command_buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        ziggy_dispatch_rowwise(encoder, state.matvecPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal matvec command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
     }
 }
 
@@ -417,20 +476,39 @@ int ziggy_metal_run_matvec_q4k_f32(
         const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-        return ziggy_run_compute(
-            state,
-            state.matvecQ4KPipeline,
-            rows,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-                [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
-                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-                [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-                [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-            },
-            error_message,
-            error_message_len
-        );
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
+        if (command_buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecQ4KPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        ziggy_dispatch_q4k_rows(encoder, state.matvecQ4KPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
     }
 }
 
@@ -591,8 +669,15 @@ int ziggy_metal_attention_fused_f32(
         [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:10];
         [encoder setBytes:&scale length:sizeof(scale) atIndex:11];
 
-        NSUInteger threads_per_group = head_dim == 0 ? 1 : head_dim;
+        NSUInteger thread_width = state.attentionFusedPipeline.threadExecutionWidth;
+        if (thread_width == 0) thread_width = 1;
         NSUInteger max_total_threads = state.attentionFusedPipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger work_items = position + 1;
+        if (head_dim > work_items) work_items = head_dim;
+        NSUInteger threads_per_group = thread_width;
+        while (threads_per_group < work_items && threads_per_group + thread_width <= max_total_threads && threads_per_group < 256) {
+            threads_per_group += thread_width;
+        }
         if (threads_per_group > max_total_threads) threads_per_group = max_total_threads;
         MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
         MTLSize grid_size = MTLSizeMake(head_count, 1, 1);

@@ -21,6 +21,7 @@ test {
     std.testing.refAllDecls(@import("cli.zig"));
     std.testing.refAllDecls(@import("commands.zig"));
     std.testing.refAllDecls(@import("runtime.zig"));
+    std.testing.refAllDecls(@import("runtime/metal_backend_test.zig"));
     std.testing.refAllDecls(@import("llama_cpu.zig"));
     std.testing.refAllDecls(@import("gguf.zig"));
     std.testing.refAllDecls(@import("server.zig"));
