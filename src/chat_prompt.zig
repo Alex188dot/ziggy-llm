@@ -9,6 +9,16 @@ pub const Message = struct {
     content: []u8,
 };
 
+const system_message =
+    \\You are in an interactive terminal chat.
+    \\Reply only as the assistant.
+    \\Never emit role labels such as User, Assistant, Customer, Human, or System.
+    \\Do not invent the user's next message.
+    \\Keep answers concise unless the user asks for detail.
+;
+
+pub const history_window_messages: usize = 8;
+
 pub fn deinitMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) void {
     for (messages.items) |message| allocator.free(message.content);
     messages.deinit(allocator);
@@ -30,12 +40,13 @@ pub fn buildPrompt(
     messages: []const Message,
 ) ![]u8 {
     const context_length = runtime_cache.contextLength() orelse blk: {
-        _ = try runtime_cache.promptTokenCount(model_path, "User: hi\nAssistant:", backend);
+        _ = try runtime_cache.promptTokenCount(model_path, "<|user|>\nhi</s>\n<|assistant|>\n", backend);
         break :blk runtime_cache.contextLength().?;
     };
-    const token_budget = context_length -| (max_tokens + 32);
+    const token_budget = context_length -| (max_tokens + 64);
 
-    var start_index: usize = if (messages.len > 0) messages.len - 1 else 0;
+    var start_index: usize = if (messages.len > history_window_messages) messages.len - history_window_messages else 0;
+    if (start_index % 2 != 0) start_index -= 1;
     while (true) {
         const prompt = try renderMessages(allocator, messages[start_index..]);
         errdefer allocator.free(prompt);
@@ -45,7 +56,7 @@ pub fn buildPrompt(
         };
         if (count <= token_budget or start_index == 0) return prompt;
         allocator.free(prompt);
-        start_index -= 1;
+        start_index -|= 2;
     }
 }
 
@@ -61,6 +72,12 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
         }
         offset += line.len + 1;
     }
+
+    for ([_][]const u8{ "</s>", "</s", "</", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|", "<user|", "<assistant|", "<system|" }) |marker| {
+        if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
+            end = @min(end, index);
+        }
+    }
     return std.mem.trim(u8, reply[0..end], " \n\r\t");
 }
 
@@ -68,8 +85,13 @@ fn isDialogueBoundary(line: []const u8) bool {
     if (line.len == 0) return false;
 
     const explicit = [_][]const u8{
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
         "User:",
+        "User",
         "Assistant:",
+        "Assistant",
         "System:",
         "Human:",
         "Customer:",
@@ -92,17 +114,22 @@ fn renderMessages(allocator: std.mem.Allocator, messages: []const Message) ![]u8
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     const writer = buf.writer(allocator);
+    try writer.print("<|system|>\n{s}\n</s>\n", .{system_message});
     for (messages) |message| {
-        try writer.print("{s}: {s}\n\n", .{
-            switch (message.role) {
-                .user => "User",
-                .assistant => "Assistant",
-            },
-            message.content,
-        });
+        const tag = switch (message.role) {
+            .user => "user",
+            .assistant => "assistant",
+        };
+        try writer.print("<|{s}|>\n{s}\n</s>\n", .{ tag, message.content });
     }
-    try writer.print("Assistant:", .{});
+    try writer.print("<|assistant|>\n", .{});
     return buf.toOwnedSlice(allocator);
+}
+
+pub fn contextWindow(runtime_cache: *resident_runtime.ResidentRuntime, model_path: []const u8, backend: runtime.BackendPreference) !usize {
+    if (runtime_cache.contextLength()) |length| return length;
+    _ = try runtime_cache.promptTokenCount(model_path, "<|user|>\nhi</s>\n<|assistant|>\n", backend);
+    return runtime_cache.contextLength().?;
 }
 
 test "trimAssistantReply stops at generic dialogue boundary" {
@@ -112,4 +139,28 @@ test "trimAssistantReply stops at generic dialogue boundary" {
         \\Customer: I want to place an order.
     ;
     try std.testing.expectEqualStrings("Hi there! My name is Asa.", trimAssistantReply(reply));
+}
+
+test "trimAssistantReply stops at chat template marker" {
+    const reply =
+        \\Hello Alessio.
+        \\<|user|>
+        \\what is your name
+    ;
+    try std.testing.expectEqualStrings("Hello Alessio.", trimAssistantReply(reply));
+}
+
+test "trimAssistantReply stops at malformed emitted role marker" {
+    const reply = "Hello there. </s>\n<user|>\nquestion";
+    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+}
+
+test "trimAssistantReply stops at partial stop marker" {
+    const reply = "Hello there. </s";
+    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+}
+
+test "trimAssistantReply stops at shortest stop prefix" {
+    const reply = "Hello there. </";
+    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
 }

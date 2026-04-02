@@ -16,8 +16,13 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin = std.fs.File.stdin().reader(&stdin_buf);
+    const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend);
 
-    try writer.print("chat_ready: true\nmodel: {s}\ncommands: /help /clear /unload /bye\n\n", .{model_path});
+    try writer.print("chat_ready: true\nmodel: {s}\ncontext_window: {d}\nhistory_window_messages: {d}\ncommands: /help /clear /unload /bye\n\n", .{
+        model_path,
+        context_window,
+        prompt_builder.history_window_messages,
+    });
 
     if (config.prompt) |prompt| {
         try handleUserTurn(writer, allocator, &cache, model_path, config, &messages, prompt);
@@ -64,12 +69,16 @@ fn handleUserTurn(
     const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.max_tokens, messages.items);
     defer allocator.free(prompt);
 
-    var report = try cache.generate(model_path, prompt, generationOptions(config));
+    var stream_state = StreamState.init(allocator, writer);
+    defer stream_state.deinit();
+
+    var report = try cache.generateStreaming(model_path, prompt, generationOptions(config), &stream_state, streamChunk);
     defer report.deinit(allocator);
     const trimmed = prompt_builder.trimAssistantReply(report.generated_text);
     try prompt_builder.appendMessage(allocator, messages, .assistant, trimmed);
+    try stream_state.flushFinal(trimmed);
 
-    try writer.print("{s}\n\n", .{trimmed});
+    try writer.print("\n\n", .{});
 }
 
 fn generationOptions(config: cli.Config) runtime.GenerationOptions {
@@ -84,4 +93,44 @@ fn generationOptions(config: cli.Config) runtime.GenerationOptions {
         .backend = config.backend,
         .metal_profile = config.metal_profile,
     };
+}
+
+const StreamState = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    buffer: std.ArrayList(u8) = .empty,
+    emitted_len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) StreamState {
+        return .{
+            .allocator = allocator,
+            .writer = writer,
+        };
+    }
+
+    fn deinit(self: *StreamState) void {
+        self.buffer.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn flushSafePrefix(self: *StreamState) !void {
+        const safe = prompt_builder.trimAssistantReply(self.buffer.items);
+        if (safe.len <= self.emitted_len) return;
+        try self.writer.print("{s}", .{safe[self.emitted_len..]});
+        try self.writer.flush();
+        self.emitted_len = safe.len;
+    }
+
+    fn flushFinal(self: *StreamState, final_trimmed: []const u8) !void {
+        if (final_trimmed.len <= self.emitted_len) return;
+        try self.writer.print("{s}", .{final_trimmed[self.emitted_len..]});
+        try self.writer.flush();
+        self.emitted_len = final_trimmed.len;
+    }
+};
+
+fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
+    const state: *StreamState = @ptrCast(@alignCast(ctx.?));
+    try state.buffer.appendSlice(state.allocator, chunk);
+    try state.flushSafePrefix();
 }

@@ -44,6 +44,8 @@ pub const GenerateReport = struct {
     }
 };
 
+pub const StreamCallback = *const fn (?*anyopaque, []const u8) anyerror!void;
+
 pub const DenseTensorLookup = struct {
     ctx: ?*const anyopaque,
     get_fn: *const fn (?*const anyopaque, TensorRef) ?[]const f32,
@@ -810,6 +812,19 @@ pub fn generateLoaded(
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
 ) !GenerateReport {
+    return generateLoadedStreaming(allocator, model, prompt, options, backend, dense_tensors, null, null);
+}
+
+pub fn generateLoadedStreaming(
+    allocator: std.mem.Allocator,
+    model: *const Model,
+    prompt: []const u8,
+    options: runtime_types.GenerationOptions,
+    backend: ?backend_api.MatVecBackend,
+    dense_tensors: ?DenseTensorLookup,
+    stream_ctx: ?*anyopaque,
+    stream_callback: ?StreamCallback,
+) !GenerateReport {
     const startup_begin = std.time.nanoTimestamp();
     var spinner = terminal.Spinner{};
     try spinner.start();
@@ -857,7 +872,12 @@ pub fn generateLoaded(
             profiler.endDecodeToken();
             break;
         }
+        const chunk_start = output.items.len;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
+        if (stream_callback) |callback| {
+            const chunk = output.items[chunk_start..];
+            if (chunk.len > 0) try callback(stream_ctx, chunk);
+        }
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }

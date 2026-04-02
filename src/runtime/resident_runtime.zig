@@ -50,6 +50,17 @@ pub const ResidentRuntime = struct {
         prompt: []const u8,
         options: types.GenerationOptions,
     ) !types.GenerationReport {
+        return self.generateStreaming(model_path, prompt, options, null, null);
+    }
+
+    pub fn generateStreaming(
+        self: *ResidentRuntime,
+        model_path: []const u8,
+        prompt: []const u8,
+        options: types.GenerationOptions,
+        stream_ctx: ?*anyopaque,
+        stream_callback: ?llama_cpu.StreamCallback,
+    ) !types.GenerationReport {
         self.unloadIfExpired();
         try self.ensureLoaded(model_path, options.backend);
         const loaded = &self.loaded.?;
@@ -65,13 +76,15 @@ pub const ResidentRuntime = struct {
         else
             null;
 
-        var report = try llama_cpu.generateLoaded(
+        var report = try llama_cpu.generateLoadedStreaming(
             self.allocator,
             &loaded.model,
             prompt,
             options,
             loaded.execution.backend,
             lookup,
+            stream_ctx,
+            stream_callback,
         );
         report.startup_breakdown.model_load_ns = loaded.startup_breakdown.model_load_ns;
         report.startup_breakdown.tensor_prepare_ns = loaded.startup_breakdown.tensor_prepare_ns;
