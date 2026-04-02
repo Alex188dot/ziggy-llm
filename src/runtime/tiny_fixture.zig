@@ -5,13 +5,15 @@ const types = @import("types.zig");
 pub const Options = struct {
     file_type: u32 = 1,
     ambiguous_a: bool = false,
+    loop_output: bool = false,
+    context_length: usize = 16,
 };
 
 pub fn makeTinyModelFixture(allocator: std.mem.Allocator, options: Options) ![]u8 {
     const vocab = [_][]const u8{ "<unk>", "<s>", "</s>", "a", "b", "c", "!" };
     const embed: usize = vocab.len;
     const ff: usize = 4;
-    const context: usize = 16;
+    const context: usize = options.context_length;
 
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
@@ -33,7 +35,7 @@ pub fn makeTinyModelFixture(allocator: std.mem.Allocator, options: Options) ![]u
     writeU32Kv(&list, "tokenizer.ggml.eos_token_id", 2);
     writeU32Kv(&list, "tokenizer.ggml.unknown_token_id", 0);
     writeBoolKv(&list, "tokenizer.ggml.add_bos_token", false);
-    writeU32Kv(&list, "ziggy.context_length", context);
+    writeU32Kv(&list, "ziggy.context_length", @intCast(context));
     writeU32Kv(&list, "ziggy.embedding_length", embed);
     writeU32Kv(&list, "ziggy.feed_forward_length", ff);
     writeU32Kv(&list, "ziggy.block_count", 1);
@@ -103,10 +105,10 @@ pub fn makeTinyModelFixture(allocator: std.mem.Allocator, options: Options) ![]u
     defer allocator.free(output);
     @memset(output, -4);
 
-    setTransition(output, vocab.len, 3, if (options.ambiguous_a) 4 else 4, 4);
+    setTransition(output, vocab.len, 3, 4, 4);
     setTransition(output, vocab.len, 4, 5, 4);
     setTransition(output, vocab.len, 5, 6, 4);
-    setTransition(output, vocab.len, 6, 2, 4);
+    setTransition(output, vocab.len, 6, if (options.loop_output) 3 else 2, 4);
     if (options.ambiguous_a) setTransition(output, vocab.len, 3, 5, 4);
 
     const tensor_data = [_][]const f32{

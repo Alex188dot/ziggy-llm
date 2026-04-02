@@ -147,6 +147,7 @@ pub fn generate(
     var rng = std.Random.DefaultPrng.init(options.seed);
     const random = rng.random();
     var generated_token_count: usize = 0;
+    var ttft_ns = types.deltaNs(startup_begin, prompt_end);
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) {
@@ -156,6 +157,9 @@ pub fn generate(
         const token_text = try model.tokenizer.tokenString(next_token);
         if (!(model.tokenizer.bos_token_id != null and next_token == model.tokenizer.bos_token_id.?)) {
             try output.appendSlice(allocator, token_text);
+        }
+        if (generated_token_count == 0) {
+            ttft_ns = types.deltaNs(startup_begin, std.time.nanoTimestamp());
         }
         _ = try session.step(next_token);
         generated_token_count += 1;
@@ -168,6 +172,7 @@ pub fn generate(
         .generated_token_count = generated_token_count,
         .startup_ns = types.deltaNs(startup_begin, startup_end),
         .prompt_ns = types.deltaNs(prompt_begin, prompt_end),
+        .ttft_ns = ttft_ns,
         .decode_ns = types.deltaNs(decode_begin, decode_end),
         .seed = options.seed,
         .temperature = options.temperature,

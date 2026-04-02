@@ -45,6 +45,7 @@ pub fn generate(
             .generated_token_count = llama_report.generated_token_count,
             .startup_ns = llama_report.startup_ns,
             .prompt_ns = llama_report.prompt_ns,
+            .ttft_ns = llama_report.ttft_ns,
             .decode_ns = llama_report.decode_ns,
             .seed = options.seed,
             .temperature = options.temperature,
@@ -75,6 +76,7 @@ pub fn runCommand(
         \\temperature: {d:.3}
         \\startup_ms: {d:.3}
         \\prompt_ms: {d:.3}
+        \\ttft_ms: {d:.3}
         \\tps: {d:.3}
         \\decode_tok_s: {d:.3}
         \\
@@ -88,6 +90,7 @@ pub fn runCommand(
             report.temperature,
             nsToMs(report.startup_ns),
             nsToMs(report.prompt_ns),
+            nsToMs(report.ttft_ns),
             report.decodeTokensPerSecond(),
             report.decodeTokensPerSecond(),
         },
@@ -108,6 +111,7 @@ pub fn benchCommand(
         \\backend={s}
         \\startup_ns={d}
         \\prompt_ns={d}
+        \\ttft_ns={d}
         \\decode_ns={d}
         \\prompt_tokens={d}
         \\generated_tokens={d}
@@ -119,6 +123,7 @@ pub fn benchCommand(
             report.backend.label(),
             report.startup_ns,
             report.prompt_ns,
+            report.ttft_ns,
             report.decode_ns,
             report.prompt_token_count,
             report.generated_token_count,

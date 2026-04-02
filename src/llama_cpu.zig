@@ -27,6 +27,7 @@ pub const GenerateReport = struct {
     generated_token_count: usize,
     startup_ns: u64,
     prompt_ns: u64,
+    ttft_ns: u64,
     decode_ns: u64,
 
     pub fn deinit(self: *GenerateReport, allocator: std.mem.Allocator) void {
@@ -716,12 +717,16 @@ pub fn generate(
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
     var generated_token_count: usize = 0;
+    var ttft_ns = deltaNs(startup_begin, prompt_end);
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < max_tokens) : (generated_token_count += 1) {
         const next_token = sampleToken(session.logits, temperature);
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) break;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
+        if (generated_token_count == 0) {
+            ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
+        }
         _ = try session.step(next_token);
     }
     const decode_end = std.time.nanoTimestamp();
@@ -732,6 +737,7 @@ pub fn generate(
         .generated_token_count = generated_token_count,
         .startup_ns = deltaNs(startup_begin, startup_end),
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
+        .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
     };
 }

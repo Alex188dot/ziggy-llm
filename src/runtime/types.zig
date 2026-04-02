@@ -81,6 +81,7 @@ pub const GenerationReport = struct {
     generated_token_count: usize,
     startup_ns: u64,
     prompt_ns: u64,
+    ttft_ns: u64,
     decode_ns: u64,
     seed: u64,
     temperature: f32,

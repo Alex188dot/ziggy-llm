@@ -26,6 +26,7 @@ Today, the codebase provides:
 - a narrow Metal matvec runtime for `ziggy-tiny` GGUF fixtures on Apple Silicon
 - a native CPU `llama` GGUF runtime in Zig
 - deterministic `run` and `bench` execution with seed, backend selection, and timing output
+- explicit TTFT reporting in `run` and `bench`
 - a smaller runtime module layout for backend dispatch, tiny-model loading, CPU/Metal backends, and fixtures
 - project docs, scope, and roadmap
 
@@ -209,7 +210,7 @@ Current Metal-specific limitations:
 - Apple Silicon macOS builds only
 - only the `ziggy-tiny` reference runtime uses Metal today
 - the `llama` runtime is still CPU-only
-- performance notes and benchmark numbers for the M3 target machine are still to be recorded
+- performance notes and first benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 There is also a pragmatic real-model path:
 
@@ -287,6 +288,27 @@ Run an implemented CPU reference command:
 zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
 ```
 
+Create a reproducible `ziggy-tiny` benchmark fixture:
+
+```bash
+zig build tiny-fixture -- --loop /tmp/ziggy-tiny-loop.gguf
+```
+
+Run the implemented Metal path on Apple Silicon:
+
+```bash
+./zig-out/bin/ziggy-llm run -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 32 --seed 7 --backend metal
+```
+
+Benchmark CPU vs Metal on the same fixture:
+
+```bash
+./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend cpu
+./zig-out/bin/ziggy-llm bench -m /tmp/ziggy-tiny-loop.gguf -p a --max-tokens 256 --seed 7 --backend metal
+```
+
+Real `llama` GGUF models still run on CPU only. `--backend auto` will pick Metal only for the `ziggy-tiny` path today.
+
 Run tests:
 
 ```bash
@@ -297,6 +319,7 @@ zig build test
 
 - [PROJECT_OUTLINE.md](/Users/alessioleodori/HelloWorld/zig_/PROJECT_OUTLINE.md)
 - [ROADMAP.md](/Users/alessioleodori/HelloWorld/zig_/ROADMAP.md)
+- [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Error Handling Conventions
 

@@ -25,6 +25,17 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const fixture_tool = b.addExecutable(.{
+        .name = "make-tiny-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/make_tiny_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    configureCompileStep(b, fixture_tool, build_options, enable_metal);
+    b.installArtifact(fixture_tool);
+
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -32,6 +43,13 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run ziggy-llm");
     run_step.dependOn(&run_cmd.step);
+
+    const fixture_run = b.addRunArtifact(fixture_tool);
+    if (b.args) |args| {
+        fixture_run.addArgs(args);
+    }
+    const fixture_step = b.step("tiny-fixture", "Write a reproducible ziggy-tiny GGUF fixture");
+    fixture_step.dependOn(&fixture_run.step);
 
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -78,8 +78,8 @@ Definition of done for v0.3.0:
 - [x] Implement Metal buffer management for model tensors and runtime buffers
 - [x] Implement at least one working Metal compute path for the first supported model
 - [x] Validate correctness against the CPU reference path
-- [ ] Measure TTFT and tok/s on the M3 MacBook Pro target machine
-- [ ] Profile hot kernels on macOS and record optimization notes
+- [x] Measure TTFT and tok/s on the M3 MacBook Pro target machine
+- [x] Profile hot kernels on macOS and record optimization notes
 - [x] Document Metal-specific assumptions and limitations
 - [x] Add graceful fallback behavior when Metal is unavailable or disabled
 
