@@ -17,6 +17,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     var stdin_buf: [4096]u8 = undefined;
     var stdin = std.fs.File.stdin().reader(&stdin_buf);
     const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend);
+    const max_tokens = effectiveChatMaxTokens(config, context_window);
 
     try writer.print("chat_ready: true\nmodel: {s}\ncontext_window: {d}\nhistory_window_messages: {d}\ncommands: /help /clear /unload /bye\n\n", .{
         model_path,
@@ -25,7 +26,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     });
 
     if (config.prompt) |prompt| {
-        try handleUserTurn(writer, allocator, &cache, model_path, config, &messages, prompt);
+        try handleUserTurn(writer, allocator, &cache, model_path, config, max_tokens, &messages, prompt);
     }
 
     while (true) {
@@ -52,7 +53,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
             continue;
         }
 
-        try handleUserTurn(writer, allocator, &cache, model_path, config, &messages, trimmed);
+        try handleUserTurn(writer, allocator, &cache, model_path, config, max_tokens, &messages, trimmed);
     }
 }
 
@@ -62,17 +63,18 @@ fn handleUserTurn(
     cache: *resident_runtime.ResidentRuntime,
     model_path: []const u8,
     config: cli.Config,
+    max_tokens: usize,
     messages: *std.ArrayList(prompt_builder.Message),
     user_text: []const u8,
 ) !void {
     try prompt_builder.appendMessage(allocator, messages, .user, user_text);
-    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.max_tokens, messages.items);
+    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, max_tokens, messages.items);
     defer allocator.free(prompt);
 
     var stream_state = StreamState.init(allocator, writer);
     defer stream_state.deinit();
 
-    var report = try cache.generateStreaming(model_path, prompt, generationOptions(config), &stream_state, streamChunk);
+    var report = try cache.generateStreaming(model_path, prompt, generationOptions(config, max_tokens), &stream_state, streamChunk);
     defer report.deinit(allocator);
     const trimmed = prompt_builder.trimAssistantReply(report.generated_text);
     try prompt_builder.appendMessage(allocator, messages, .assistant, trimmed);
@@ -81,9 +83,9 @@ fn handleUserTurn(
     try writer.print("\n\n", .{});
 }
 
-fn generationOptions(config: cli.Config) runtime.GenerationOptions {
+fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOptions {
     return .{
-        .max_tokens = config.max_tokens,
+        .max_tokens = max_tokens,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,
@@ -94,6 +96,12 @@ fn generationOptions(config: cli.Config) runtime.GenerationOptions {
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
     };
+}
+
+fn effectiveChatMaxTokens(config: cli.Config, context_window: usize) usize {
+    const cli_default: usize = 16;
+    if (config.max_tokens != cli_default) return config.max_tokens;
+    return @min(@as(usize, 256), context_window / 4);
 }
 
 const StreamState = struct {
