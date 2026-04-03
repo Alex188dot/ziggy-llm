@@ -218,6 +218,12 @@ pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     try readBuffer(buffer.raw, out);
 }
 
+pub fn readBufferU32(buffer: BufferHandle, out: []u32) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (out.len * @sizeOf(u32) > buffer.byte_len) return error.MetalBufferError;
+    try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
+}
+
 pub fn beginSequence(backend: backend_api.MatVecBackend) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -460,6 +466,83 @@ pub fn runMatVecQ6KAddToBuffer(
     const matrix_buffer = try state.rawBuffer(matrix_bytes);
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     try mapStatus(c.ziggy_metal_run_matvec_q6k_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ8_0ToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q8_0_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ8_0ToDstBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    output_offset_bytes: usize,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < output_offset_bytes + rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q8_0_f32_to_dst(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        output_offset_bytes,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ8_0AddToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q8_0_add_f32(
         state.context,
         matrix_buffer.raw,
         input.raw,
@@ -724,6 +807,25 @@ pub fn rmsNorm(
     ), &error_buf);
 }
 
+pub fn argmax(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_token: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_argmax_f32(
+        state.context,
+        input.raw,
+        output_token.raw,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 fn metalMatVec(
     ctx: ?*anyopaque,
     out: []f32,
@@ -805,11 +907,15 @@ fn writeBuffer(buffer: *c.ZiggyMetalBuffer, values: []const f32) !void {
 }
 
 fn readBuffer(buffer: *c.ZiggyMetalBuffer, out: []f32) !void {
+    try readBufferBytes(buffer, std.mem.sliceAsBytes(out));
+}
+
+fn readBufferBytes(buffer: *c.ZiggyMetalBuffer, out: []u8) !void {
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     const status = c.ziggy_metal_read_buffer(
         buffer,
         out.ptr,
-        out.len * @sizeOf(f32),
+        out.len,
         0,
         &error_buf,
         error_buf.len,

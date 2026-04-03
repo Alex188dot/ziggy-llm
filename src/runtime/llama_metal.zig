@@ -141,7 +141,7 @@ pub const DenseTensorStore = struct {
             .tensor_type = tensor.tensor_type,
         });
 
-        if (tensor.tensor_type == .q4_k or tensor.tensor_type == .q6_k) {
+        if (tensor.tensor_type == .q4_k or tensor.tensor_type == .q6_k or tensor.tensor_type == .q8_0) {
             const prepare_start = std.time.nanoTimestamp();
             const tensor_bytes = try llama.tensorBytes(model, tensor);
             try self.raw_tensors.put(tensor.offset, tensor_bytes);

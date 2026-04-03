@@ -69,6 +69,7 @@ pub const Session = struct {
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
+    sampled_token: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
@@ -100,6 +101,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(up);
         const tmp = try metal_backend.createScratchBuffer(backend, max_vec);
         errdefer metal_backend.destroyBuffer(tmp);
+        const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
+        errdefer metal_backend.destroyBuffer(sampled_token);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -118,6 +121,7 @@ pub const Session = struct {
             .gate = gate,
             .up = up,
             .tmp = tmp,
+            .sampled_token = sampled_token,
             .k_cache = k_cache,
             .v_cache = v_cache,
             .profiler = profiler,
@@ -134,6 +138,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
+        metal_backend.destroyBuffer(self.sampled_token);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
         self.* = undefined;
@@ -258,6 +263,22 @@ pub const Session = struct {
         });
     }
 
+    pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const readback_start = std.time.nanoTimestamp();
+        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        try metal_backend.commitSequence(self.backend);
+        var token: [1]u32 = .{0};
+        try metal_backend.readBufferU32(self.sampled_token, &token);
+        self.recordCategoryWithShape(.readback, readback_start, .{
+            .rows = 1,
+            .cols = 1,
+            .depth = self.model.vocab_size,
+        });
+        return token[0];
+    }
+
     fn runRmsNorm(
         self: *Session,
         tensor: TensorDesc,
@@ -301,6 +322,10 @@ pub const Session = struct {
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -350,6 +375,10 @@ pub const Session = struct {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
             },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+            },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
@@ -389,6 +418,10 @@ pub const Session = struct {
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0AddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;

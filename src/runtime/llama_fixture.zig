@@ -4,6 +4,8 @@ const llama_cpu = @import("../llama_cpu.zig");
 const rope_metaspace = "\xE2\x96\x81";
 const q4_k_block_values = 256;
 const q4_k_block_bytes = 144;
+const q8_0_block_values = 32;
+const q8_0_block_bytes = 34;
 const q6_k_block_values = 256;
 const q6_k_block_bytes = 210;
 
@@ -237,8 +239,21 @@ fn writeTensorData(list: *std.ArrayList(u8), tensor_type: llama_cpu.TensorType, 
     switch (tensor_type) {
         .f32 => writeTensorDataF32(list, values),
         .f16 => try writeTensorDataF16(list, values),
+        .q8_0 => try writeTensorDataQ8_0(list, values, row_len),
         .q4_k => try writeTensorDataQ4K(list, values, row_len),
         .q6_k => try writeTensorDataQ6K(list, values, row_len),
+    }
+}
+
+fn writeTensorDataQ8_0(list: *std.ArrayList(u8), values: []const f32, row_len: usize) !void {
+    if (row_len == 0 or row_len % q8_0_block_values != 0 or values.len % row_len != 0) return error.InvalidTensorMetadata;
+    const row_count = values.len / row_len;
+    for (0..row_count) |row_index| {
+        const row = values[row_index * row_len ..][0..row_len];
+        var block_index: usize = 0;
+        while (block_index < row_len) : (block_index += q8_0_block_values) {
+            appendQ8_0Block(list, row[block_index .. block_index + q8_0_block_values]) catch unreachable;
+        }
     }
 }
 
@@ -300,6 +315,15 @@ fn appendQ4KBlock(list: *std.ArrayList(u8), values: []const f32) !void {
         }
     }
 
+    list.appendSliceAssumeCapacity(&block);
+}
+
+fn appendQ8_0Block(list: *std.ArrayList(u8), values: []const f32) !void {
+    var block: [q8_0_block_bytes]u8 = [_]u8{0} ** q8_0_block_bytes;
+    writeHalfU16(block[0..2], 1);
+    for (values, 0..) |value, index| {
+        block[2 + index] = @bitCast(@as(i8, if (value >= 0) 1 else -1));
+    }
     list.appendSliceAssumeCapacity(&block);
 }
 

@@ -101,6 +101,7 @@ const ValueType = enum(u32) {
 pub const TensorType = enum(u32) {
     f32 = 0,
     f16 = 1,
+    q8_0 = 8,
     q4_k = 12,
     q6_k = 14,
 };
@@ -548,6 +549,28 @@ const Session = struct {
         for (prompt_tokens) |token_id| _ = try self.step(token_id);
     }
 
+    fn stepGreedy(self: *Session, token_id: u32) !u32 {
+        if (self.gpu_session == null) {
+            _ = try self.step(token_id);
+            return argmax(self.logits);
+        }
+        if (self.position >= self.model.context_length) return error.ContextOverflow;
+        try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
+
+        for (self.model.layers, 0..) |layer, layer_index| {
+            const gpu_session = &self.gpu_session.?;
+            if (layer_index == 0) try gpu_session.beginToken(self.hidden);
+            try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
+            try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+        }
+
+        const gpu_session = &self.gpu_session.?;
+        const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
+        self.token_buffer[self.position] = token_id;
+        self.position += 1;
+        return next_token;
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
         if (self.position >= self.model.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
@@ -613,6 +636,7 @@ const Session = struct {
             .current_format = switch (tensor.tensor_type) {
                 .f32 => .f32_reference,
                 .f16 => .f16_reference,
+                .q8_0 => .q8_0,
                 .q4_k => .legacy_q4_k,
                 .q6_k => .legacy_q6_k,
             },
@@ -930,13 +954,20 @@ pub fn generateLoadedStreaming(
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
+    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
+    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const sample_begin = std.time.nanoTimestamp();
-        const next_token = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
-        profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+        const next_token = if (gpu_greedy) blk: {
+            break :blk greedy_next_token.?;
+        } else blk: {
+            const sample_begin = std.time.nanoTimestamp();
+            const sampled = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
+            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            break :blk sampled;
+        };
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
@@ -951,7 +982,11 @@ pub fn generateLoadedStreaming(
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
         const step_begin = std.time.nanoTimestamp();
-        _ = try session.step(next_token);
+        if (gpu_greedy) {
+            greedy_next_token = try session.stepGreedy(next_token);
+        } else {
+            _ = try session.step(next_token);
+        }
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
@@ -1032,13 +1067,20 @@ pub fn generateLoadedStreamingCached(
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
+    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
+    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const sample_begin = std.time.nanoTimestamp();
-        const next_token = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
-        profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+        const next_token = if (gpu_greedy) blk: {
+            break :blk greedy_next_token.?;
+        } else blk: {
+            const sample_begin = std.time.nanoTimestamp();
+            const sampled = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
+            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            break :blk sampled;
+        };
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
@@ -1053,7 +1095,11 @@ pub fn generateLoadedStreamingCached(
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
         const step_begin = std.time.nanoTimestamp();
-        _ = try session.step(next_token);
+        if (gpu_greedy) {
+            greedy_next_token = try session.stepGreedy(next_token);
+        } else {
+            _ = try session.step(next_token);
+        }
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
@@ -1444,6 +1490,10 @@ pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 144);
         },
+        .q8_0 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 34);
+        },
         .q6_k => blk: {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 210);
@@ -1487,6 +1537,7 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
         .f16 => {
             for (0..row_len) |index| out[index] = readF16AsF32(row[index * 2 ..][0..2]);
         },
+        .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
         .q6_k => try dequantizeRowQ6K(out, row, row_len),
     }
@@ -1496,6 +1547,7 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
     return switch (tensor_type) {
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
+        .q8_0 => try dotQ8_0Row(row, row_len, input),
         .q4_k => try dotQ4KRow(row, row_len, input),
         .q6_k => try dotQ6KRow(row, row_len, input),
     };
@@ -1505,9 +1557,40 @@ fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, i
     return switch (tensor_type) {
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
+        .q8_0 => dotQ8_0Row(row, row_len, input) catch unreachable,
         .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
         .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
     };
+}
+
+fn dequantizeRowQ8_0(out: []f32, row: []const u8, row_len: usize) !void {
+    if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+    var out_offset: usize = 0;
+    var block_index: usize = 0;
+    while (block_index < row.len) : (block_index += 34) {
+        const block = row[block_index .. block_index + 34];
+        const d = readF16AsF32(block[0..2]);
+        for (0..32) |index| {
+            out[out_offset + index] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index]))));
+        }
+        out_offset += 32;
+    }
+}
+
+fn dotQ8_0Row(row: []const u8, row_len: usize, input: []const f32) !f32 {
+    if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+    var sum: f32 = 0;
+    var input_offset: usize = 0;
+    var block_index: usize = 0;
+    while (block_index < row.len) : (block_index += 34) {
+        const block = row[block_index .. block_index + 34];
+        const d = readF16AsF32(block[0..2]);
+        for (0..32) |index| {
+            sum += d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))) * input[input_offset + index];
+        }
+        input_offset += 32;
+    }
+    return sum;
 }
 
 fn dotF32Row(row: []const u8, input: []const f32) f32 {
