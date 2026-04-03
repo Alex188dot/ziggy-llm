@@ -11,13 +11,10 @@ pub const Message = struct {
 };
 
 const system_message =
-    \\You are a helpful assistant
+    \\You are a helpful AI assistant.
 ;
 
-const summary_intro = "Context: ";
-const summary_separator = " | ";
-const compact_summary_chars: usize = 192;
-const retained_recent_messages: usize = 4;
+const retained_recent_messages: usize = 2;
 const token_safety_margin: usize = 128;
 
 pub const history_window_messages: usize = retained_recent_messages;
@@ -61,13 +58,6 @@ pub fn buildPrompt(
     var start_index: usize = if (messages.len > retained_recent_messages) messages.len - retained_recent_messages else 0;
     if (start_index % 2 != 0) start_index -= 1;
 
-    var summary: ?[]u8 = null;
-    errdefer if (summary) |value| allocator.free(value);
-    if (start_index > 0) {
-        summary = try summarizeMessages(allocator, messages[0..start_index]);
-        if (summary) |value| estimated_tokens += try countSummaryTokens(runtime_cache, model_path, backend, value);
-    }
-
     for (messages[start_index..]) |message| estimated_tokens += message.token_count;
 
     while (estimated_tokens > token_budget and start_index < messages.len) {
@@ -77,13 +67,9 @@ pub fn buildPrompt(
             estimated_tokens -|= messages[start_index].token_count;
             start_index += 1;
         }
-        if (summary) |value| {
-            allocator.free(value);
-            summary = null;
-        }
     }
 
-    return renderConversation(allocator, summary, messages[start_index..]);
+    return renderConversation(allocator, messages[start_index..]);
 }
 
 pub fn trimAssistantReply(reply: []const u8) []const u8 {
@@ -134,6 +120,8 @@ fn isDialogueBoundary(line: []const u8) bool {
         "Assistant:",
         "Assistant",
         "System:",
+        "U=",
+        "A=",
         "Human:",
         "Customer:",
         "Question:",
@@ -151,14 +139,11 @@ fn isDialogueBoundary(line: []const u8) bool {
     return true;
 }
 
-fn renderConversation(allocator: std.mem.Allocator, summary: ?[]const u8, messages: []const Message) ![]u8 {
+fn renderConversation(allocator: std.mem.Allocator, messages: []const Message) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     const writer = buf.writer(allocator);
     try writer.print("System: {s}\n", .{system_message});
-    if (summary) |value| {
-        try writer.print("{s}{s}\n", .{ summary_intro, value });
-    }
     for (messages) |message| {
         const tag = switch (message.role) {
             .user => "User",
@@ -198,62 +183,6 @@ fn countRenderedMessageTokens(
     const snippet = try std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}\n", .{ tag, content });
     defer std.heap.page_allocator.free(snippet);
     return runtime_cache.promptTokenCount(model_path, snippet, backend);
-}
-
-fn countSummaryTokens(
-    runtime_cache: *resident_runtime.ResidentRuntime,
-    model_path: []const u8,
-    backend: runtime.BackendPreference,
-    summary: []const u8,
-) !usize {
-    const snippet = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}\n", .{ summary_intro, summary });
-    defer std.heap.page_allocator.free(snippet);
-    return runtime_cache.promptTokenCount(model_path, snippet, backend);
-}
-
-fn summarizeMessages(allocator: std.mem.Allocator, messages: []const Message) !?[]u8 {
-    if (messages.len == 0) return null;
-
-    var summary = std.ArrayList(u8).empty;
-    errdefer summary.deinit(allocator);
-
-    const summary_start = messages.len - @min(messages.len, @as(usize, 4));
-    for (messages[summary_start..], summary_start..) |message, index| {
-        if (summary.items.len > 0) try summary.appendSlice(allocator, summary_separator);
-        const role_prefix = switch (message.role) {
-            .user => "U=",
-            .assistant => "A=",
-        };
-        try summary.appendSlice(allocator, role_prefix);
-        try appendCompactText(allocator, &summary, message.content);
-        if (summary.items.len >= compact_summary_chars) break;
-        if (index + 1 == messages.len) break;
-    }
-
-    if (summary.items.len == 0) return null;
-    if (summary.items.len > compact_summary_chars) summary.items.len = compact_summary_chars;
-    return @as(?[]u8, try summary.toOwnedSlice(allocator));
-}
-
-fn appendCompactText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    var pending_space = false;
-    for (text) |char| {
-        if (char == '\n' or char == '\r' or char == '\t' or char == ' ') {
-            pending_space = out.items.len > 0;
-            continue;
-        }
-        if (pending_space and out.items.len < compact_summary_chars) {
-            try out.append(allocator, ' ');
-        }
-        pending_space = false;
-        if (out.items.len >= compact_summary_chars) break;
-        try out.append(allocator, char);
-    }
-    if (out.items.len >= compact_summary_chars and out.items.len >= 3) {
-        out.items[out.items.len - 3] = '.';
-        out.items[out.items.len - 2] = '.';
-        out.items[out.items.len - 1] = '.';
-    }
 }
 
 test "trimAssistantReply stops at generic dialogue boundary" {
