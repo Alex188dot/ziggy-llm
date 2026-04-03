@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const supported_versions = "GGUF v2 and v3 (little-endian)";
 pub const supported_metadata_fields =
-    "general.type=model, general.architecture, general.alignment, general.file_type, general.quantization_version, tokenizer.ggml.model, tokenizer.ggml.pre, tokenizer.ggml.tokens, tokenizer.ggml.{bos,eos,unk,pad}_token_id, tokenizer.ggml.add_{bos,eos}_token";
+    "general.type=model, general.architecture, general.alignment, general.file_type, general.quantization_version, tokenizer.ggml.model, tokenizer.ggml.pre, tokenizer.ggml.tokens, tokenizer.ggml.{bos,eos,unk,pad}_token_id, tokenizer.ggml.add_{bos,eos}_token, tokenizer.chat_template";
 
 const gguf_magic = "GGUF";
 const default_alignment: u32 = 32;
@@ -82,6 +82,11 @@ pub const TensorType = enum(u32) {
     nvfp4 = 40,
 };
 
+pub const ChatTemplateStyle = enum {
+    generic,
+    chatml,
+};
+
 const TypeLayout = struct {
     block_size: u16,
     type_size: u16,
@@ -102,6 +107,7 @@ pub const InspectReport = struct {
     tokenizer_model: ?[]const u8,
     tokenizer_pre: ?[]const u8,
     tokenizer_tokens: ?u64,
+    chat_template: ?[]const u8,
     bos_token_id: ?u32,
     eos_token_id: ?u32,
     unk_token_id: ?u32,
@@ -116,6 +122,10 @@ pub const InspectReport = struct {
 
     pub fn dominantTensorTypeName(self: InspectReport) []const u8 {
         return formatTensorType(self.dominant_tensor_type);
+    }
+
+    pub fn chatTemplateStyle(self: InspectReport) ChatTemplateStyle {
+        return detectChatTemplateStyle(self.chat_template);
     }
 };
 
@@ -209,6 +219,7 @@ pub fn inspectFile(allocator: std.mem.Allocator, model_path: []const u8) !Inspec
         .tokenizer_model = state.tokenizer_model,
         .tokenizer_pre = state.tokenizer_pre,
         .tokenizer_tokens = state.tokenizer_tokens,
+        .chat_template = state.chat_template,
         .bos_token_id = state.bos_token_id,
         .eos_token_id = state.eos_token_id,
         .unk_token_id = state.unk_token_id,
@@ -281,6 +292,7 @@ const ParseState = struct {
     tokenizer_model: ?[]const u8 = null,
     tokenizer_pre: ?[]const u8 = null,
     tokenizer_tokens: ?u64 = null,
+    chat_template: ?[]const u8 = null,
     bos_token_id: ?u32 = null,
     eos_token_id: ?u32 = null,
     unk_token_id: ?u32 = null,
@@ -338,6 +350,10 @@ fn parseMetadataEntry(
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.tokens")) {
         state.tokenizer_tokens = try readStringArrayCount(reader, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "tokenizer.chat_template")) {
+        state.chat_template = try readExpectedString(allocator, reader, value_type);
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.bos_token_id")) {
@@ -631,6 +647,16 @@ fn optionalString(value: ?[]const u8) []const u8 {
     return value orelse "<unset>";
 }
 
+pub fn detectChatTemplateStyle(chat_template: ?[]const u8) ChatTemplateStyle {
+    const template = chat_template orelse return .generic;
+    if (std.mem.indexOf(u8, template, "<|user|>") != null and
+        std.mem.indexOf(u8, template, "<|assistant|>") != null)
+    {
+        return .chatml;
+    }
+    return .generic;
+}
+
 fn formatOptionalBool(value: ?bool) []const u8 {
     if (value) |v| return if (v) "true" else "false";
     return "<unset>";
@@ -774,6 +800,31 @@ test "inspect rejects invalid magic" {
     try std.testing.expectError(error.InvalidMagic, inspectFile(allocator, path));
 }
 
+test "inspect parses chat template metadata and detects chatml" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const fixture = try makeFixture(.{
+        .chat_template =
+        \\{% for message in messages %}
+        \\{{ '<|user|>\n' + message['content'] + eos_token }}
+        \\{% endfor %}
+        \\{{ '<|assistant|>' }}
+        ,
+    });
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "chat-template.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(allocator, "chat-template.gguf");
+
+    const report = try inspectFile(allocator, path);
+    try std.testing.expect(report.chat_template != null);
+    try std.testing.expectEqual(ChatTemplateStyle.chatml, report.chatTemplateStyle());
+}
+
 const FixtureOptions = struct {
     version: u32 = 3,
     general_type: []const u8 = "model",
@@ -784,6 +835,7 @@ const FixtureOptions = struct {
     quantization_version: u32 = 2,
     tokenizer_model: []const u8 = "gpt2",
     tokenizer_pre: []const u8 = "default",
+    chat_template: ?[]const u8 = null,
     tensor_type: TensorType = .f16,
     dimensions: [4]u64 = .{ 32, 3, 1, 1 },
     truncate_tensor_data: bool = false,
@@ -797,7 +849,8 @@ fn makeFixture(options: FixtureOptions) ![]const u8 {
     writeBytes(&list, gguf_magic);
     writeInt(&list, u32, options.version);
 
-    const kv_count: u64 = if (options.include_architecture) 11 else 10;
+    const kv_count: u64 = (if (options.include_architecture) @as(u64, 11) else 10) +
+        (if (options.chat_template != null) @as(u64, 1) else 0);
     writeInt(&list, u64, 1);
     writeInt(&list, u64, kv_count);
 
@@ -809,6 +862,7 @@ fn makeFixture(options: FixtureOptions) ![]const u8 {
     writeStringKv(&list, "tokenizer.ggml.model", options.tokenizer_model);
     writeStringKv(&list, "tokenizer.ggml.pre", options.tokenizer_pre);
     writeStringArrayKv(&list, "tokenizer.ggml.tokens", &.{ "<unk>", "<s>", "</s>" });
+    if (options.chat_template) |chat_template| writeStringKv(&list, "tokenizer.chat_template", chat_template);
     writeU32Kv(&list, "tokenizer.ggml.bos_token_id", 1);
     writeU32Kv(&list, "tokenizer.ggml.eos_token_id", 2);
     writeBoolKv(&list, "tokenizer.ggml.add_bos_token", true);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const gguf = @import("../gguf.zig");
 const llama_cpu = @import("../llama_cpu.zig");
 const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
@@ -43,6 +44,11 @@ pub const ResidentRuntime = struct {
 
     pub fn contextLength(self: *const ResidentRuntime) ?usize {
         return if (self.loaded) |loaded| loaded.model.context_length else null;
+    }
+
+    pub fn chatTemplateStyle(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference) !gguf.ChatTemplateStyle {
+        try self.ensureLoaded(model_path, backend, false);
+        return self.loaded.?.chat_template_style;
     }
 
     pub fn generate(
@@ -204,9 +210,14 @@ pub const ResidentRuntime = struct {
         );
         errdefer reusable_session.deinit(self.allocator);
 
+        var inspect_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer inspect_arena.deinit();
+        const chat_template_style = (try gguf.inspectFile(inspect_arena.allocator(), model_path)).chatTemplateStyle();
+
         self.loaded = .{
             .model_path = owned_model_path,
             .backend_pref = backend_pref,
+            .chat_template_style = chat_template_style,
             .model = model,
             .execution = execution,
             .reusable_session = reusable_session,
@@ -241,6 +252,7 @@ pub const ResidentRuntime = struct {
 const LoadedModel = struct {
     model_path: []u8,
     backend_pref: types.BackendPreference,
+    chat_template_style: gguf.ChatTemplateStyle,
     model: llama_cpu.Model,
     execution: ExecutionResources,
     reusable_session: llama_cpu.ReusableSession,
