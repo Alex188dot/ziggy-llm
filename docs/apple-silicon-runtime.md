@@ -119,5 +119,7 @@ Notes:
 - `Q6_K` residual-add projections now stay on the direct quantized Metal path instead of paying for a temp-buffer add round-trip
 - `Q4_K` residual-add projections now also stay on a direct fused-add path even when MoonQuant packing is disabled
 - dense residual projections now use a fused-add Metal kernel rather than a matvec-to-temp plus separate add pass
-- prefer `bench` over `run` for published numbers, because `bench --bench-runs N` separates cold startup from warm reused-runtime measurements
+- prefer `bench` over `run` for published numbers, because `bench --bench-runs N` separates cold startup from warm resident-runtime measurements
+- warm benchmark output now reports `warm.reused_prompt_tokens_avg`; use that field to tell whether a prompt-prefix cache actually participated in the measured TTFT
+- repeated identical prompts may still show `warm.reused_prompt_tokens_avg=0` if the cached session no longer matches the prompt prefix exactly, so treat warm TTFT and prompt reuse as related but distinct signals
 - compare CPU and Metal with the same prompt, token count, seed, and model when tracking regressions

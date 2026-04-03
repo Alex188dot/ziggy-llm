@@ -163,7 +163,7 @@ fn printHelp() !void {
         \\  moon-quant-guardrail --model <path> [options]
         \\
         \\Options:
-        \\  --bench-runs <n>                     One cold run plus warm averages over reused runtime (default: 5)
+        \\  --bench-runs <n>                     One cold run plus warm averages over the resident runtime path (default: 5)
         \\  --backend <auto|cpu|metal>          Backend to compare (default: metal)
         \\  --min-warm-decode-speedup-pct <n>   Required enabled-vs-disabled warm decode speedup floor (default: 0.0)
         \\  --max-warm-ttft-regression-pct <n>  Allowed enabled-vs-disabled warm TTFT regression ceiling (default: 25.0)

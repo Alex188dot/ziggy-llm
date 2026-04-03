@@ -137,6 +137,7 @@ pub fn benchCommand(
             \\warm.ttft_ms_avg={d:.3}
             \\warm.first_decode_step_ms_avg={d:.3}
             \\warm.decode_ms_avg={d:.3}
+            \\warm.reused_prompt_tokens_avg={d}
             \\warm.generated_tokens_avg={d}
             \\warm.tps_avg={d:.3}
             \\warm.decode_tok_s_avg={d:.3}
@@ -170,6 +171,7 @@ pub fn benchCommand(
                 nsToMs(summary.warm_ttft_ns_avg),
                 nsToMs(summary.warm_startup_breakdown_avg.first_decode_step_ns),
                 nsToMs(summary.warm_decode_ns_avg),
+                summary.warm_reused_prompt_token_count_avg,
                 summary.warm_generated_token_count_avg,
                 summary.warmDecodeTokensPerSecond(),
                 summary.warmDecodeTokensPerSecond(),

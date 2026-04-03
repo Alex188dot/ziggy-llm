@@ -187,6 +187,8 @@ Benchmark CPU vs Metal on the same model:
 ./zig-out/bin/ziggy-llm bench -m /path/to/llama-model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend metal
 ```
 
+With `--bench-runs N`, the first run is cold and the remaining runs use the resident runtime path. Warm output now reports `warm.reused_prompt_tokens_avg` so prompt-prefix reuse is visible instead of being inferred from TTFT alone.
+
 Run tests:
 
 ```bash
