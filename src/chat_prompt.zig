@@ -1,23 +1,24 @@
 const std = @import("std");
+const gguf = @import("gguf.zig");
 const resident_runtime = @import("runtime/resident_runtime.zig");
 const runtime = @import("runtime.zig");
 
-pub const Role = enum { user, assistant };
+pub const Role = enum { system, user, assistant };
 
 pub const Message = struct {
     role: Role,
     content: []u8,
+    token_count: usize = 0,
 };
 
 const system_message =
-    \\You are in an interactive terminal chat.
-    \\Reply only as the assistant.
-    \\Never emit role labels such as User, Assistant, Customer, Human, or System.
-    \\Do not invent the user's next message.
-    \\Keep answers concise unless the user asks for detail.
+    \\You are a helpful AI assistant.
 ;
 
-pub const history_window_messages: usize = 8;
+const retained_recent_messages: usize = 2;
+const token_safety_margin: usize = 128;
+
+pub const history_window_messages: usize = retained_recent_messages;
 
 pub fn deinitMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) void {
     for (messages.items) |message| allocator.free(message.content);
@@ -28,6 +29,7 @@ pub fn appendMessage(allocator: std.mem.Allocator, messages: *std.ArrayList(Mess
     try messages.append(allocator, .{
         .role = role,
         .content = try allocator.dupe(u8, std.mem.trim(u8, content, " \n\r\t")),
+        .token_count = 0,
     });
 }
 
@@ -37,27 +39,44 @@ pub fn buildPrompt(
     model_path: []const u8,
     backend: runtime.BackendPreference,
     max_tokens: usize,
-    messages: []const Message,
+    messages: []Message,
 ) ![]u8 {
-    const context_length = runtime_cache.contextLength() orelse blk: {
-        _ = try runtime_cache.promptTokenCount(model_path, "<|user|>\nhi</s>\n<|assistant|>\n", backend);
-        break :blk runtime_cache.contextLength().?;
-    };
-    const token_budget = context_length -| (max_tokens + 64);
+    const template_style = try runtime_cache.chatTemplateStyle(model_path, backend);
+    const context_length = try contextWindow(runtime_cache, model_path, backend);
+    const token_budget = context_length -| (max_tokens + token_safety_margin);
 
-    var start_index: usize = if (messages.len > history_window_messages) messages.len - history_window_messages else 0;
-    if (start_index % 2 != 0) start_index -= 1;
-    while (true) {
-        const prompt = try renderMessages(allocator, messages[start_index..]);
-        errdefer allocator.free(prompt);
-        const count = runtime_cache.promptTokenCount(model_path, prompt, backend) catch |err| switch (err) {
-            error.ContextOverflow => context_length + 1,
-            else => return err,
-        };
-        if (count <= token_budget or start_index == 0) return prompt;
-        allocator.free(prompt);
-        start_index -|= 2;
+    const system_prefix_len = countLeadingSystemMessages(messages);
+    const include_default_system = shouldInjectDefaultSystem(template_style, system_prefix_len);
+    const base_token_count = try promptBaseTokenCount(runtime_cache, model_path, backend, template_style, include_default_system);
+    var estimated_tokens = base_token_count;
+
+    for (messages) |*message| {
+        if (message.token_count == 0) {
+            message.token_count = try countRenderedMessageTokens(runtime_cache, model_path, backend, template_style, message.role, message.content);
+        }
     }
+
+    for (messages[0..system_prefix_len]) |message| estimated_tokens += message.token_count;
+
+    var start_index = system_prefix_len;
+    const conversational_count = messages.len - system_prefix_len;
+    if (conversational_count > retained_recent_messages) {
+        start_index = messages.len - retained_recent_messages;
+        if ((start_index - system_prefix_len) % 2 != 0) start_index -= 1;
+    }
+
+    for (messages[start_index..]) |message| estimated_tokens += message.token_count;
+
+    while (estimated_tokens > token_budget and start_index < messages.len) {
+        estimated_tokens -|= messages[start_index].token_count;
+        start_index += 1;
+        if (start_index < messages.len) {
+            estimated_tokens -|= messages[start_index].token_count;
+            start_index += 1;
+        }
+    }
+
+    return renderConversation(allocator, template_style, messages[0..system_prefix_len], messages[start_index..], include_default_system);
 }
 
 pub fn trimAssistantReply(reply: []const u8) []const u8 {
@@ -81,6 +100,21 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
     return std.mem.trim(u8, reply[0..end], " \n\r\t");
 }
 
+pub fn hasCompletedAssistantReply(reply: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    var offset: usize = 0;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (offset > 0 and isDialogueBoundary(trimmed)) return true;
+        offset += line.len + 1;
+    }
+
+    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|" }) |marker| {
+        if (std.mem.indexOf(u8, reply, marker) != null) return true;
+    }
+    return false;
+}
+
 fn isDialogueBoundary(line: []const u8) bool {
     if (line.len == 0) return false;
 
@@ -93,6 +127,8 @@ fn isDialogueBoundary(line: []const u8) bool {
         "Assistant:",
         "Assistant",
         "System:",
+        "U=",
+        "A=",
         "Human:",
         "Customer:",
         "Question:",
@@ -110,26 +146,120 @@ fn isDialogueBoundary(line: []const u8) bool {
     return true;
 }
 
-fn renderMessages(allocator: std.mem.Allocator, messages: []const Message) ![]u8 {
+fn countLeadingSystemMessages(messages: []const Message) usize {
+    var count: usize = 0;
+    while (count < messages.len and messages[count].role == .system) : (count += 1) {}
+    return count;
+}
+
+fn shouldInjectDefaultSystem(template_style: gguf.ChatTemplateStyle, system_prefix_len: usize) bool {
+    return template_style == .generic and system_prefix_len == 0;
+}
+
+fn renderConversation(
+    allocator: std.mem.Allocator,
+    template_style: gguf.ChatTemplateStyle,
+    system_messages: []const Message,
+    messages: []const Message,
+    include_default_system: bool,
+) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     const writer = buf.writer(allocator);
-    try writer.print("<|system|>\n{s}\n</s>\n", .{system_message});
-    for (messages) |message| {
-        const tag = switch (message.role) {
-            .user => "user",
-            .assistant => "assistant",
-        };
-        try writer.print("<|{s}|>\n{s}\n</s>\n", .{ tag, message.content });
+
+    switch (template_style) {
+        .generic => {
+            if (include_default_system) {
+                try writer.print("System: {s}\n", .{system_message});
+            } else {
+                for (system_messages) |message| {
+                    try writer.print("System: {s}\n", .{message.content});
+                }
+            }
+            for (messages) |message| {
+                const tag = switch (message.role) {
+                    .system => "System",
+                    .user => "User",
+                    .assistant => "Assistant",
+                };
+                try writer.print("{s}: {s}\n", .{ tag, message.content });
+            }
+            try writer.print("Assistant:", .{});
+        },
+        .chatml => {
+            if (include_default_system) {
+                try writer.print("<|system|>\n{s}</s>\n", .{system_message});
+            } else {
+                for (system_messages) |message| {
+                    try writer.print("<|system|>\n{s}</s>\n", .{message.content});
+                }
+            }
+            for (messages) |message| {
+                const tag = switch (message.role) {
+                    .system => "system",
+                    .user => "user",
+                    .assistant => "assistant",
+                };
+                try writer.print("<|{s}|>\n{s}</s>\n", .{ tag, message.content });
+            }
+            try writer.print("<|assistant|>\n", .{});
+        },
     }
-    try writer.print("<|assistant|>\n", .{});
     return buf.toOwnedSlice(allocator);
 }
 
 pub fn contextWindow(runtime_cache: *resident_runtime.ResidentRuntime, model_path: []const u8, backend: runtime.BackendPreference) !usize {
     if (runtime_cache.contextLength()) |length| return length;
-    _ = try runtime_cache.promptTokenCount(model_path, "<|user|>\nhi</s>\n<|assistant|>\n", backend);
+    _ = try runtime_cache.chatTemplateStyle(model_path, backend);
     return runtime_cache.contextLength().?;
+}
+
+fn promptBaseTokenCount(
+    runtime_cache: *resident_runtime.ResidentRuntime,
+    model_path: []const u8,
+    backend: runtime.BackendPreference,
+    template_style: gguf.ChatTemplateStyle,
+    include_default_system: bool,
+) !usize {
+    const scaffold = promptScaffold(template_style, include_default_system);
+    return runtime_cache.promptTokenCount(model_path, scaffold, backend);
+}
+
+fn countRenderedMessageTokens(
+    runtime_cache: *resident_runtime.ResidentRuntime,
+    model_path: []const u8,
+    backend: runtime.BackendPreference,
+    template_style: gguf.ChatTemplateStyle,
+    role: Role,
+    content: []const u8,
+) !usize {
+    const snippet = switch (template_style) {
+        .generic => blk: {
+            const tag = switch (role) {
+                .system => "System",
+                .user => "User",
+                .assistant => "Assistant",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}: {s}\n", .{ tag, content });
+        },
+        .chatml => blk: {
+            const tag = switch (role) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|{s}|>\n{s}</s>\n", .{ tag, content });
+        },
+    };
+    defer std.heap.page_allocator.free(snippet);
+    return runtime_cache.promptTokenCount(model_path, snippet, backend);
+}
+
+fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system: bool) []const u8 {
+    return switch (template_style) {
+        .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
+        .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
+    };
 }
 
 test "trimAssistantReply stops at generic dialogue boundary" {
@@ -163,4 +293,17 @@ test "trimAssistantReply stops at partial stop marker" {
 test "trimAssistantReply stops at shortest stop prefix" {
     const reply = "Hello there. </";
     try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+}
+
+test "renderConversation uses chatml markers when GGUF template requests it" {
+    const messages = [_]Message{
+        .{ .role = .user, .content = @constCast("my name is alessio") },
+    };
+    const rendered = try renderConversation(std.testing.allocator, .chatml, &.{}, &messages, false);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expectEqualStrings(
+        "<|user|>\nmy name is alessio</s>\n<|assistant|>\n",
+        rendered,
+    );
 }

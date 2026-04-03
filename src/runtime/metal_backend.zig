@@ -20,6 +20,17 @@ pub const BufferHandle = if (build_enabled_value) struct {
     byte_len: usize,
 } else struct {};
 
+pub const ShortlistEntry = extern struct {
+    token_id: u32,
+    score: f32,
+};
+
+pub const CommitStats = struct {
+    cpu_wait_ns: u64 = 0,
+    gpu_elapsed_ns: u64 = 0,
+    gpu_timestamps_valid: bool = false,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -201,6 +212,16 @@ pub fn createScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) 
     };
 }
 
+pub fn createByteScratchBuffer(backend: backend_api.MatVecBackend, byte_len: usize) !BufferHandle {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const raw = try createEmptyBuffer(state.context, byte_len);
+    return .{
+        .raw = raw,
+        .byte_len = byte_len,
+    };
+}
+
 pub fn destroyBuffer(buffer: BufferHandle) void {
     if (!build_enabled_value) return;
     c.ziggy_metal_destroy_buffer(buffer.raw);
@@ -224,6 +245,24 @@ pub fn readBufferU32(buffer: BufferHandle, out: []u32) !void {
     try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
 }
 
+pub fn writeBufferU32(buffer: BufferHandle, values: []const u32) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (values.len * @sizeOf(u32) > buffer.byte_len) return error.MetalBufferError;
+    try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
+}
+
+pub fn writeBufferU64(buffer: BufferHandle, values: []const u64) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (values.len * @sizeOf(u64) > buffer.byte_len) return error.MetalBufferError;
+    try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
+}
+
+pub fn readBufferU64(buffer: BufferHandle, out: []u64) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (out.len * @sizeOf(u64) > buffer.byte_len) return error.MetalBufferError;
+    try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
+}
+
 pub fn beginSequence(backend: backend_api.MatVecBackend) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -236,14 +275,25 @@ pub fn beginSequence(backend: backend_api.MatVecBackend) !void {
 }
 
 pub fn commitSequence(backend: backend_api.MatVecBackend) !void {
+    _ = try commitSequenceTimed(backend);
+}
+
+pub fn commitSequenceTimed(backend: backend_api.MatVecBackend) !CommitStats {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
-    try mapStatus(c.ziggy_metal_commit_sequence(
+    var raw_stats: c.ZiggyMetalCommitStats = std.mem.zeroes(c.ZiggyMetalCommitStats);
+    try mapStatus(c.ziggy_metal_commit_sequence_timed(
         state.context,
+        &raw_stats,
         &error_buf,
         error_buf.len,
     ), &error_buf);
+    return .{
+        .cpu_wait_ns = raw_stats.cpu_wait_ns,
+        .gpu_elapsed_ns = raw_stats.gpu_elapsed_ns,
+        .gpu_timestamps_valid = raw_stats.gpu_timestamps_valid,
+    };
 }
 
 pub fn runMatVecToBuffer(
@@ -470,6 +520,31 @@ pub fn runMatVecQ6KAddToBuffer(
         matrix_buffer.raw,
         input.raw,
         output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ6KArgmaxToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output_packed.byte_len < @sizeOf(u64)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q6k_argmax_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output_packed.raw,
         @intCast(rows),
         @intCast(cols),
         &error_buf,
@@ -826,6 +901,61 @@ pub fn argmax(
     ), &error_buf);
 }
 
+pub fn topKShortlist(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_entries: BufferHandle,
+    count: usize,
+    top_k: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (top_k == 0 or top_k > 64) return error.InvalidTensorMetadata;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_topk_f32(
+        state.context,
+        input.raw,
+        output_entries.raw,
+        @intCast(count),
+        @intCast(top_k),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn sampleTopK(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_token: BufferHandle,
+    count: usize,
+    top_k: usize,
+    temperature: f32,
+    random_uniform: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (top_k == 0 or top_k > 64 or !(temperature > 0)) return error.InvalidTensorMetadata;
+    if (output_token.byte_len < @sizeOf(u32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_sample_topk_f32(
+        state.context,
+        input.raw,
+        output_token.raw,
+        @intCast(count),
+        @intCast(top_k),
+        temperature,
+        random_uniform,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;
+    try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
+}
+
 fn metalMatVec(
     ctx: ?*anyopaque,
     out: []f32,
@@ -894,11 +1024,15 @@ fn createEmptyBuffer(context: *c.ZiggyMetalContext, byte_len: usize) !*c.ZiggyMe
 }
 
 fn writeBuffer(buffer: *c.ZiggyMetalBuffer, values: []const f32) !void {
+    try writeBufferBytes(buffer, std.mem.sliceAsBytes(values));
+}
+
+fn writeBufferBytes(buffer: *c.ZiggyMetalBuffer, values: []const u8) !void {
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     const status = c.ziggy_metal_write_buffer(
         buffer,
         values.ptr,
-        values.len * @sizeOf(f32),
+        values.len,
         0,
         &error_buf,
         error_buf.len,

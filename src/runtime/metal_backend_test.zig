@@ -44,6 +44,59 @@ test "metal q4k matvec matches cpu dequantized reference" {
     }
 }
 
+test "metal top-k shortlist returns descending logits with stable ties" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const logits = [_]f32{ 0.2, 1.5, -2.0, 1.0, 3.0, 0.4, 1.5, -1.0 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, logits.len);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const shortlist_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(metal_backend.ShortlistEntry));
+    defer metal_backend.destroyBuffer(shortlist_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &logits);
+    try metal_backend.topKShortlist(backend, input_buffer, shortlist_buffer, logits.len, 3);
+
+    var entries: [3]metal_backend.ShortlistEntry = undefined;
+    try metal_backend.readShortlistEntries(shortlist_buffer, &entries);
+
+    try std.testing.expectEqualSlices(u32, &.{ 4, 1, 6 }, &.{ entries[0].token_id, entries[1].token_id, entries[2].token_id });
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), entries[0].score, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), entries[1].score, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), entries[2].score, 0.0001);
+}
+
+test "metal sample top-k returns one of the weighted winners" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const logits = [_]f32{ 5.0, 4.0, 0.1, -1.0 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, logits.len);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const token_buffer = try metal_backend.createScratchBuffer(backend, 1);
+    defer metal_backend.destroyBuffer(token_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &logits);
+
+    try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.0);
+    var sampled_low: [1]u32 = undefined;
+    try metal_backend.readBufferU32(token_buffer, &sampled_low);
+    try std.testing.expectEqual(@as(u32, 0), sampled_low[0]);
+
+    try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.999);
+    var sampled_high: [1]u32 = undefined;
+    try metal_backend.readBufferU32(token_buffer, &sampled_high);
+    try std.testing.expect(sampled_high[0] == 0 or sampled_high[0] == 1);
+}
+
 test "metal q4k fused add matches cpu dequantized reference for dominant llama shape" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -390,6 +443,67 @@ test "metal q6k fused add matches cpu dequantized reference for dominant llama s
         expected[row] += dot(dequantized_row, input);
         try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.05);
     }
+}
+
+test "metal q6k fused argmax matches cpu dequantized reference for output projection" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q6_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q6k-argmax.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q6k-argmax.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const tensor = model.output;
+    const rows = try tensor.rowCount();
+    const cols = model.embedding_length;
+    const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
+    const matrix = try llama_cpu.tensorBytes(&model, tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 41)) - 20)) * 0.015625) + 0.02;
+    }
+
+    var expected_best_token: u32 = 0;
+    var expected_best_logit = -std.math.inf(f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q6_k, row_bytes, cols);
+        const logit = dot(dequantized_row, input);
+        if (logit > expected_best_logit) {
+            expected_best_logit = logit;
+            expected_best_token = @intCast(row);
+        }
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+    defer metal_backend.destroyBuffer(packed_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, std.math.maxInt(u32) });
+    try metal_backend.runMatVecQ6KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
+
+    var argmax_state: [2]u32 = .{ 0, 0 };
+    try metal_backend.readBufferU32(packed_buffer, &argmax_state);
+    const actual_token = argmax_state[1];
+    try std.testing.expectEqual(expected_best_token, actual_token);
 }
 
 test "metal q8_0 matvec matches cpu dequantized reference" {

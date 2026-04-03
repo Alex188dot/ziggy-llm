@@ -56,6 +56,13 @@ pub const ModelDesc = struct {
     rms_norm_eps: f32,
 };
 
+pub const ShortlistEntry = struct {
+    token_id: u32,
+    logit: f32,
+};
+
+pub const max_shortlist_len: usize = 64;
+
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
     dense_lookup: DenseLookup,
@@ -70,6 +77,8 @@ pub const Session = struct {
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
     sampled_token: metal_backend.BufferHandle,
+    sampled_token_packed: metal_backend.BufferHandle,
+    shortlist_entries: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
@@ -103,6 +112,10 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(tmp);
         const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(sampled_token);
+        const sampled_token_packed = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+        errdefer metal_backend.destroyBuffer(sampled_token_packed);
+        const shortlist_entries = try metal_backend.createByteScratchBuffer(backend, max_shortlist_len * @sizeOf(metal_backend.ShortlistEntry));
+        errdefer metal_backend.destroyBuffer(shortlist_entries);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -122,6 +135,8 @@ pub const Session = struct {
             .up = up,
             .tmp = tmp,
             .sampled_token = sampled_token,
+            .sampled_token_packed = sampled_token_packed,
+            .shortlist_entries = shortlist_entries,
             .k_cache = k_cache,
             .v_cache = v_cache,
             .profiler = profiler,
@@ -139,6 +154,8 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
         metal_backend.destroyBuffer(self.sampled_token);
+        metal_backend.destroyBuffer(self.sampled_token_packed);
+        metal_backend.destroyBuffer(self.shortlist_entries);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
         self.* = undefined;
@@ -254,29 +271,134 @@ pub const Session = struct {
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
-        try metal_backend.commitSequence(self.backend);
-        try metal_backend.readBufferF32(self.tmp, out);
-        self.recordCategoryWithShape(.readback, readback_start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = out.len,
-        });
+        };
+        try self.commitOutputSequence(shape);
+        const host_readback_start = std.time.nanoTimestamp();
+        try metal_backend.readBufferF32(self.tmp, out);
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
+    }
+
+    pub fn commitToken(self: *Session) !void {
+        try metal_backend.commitSequence(self.backend);
     }
 
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
         try self.runRmsNorm(norm, self.hidden, self.normed);
-        try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
-        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
-        try metal_backend.commitSequence(self.backend);
-        var token: [1]u32 = .{0};
-        try metal_backend.readBufferU32(self.sampled_token, &token);
-        self.recordCategoryWithShape(.readback, readback_start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = 1,
             .depth = self.model.vocab_size,
-        });
+            .tensor_type = tensor.tensor_type,
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
+        if (tensor.tensor_type == 14) {
+            const initial_state = [_]u32{ 0, std.math.maxInt(u32) };
+            try metal_backend.writeBufferU32(self.sampled_token_packed, &initial_state);
+            const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+            try metal_backend.runMatVecQ6KArgmaxToBuffer(
+                self.backend,
+                matrix,
+                self.normed,
+                self.sampled_token_packed,
+                tensor.rows,
+                tensor.cols,
+            );
+        } else {
+            try self.runProjection(tensor, self.normed, self.tmp);
+            try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        }
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        try self.commitOutputSequence(shape);
+        const host_readback_start = std.time.nanoTimestamp();
+        var token: [1]u32 = .{0};
+        if (tensor.tensor_type == 14) {
+            var argmax_state: [2]u32 = .{ 0, 0 };
+            try metal_backend.readBufferU32(self.sampled_token_packed, &argmax_state);
+            token[0] = argmax_state[1];
+        } else {
+            try metal_backend.readBufferU32(self.sampled_token, &token);
+        }
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
+    }
+
+    pub fn runOutputSampleTopK(
+        self: *Session,
+        norm: TensorDesc,
+        tensor: TensorDesc,
+        top_k: usize,
+        temperature: f32,
+        random_uniform: f32,
+    ) !u32 {
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const shape = metal_profile.ShapeDesc{
+            .rows = 1,
+            .cols = 1,
+            .depth = self.model.vocab_size,
+            .extra = top_k,
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
+        try metal_backend.sampleTopK(
+            self.backend,
+            self.tmp,
+            self.sampled_token,
+            self.model.vocab_size,
+            top_k,
+            temperature,
+            random_uniform,
+        );
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        try self.commitOutputSequence(shape);
+        var token: [1]u32 = .{0};
+        const host_readback_start = std.time.nanoTimestamp();
+        try metal_backend.readBufferU32(self.sampled_token, &token);
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
+        return token[0];
+    }
+
+    pub fn runOutputShortlist(
+        self: *Session,
+        norm: TensorDesc,
+        tensor: TensorDesc,
+        shortlist_len: usize,
+        out: []ShortlistEntry,
+    ) ![]const ShortlistEntry {
+        if (shortlist_len == 0 or shortlist_len > max_shortlist_len) return error.InvalidTensorMetadata;
+        if (out.len < shortlist_len) return error.InvalidTensorMetadata;
+
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const shape = metal_profile.ShapeDesc{
+            .rows = 2,
+            .cols = shortlist_len,
+            .depth = self.model.vocab_size,
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
+        try metal_backend.topKShortlist(
+            self.backend,
+            self.tmp,
+            self.shortlist_entries,
+            self.model.vocab_size,
+            shortlist_len,
+        );
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        try self.commitOutputSequence(shape);
+
+        var entries: [max_shortlist_len]metal_backend.ShortlistEntry = undefined;
+        const host_readback_start = std.time.nanoTimestamp();
+        try metal_backend.readShortlistEntries(self.shortlist_entries, entries[0..shortlist_len]);
+        for (0..shortlist_len) |index| {
+            out[index] = .{
+                .token_id = entries[index].token_id,
+                .logit = entries[index].score,
+            };
+        }
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
+        return out[0..shortlist_len];
     }
 
     fn runRmsNorm(
@@ -450,6 +572,22 @@ pub const Session = struct {
     ) void {
         if (self.profiler) |profiler| {
             profiler.recordWithShape(category, elapsedSince(start_ns), shape);
+        }
+    }
+
+    fn commitOutputSequence(self: *Session, shape: metal_profile.ShapeDesc) !void {
+        if (self.profiler != null) {
+            const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+            self.recordCommitWait(shape, commit_stats);
+            return;
+        }
+        try metal_backend.commitSequence(self.backend);
+    }
+
+    fn recordCommitWait(self: *Session, shape: metal_profile.ShapeDesc, stats: metal_backend.CommitStats) void {
+        if (self.profiler) |profiler| {
+            profiler.recordWithShape(.commit_wait, stats.cpu_wait_ns, shape);
+            if (stats.gpu_timestamps_valid) profiler.recordCommitWaitGpu(stats.gpu_elapsed_ns);
         }
     }
 

@@ -6,7 +6,9 @@ pub const Category = enum(u8) {
     kv_writes,
     normalization,
     elementwise_ops,
-    readback,
+    output_reduce,
+    commit_wait,
+    host_readback,
     cpu_sampling,
 
     pub fn label(self: Category) []const u8 {
@@ -16,7 +18,9 @@ pub const Category = enum(u8) {
             .kv_writes => "kv_writes",
             .normalization => "normalization",
             .elementwise_ops => "elementwise_ops",
-            .readback => "readback",
+            .output_reduce => "output_reduce",
+            .commit_wait => "commit_wait",
+            .host_readback => "host_readback",
             .cpu_sampling => "cpu_sampling",
         };
     }
@@ -85,6 +89,9 @@ pub const Profiler = struct {
     moon_quant_token_steps: std.ArrayList(u64),
     moon_quant_shapes: std.AutoHashMap(ShapeKey, ShapeStats),
     current_moon_quant_token_ns: u64 = 0,
+    commit_wait_gpu_total_ns: u64 = 0,
+    commit_wait_gpu_token_steps: std.ArrayList(u64),
+    current_commit_wait_gpu_ns: u64 = 0,
     token_active: bool = false,
     dropped_shape_samples: bool = false,
     dropped_moon_quant_shape_samples: bool = false,
@@ -95,6 +102,7 @@ pub const Profiler = struct {
             .enabled = enabled,
             .token_steps = .empty,
             .moon_quant_token_steps = .empty,
+            .commit_wait_gpu_token_steps = .empty,
             .shapes = std.AutoHashMap(ShapeKey, ShapeStats).init(allocator),
             .moon_quant_shapes = std.AutoHashMap(ShapeKey, ShapeStats).init(allocator),
         };
@@ -103,6 +111,7 @@ pub const Profiler = struct {
     pub fn deinit(self: *Profiler) void {
         self.token_steps.deinit(self.allocator);
         self.moon_quant_token_steps.deinit(self.allocator);
+        self.commit_wait_gpu_token_steps.deinit(self.allocator);
         self.shapes.deinit();
         self.moon_quant_shapes.deinit();
         self.* = undefined;
@@ -112,6 +121,7 @@ pub const Profiler = struct {
         if (!self.enabled) return;
         self.current_token = .{};
         self.current_moon_quant_token_ns = 0;
+        self.current_commit_wait_gpu_ns = 0;
         self.token_active = true;
     }
 
@@ -119,8 +129,10 @@ pub const Profiler = struct {
         if (!self.enabled or !self.token_active) return;
         self.token_steps.append(self.allocator, self.current_token) catch {};
         self.moon_quant_token_steps.append(self.allocator, self.current_moon_quant_token_ns) catch {};
+        self.commit_wait_gpu_token_steps.append(self.allocator, self.current_commit_wait_gpu_ns) catch {};
         self.current_token = .{};
         self.current_moon_quant_token_ns = 0;
+        self.current_commit_wait_gpu_ns = 0;
         self.token_active = false;
     }
 
@@ -180,6 +192,12 @@ pub const Profiler = struct {
         entry.value_ptr.calls += 1;
     }
 
+    pub fn recordCommitWaitGpu(self: *Profiler, duration_ns: u64) void {
+        if (!self.enabled or !self.token_active or duration_ns == 0) return;
+        self.commit_wait_gpu_total_ns += duration_ns;
+        self.current_commit_wait_gpu_ns += duration_ns;
+    }
+
     pub fn renderSummary(self: *const Profiler, allocator: std.mem.Allocator) ![]u8 {
         if (!self.enabled) return allocator.dupe(u8, "");
 
@@ -196,6 +214,10 @@ pub const Profiler = struct {
         try writer.print(
             "moon_quant.profile.share_of_decode_pct={d:.3}\n",
             .{percentage(self.moon_quant_total_ns, total_decode_ns)},
+        );
+        try writer.print(
+            "profile.commit_wait.gpu_ns={d}\nprofile.commit_wait.gpu_share_of_decode_pct={d:.3}\n",
+            .{ self.commit_wait_gpu_total_ns, percentage(self.commit_wait_gpu_total_ns, total_decode_ns) },
         );
 
         for (std.enums.values(Category)) |category| {
@@ -282,6 +304,10 @@ pub const Profiler = struct {
                 "moon_quant.profile.token_{d}.ns={d}\n",
                 .{ index, self.moon_quant_token_steps.items[index] },
             );
+            try writer.print(
+                "profile.token_{d}.commit_wait.gpu_ns={d}\n",
+                .{ index, self.commit_wait_gpu_token_steps.items[index] },
+            );
         }
 
         return buffer.toOwnedSlice(allocator);
@@ -364,6 +390,8 @@ test "profiler summary exposes top bottlenecks and shapes" {
     profiler.record(.attention, 90);
     profiler.recordWithShape(.kv_writes, 30, .{ .rows = 1, .cols = 128, .depth = 2 });
     profiler.record(.cpu_sampling, 10);
+    profiler.record(.commit_wait, 50);
+    profiler.recordCommitWaitGpu(25);
     profiler.recordMoonQuantProjection(150, .{ .rows = 64, .cols = 128, .tensor_type = 12 });
     profiler.endDecodeToken();
 
@@ -373,6 +401,8 @@ test "profiler summary exposes top bottlenecks and shapes" {
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.top_bottleneck_1=projections:200ns") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.shape_1=projections:rows=64:cols=128") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.token_0.cpu_sampling.ns=10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.commit_wait.gpu_ns=25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.token_0.commit_wait.gpu_ns=25") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "moon_quant.profile.total_ns=150") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "moon_quant.profile.token_0.ns=150") != null);
 }

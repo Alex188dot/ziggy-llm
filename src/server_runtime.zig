@@ -136,7 +136,12 @@ fn handleChatCompletion(
     var messages = std.ArrayList(prompt_builder.Message).empty;
     defer prompt_builder.deinitMessages(allocator, &messages);
     for (payload.messages) |message| {
-        const role: prompt_builder.Role = if (std.mem.eql(u8, message.role, "assistant")) .assistant else .user;
+        const role: prompt_builder.Role = if (std.mem.eql(u8, message.role, "system"))
+            .system
+        else if (std.mem.eql(u8, message.role, "assistant"))
+            .assistant
+        else
+            .user;
         try prompt_builder.appendMessage(allocator, &messages, role, message.content);
     }
 
@@ -165,6 +170,7 @@ fn mergeOptions(config: cli.Config, payload: anytype) runtime.GenerationOptions 
         .min_p = payload.min_p orelse config.min_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
+        .sampling_strategy = config.sampling_strategy,
     };
 }
 

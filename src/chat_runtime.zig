@@ -17,6 +17,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     var stdin_buf: [4096]u8 = undefined;
     var stdin = std.fs.File.stdin().reader(&stdin_buf);
     const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend);
+    const max_tokens = effectiveChatMaxTokens(config, context_window);
 
     try writer.print("chat_ready: true\nmodel: {s}\ncontext_window: {d}\nhistory_window_messages: {d}\ncommands: /help /clear /unload /bye\n\n", .{
         model_path,
@@ -25,7 +26,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     });
 
     if (config.prompt) |prompt| {
-        try handleUserTurn(writer, allocator, &cache, model_path, config, &messages, prompt);
+        try handleUserTurn(writer, allocator, &cache, model_path, config, max_tokens, &messages, prompt);
     }
 
     while (true) {
@@ -52,7 +53,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
             continue;
         }
 
-        try handleUserTurn(writer, allocator, &cache, model_path, config, &messages, trimmed);
+        try handleUserTurn(writer, allocator, &cache, model_path, config, max_tokens, &messages, trimmed);
     }
 }
 
@@ -62,28 +63,30 @@ fn handleUserTurn(
     cache: *resident_runtime.ResidentRuntime,
     model_path: []const u8,
     config: cli.Config,
+    max_tokens: usize,
     messages: *std.ArrayList(prompt_builder.Message),
     user_text: []const u8,
 ) !void {
     try prompt_builder.appendMessage(allocator, messages, .user, user_text);
-    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.max_tokens, messages.items);
+    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, max_tokens, messages.items);
     defer allocator.free(prompt);
 
     var stream_state = StreamState.init(allocator, writer);
     defer stream_state.deinit();
 
-    var report = try cache.generateStreaming(model_path, prompt, generationOptions(config), &stream_state, streamChunk);
+    var report = try cache.generateStreaming(model_path, prompt, generationOptions(config, max_tokens), &stream_state, streamChunk);
     defer report.deinit(allocator);
     const trimmed = prompt_builder.trimAssistantReply(report.generated_text);
     try prompt_builder.appendMessage(allocator, messages, .assistant, trimmed);
     try stream_state.flushFinal(trimmed);
 
-    try writer.print("\n\n", .{});
+    try printTurnTimings(writer, &report);
+    try writer.print("\n", .{});
 }
 
-fn generationOptions(config: cli.Config) runtime.GenerationOptions {
+fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOptions {
     return .{
-        .max_tokens = config.max_tokens,
+        .max_tokens = max_tokens,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,
@@ -92,7 +95,14 @@ fn generationOptions(config: cli.Config) runtime.GenerationOptions {
         .min_p = config.min_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
+        .sampling_strategy = config.sampling_strategy,
     };
+}
+
+fn effectiveChatMaxTokens(config: cli.Config, context_window: usize) usize {
+    const cli_default: usize = 16;
+    if (config.max_tokens != cli_default) return config.max_tokens;
+    return @min(@as(usize, 256), context_window / 4);
 }
 
 const StreamState = struct {
@@ -100,6 +110,7 @@ const StreamState = struct {
     writer: *std.Io.Writer,
     buffer: std.ArrayList(u8) = .empty,
     emitted_len: usize = 0,
+    stopped: bool = false,
 
     fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) StreamState {
         return .{
@@ -133,4 +144,55 @@ fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
     const state: *StreamState = @ptrCast(@alignCast(ctx.?));
     try state.buffer.appendSlice(state.allocator, chunk);
     try state.flushSafePrefix();
+    if (prompt_builder.hasCompletedAssistantReply(state.buffer.items)) {
+        state.stopped = true;
+        return error.StopStreaming;
+    }
+}
+
+fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationReport) !void {
+    try writer.print(
+        \\
+        \\chat_turn_metrics:
+        \\prompt_tokens: {d}
+        \\reused_prompt_tokens: {d}
+        \\prompt_ms: {d:.3}
+        \\ttft_ms: {d:.3}
+        \\tps: {d:.3}
+        \\
+    ,
+        .{
+            report.prompt_token_count,
+            report.reused_prompt_token_count,
+            runtime.nsToMs(report.prompt_ns),
+            runtime.nsToMs(report.ttft_ns),
+            report.decodeTokensPerSecond(),
+        },
+    );
+
+    if (report.startup_breakdown.model_load_ns != 0 or
+        report.startup_breakdown.tensor_prepare_ns != 0 or
+        report.startup_breakdown.backend_init_ns != 0 or
+        report.startup_breakdown.metal_prewarm_ns != 0 or
+        report.startup_breakdown.session_init_ns != 0)
+    {
+        try writer.print(
+            \\startup_ms: {d:.3}
+            \\startup.model_load_ms: {d:.3}
+            \\startup.tensor_prepare_ms: {d:.3}
+            \\startup.backend_init_ms: {d:.3}
+            \\startup.metal_prewarm_ms: {d:.3}
+            \\startup.session_init_ms: {d:.3}
+            \\
+        ,
+            .{
+                runtime.nsToMs(report.startup_ns),
+                runtime.nsToMs(report.startup_breakdown.model_load_ns),
+                runtime.nsToMs(report.startup_breakdown.tensor_prepare_ns),
+                runtime.nsToMs(report.startup_breakdown.backend_init_ns),
+                runtime.nsToMs(report.startup_breakdown.metal_prewarm_ns),
+                runtime.nsToMs(report.startup_breakdown.session_init_ns),
+            },
+        );
+    }
 }

@@ -2,6 +2,7 @@
 using namespace metal;
 
 constant uint ZIGGY_MAX_ROW_SIMDGROUPS = 8;
+constant uint ZIGGY_MAX_NORM_SIMDGROUPS = 8;
 
 kernel void matvec_f32(
     device const float *matrix [[buffer(0)]],
@@ -360,6 +361,92 @@ kernel void matvec_q6k_f32(
             sum += partial_sums[index];
         }
         output[row] = sum;
+    }
+}
+
+inline uint ziggy_ordered_float_bits(float value) {
+    const uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
+}
+
+kernel void matvec_q6k_argmax_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device atomic_uint *output_state [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint blocks_per_row = cols / ZIGGY_Q6K_VALUES_PER_BLOCK;
+    const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+    threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
+        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+        const uint block_half = block_chunk / 32;
+        const uint l = block_chunk % 32;
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
+        const device uchar *ql = block + block_half * 64;
+        const device uchar *qh = block + 128 + block_half * 32;
+        const device uchar *scales = block + 192 + block_half * 8;
+        const float d = read_half_le(block, 208);
+        const uint scale_index = l / 16;
+        const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
+        const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
+        const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
+        const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
+        const uchar qh_value = qh[l];
+        const uchar ql_low = ql[l];
+        const uchar ql_high = ql[l + 32];
+        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f;
+        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
+        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
+        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
+        const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
+
+        local_sum += s0 * q1 * input[input_offset + 0];
+        local_sum += s2 * q2 * input[input_offset + 32];
+        local_sum += s4 * q3 * input[input_offset + 64];
+        local_sum += s6 * q4 * input[input_offset + 96];
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+
+        device atomic_uint *best_value = output_state;
+        device atomic_uint *best_token = output_state + 1;
+        uint observed = atomic_load_explicit(best_value, memory_order_relaxed);
+        const uint ordered = ziggy_ordered_float_bits(sum);
+        while (ordered > observed) {
+            if (atomic_compare_exchange_weak_explicit(
+                    best_value,
+                    &observed,
+                    ordered,
+                    memory_order_relaxed,
+                    memory_order_relaxed)) {
+                atomic_store_explicit(best_token, row, memory_order_relaxed);
+                break;
+            }
+        }
     }
 }
 
@@ -787,34 +874,283 @@ kernel void rms_norm_f32(
     device float *output [[buffer(2)]],
     constant uint &count [[buffer(3)]],
     constant float &eps [[buffer(4)]],
-    uint index [[thread_position_in_grid]]
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
 ) {
-    if (index >= count) return;
+    threadgroup float partial_sums[ZIGGY_MAX_NORM_SIMDGROUPS];
 
-    float sum = 0.0f;
-    for (uint i = 0; i < count; i += 1) {
+    float local_sum = 0.0f;
+    for (uint i = lane; i < count; i += threads_per_group) {
         const float value = input[i];
-        sum += value * value;
+        local_sum += value * value;
     }
-    const float scale = 1.0f / sqrt(sum / float(count) + eps);
-    output[index] = input[index] * scale * weights[index];
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        partial_sums[0] = 1.0f / sqrt(sum / float(count) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = partial_sums[0];
+    for (uint index = lane; index < count; index += threads_per_group) {
+        output[index] = input[index] * scale * weights[index];
+    }
 }
 
 kernel void argmax_f32(
     device const float *input [[buffer(0)]],
     device uint *output_token [[buffer(1)]],
     constant uint &count [[buffer(2)]],
-    uint index [[thread_position_in_grid]]
+    constant uint &thread_count [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]]
 ) {
-    if (index != 0 || count == 0) return;
+    if (count == 0 || thread_count == 0 || thread_count > 256) return;
+    if (tid >= thread_count) return;
+
+    float best_value = -INFINITY;
     uint best_index = 0;
-    float best_value = input[0];
-    for (uint i = 1; i < count; i += 1) {
+    for (uint i = tid; i < count; i += thread_count) {
         const float value = input[i];
-        if (value > best_value) {
+        if (value > best_value || (value == best_value && i < best_index)) {
             best_value = value;
             best_index = i;
         }
     }
-    output_token[0] = best_index;
+
+    threadgroup float scratch_values[256];
+    threadgroup uint scratch_indices[256];
+    scratch_values[tid] = best_value;
+    scratch_indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = thread_count / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            const float rhs_value = scratch_values[tid + stride];
+            const uint rhs_index = scratch_indices[tid + stride];
+            const float lhs_value = scratch_values[tid];
+            const uint lhs_index = scratch_indices[tid];
+            if (rhs_value > lhs_value || (rhs_value == lhs_value && rhs_index < lhs_index)) {
+                scratch_values[tid] = rhs_value;
+                scratch_indices[tid] = rhs_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid != 0) return;
+    output_token[0] = scratch_indices[0];
+}
+
+constant uint ZIGGY_SHORTLIST_MAX_K = 64;
+constant uint ZIGGY_SHORTLIST_THREAD_COUNT = 32;
+
+struct ZiggyShortlistEntry {
+    uint token_id;
+    float score;
+};
+
+kernel void topk_f32(
+    device const float *input [[buffer(0)]],
+    device ZiggyShortlistEntry *output_entries [[buffer(1)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &top_k [[buffer(4)]],
+    constant uint &thread_count [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (count == 0 || top_k == 0 || top_k > ZIGGY_SHORTLIST_MAX_K || thread_count == 0 || thread_count > ZIGGY_SHORTLIST_THREAD_COUNT) return;
+    if (tid >= thread_count) return;
+
+    float best_values[ZIGGY_SHORTLIST_MAX_K];
+    uint best_indices[ZIGGY_SHORTLIST_MAX_K];
+    for (uint i = 0; i < top_k; i += 1) {
+        best_values[i] = -INFINITY;
+        best_indices[i] = 0;
+    }
+
+    for (uint i = tid; i < count; i += thread_count) {
+        const float value = input[i];
+        uint insert_at = top_k;
+        for (uint slot = 0; slot < top_k; slot += 1) {
+            const bool better_value = value > best_values[slot];
+            const bool equal_value = value == best_values[slot];
+            const bool better_tie = equal_value && i < best_indices[slot];
+            if (better_value || better_tie) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == top_k) continue;
+
+        for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+            best_values[shift] = best_values[shift - 1];
+            best_indices[shift] = best_indices[shift - 1];
+        }
+        best_values[insert_at] = value;
+        best_indices[insert_at] = i;
+    }
+
+    threadgroup float scratch_values[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+    threadgroup uint scratch_indices[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+
+    const uint scratch_base = tid * ZIGGY_SHORTLIST_MAX_K;
+    for (uint i = 0; i < top_k; i += 1) {
+        scratch_values[scratch_base + i] = best_values[i];
+        scratch_indices[scratch_base + i] = best_indices[i];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid != 0) return;
+
+    for (uint worker = 1; worker < thread_count; worker += 1) {
+        const uint worker_base = worker * ZIGGY_SHORTLIST_MAX_K;
+        for (uint candidate_index = 0; candidate_index < top_k; candidate_index += 1) {
+            const float value = scratch_values[worker_base + candidate_index];
+            const uint token = scratch_indices[worker_base + candidate_index];
+            uint insert_at = top_k;
+            for (uint slot = 0; slot < top_k; slot += 1) {
+                const bool better_value = value > best_values[slot];
+                const bool equal_value = value == best_values[slot];
+                const bool better_tie = equal_value && token < best_indices[slot];
+                if (better_value || better_tie) {
+                    insert_at = slot;
+                    break;
+                }
+            }
+            if (insert_at == top_k) continue;
+
+            for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+                best_values[shift] = best_values[shift - 1];
+                best_indices[shift] = best_indices[shift - 1];
+            }
+            best_values[insert_at] = value;
+            best_indices[insert_at] = token;
+        }
+    }
+
+    for (uint i = 0; i < top_k; i += 1) {
+        output_entries[i].token_id = best_indices[i];
+        output_entries[i].score = best_values[i];
+    }
+}
+
+kernel void sample_topk_f32(
+    device const float *input [[buffer(0)]],
+    device uint *output_token [[buffer(1)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &top_k [[buffer(4)]],
+    constant uint &thread_count [[buffer(5)]],
+    constant float &temperature [[buffer(6)]],
+    constant float &random_uniform [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (count == 0 || top_k == 0 || top_k > ZIGGY_SHORTLIST_MAX_K || thread_count == 0 || thread_count > ZIGGY_SHORTLIST_THREAD_COUNT) return;
+    if (tid >= thread_count) return;
+
+    float best_values[ZIGGY_SHORTLIST_MAX_K];
+    uint best_indices[ZIGGY_SHORTLIST_MAX_K];
+    for (uint i = 0; i < top_k; i += 1) {
+        best_values[i] = -INFINITY;
+        best_indices[i] = 0;
+    }
+
+    for (uint i = tid; i < count; i += thread_count) {
+        const float value = input[i];
+        uint insert_at = top_k;
+        for (uint slot = 0; slot < top_k; slot += 1) {
+            const bool better_value = value > best_values[slot];
+            const bool equal_value = value == best_values[slot];
+            const bool better_tie = equal_value && i < best_indices[slot];
+            if (better_value || better_tie) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == top_k) continue;
+
+        for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+            best_values[shift] = best_values[shift - 1];
+            best_indices[shift] = best_indices[shift - 1];
+        }
+        best_values[insert_at] = value;
+        best_indices[insert_at] = i;
+    }
+
+    threadgroup float scratch_values[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+    threadgroup uint scratch_indices[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+    const uint scratch_base = tid * ZIGGY_SHORTLIST_MAX_K;
+    for (uint i = 0; i < top_k; i += 1) {
+        scratch_values[scratch_base + i] = best_values[i];
+        scratch_indices[scratch_base + i] = best_indices[i];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+
+    for (uint worker = 1; worker < thread_count; worker += 1) {
+        const uint worker_base = worker * ZIGGY_SHORTLIST_MAX_K;
+        for (uint candidate_index = 0; candidate_index < top_k; candidate_index += 1) {
+            const float value = scratch_values[worker_base + candidate_index];
+            const uint token = scratch_indices[worker_base + candidate_index];
+            uint insert_at = top_k;
+            for (uint slot = 0; slot < top_k; slot += 1) {
+                const bool better_value = value > best_values[slot];
+                const bool equal_value = value == best_values[slot];
+                const bool better_tie = equal_value && token < best_indices[slot];
+                if (better_value || better_tie) {
+                    insert_at = slot;
+                    break;
+                }
+            }
+            if (insert_at == top_k) continue;
+            for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+                best_values[shift] = best_values[shift - 1];
+                best_indices[shift] = best_indices[shift - 1];
+            }
+            best_values[insert_at] = value;
+            best_indices[insert_at] = token;
+        }
+    }
+
+    float max_logit = best_values[0];
+    for (uint i = 1; i < top_k; i += 1) {
+        max_logit = max(max_logit, best_values[i]);
+    }
+
+    float weights[ZIGGY_SHORTLIST_MAX_K];
+    float total_weight = 0.0f;
+    for (uint i = 0; i < top_k; i += 1) {
+        const float shifted = (best_values[i] - max_logit) / temperature;
+        const float weight = exp(shifted);
+        weights[i] = weight;
+        total_weight += weight;
+    }
+
+    if (!(total_weight > 0.0f) || !isfinite(total_weight)) {
+        output_token[0] = best_indices[0];
+        return;
+    }
+
+    const float clamped_uniform = clamp(random_uniform, 0.0f, 0.99999994f);
+    const float target = clamped_uniform * total_weight;
+    float cumulative = 0.0f;
+    for (uint i = 0; i < top_k; i += 1) {
+        cumulative += weights[i];
+        if (target <= cumulative) {
+            output_token[0] = best_indices[i];
+            return;
+        }
+    }
+    output_token[0] = best_indices[top_k - 1];
 }

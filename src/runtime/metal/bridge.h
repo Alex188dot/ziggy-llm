@@ -15,6 +15,12 @@ typedef struct {
     bool low_power;
 } ZiggyMetalDeviceInfo;
 
+typedef struct {
+    uint64_t cpu_wait_ns;
+    uint64_t gpu_elapsed_ns;
+    bool gpu_timestamps_valid;
+} ZiggyMetalCommitStats;
+
 enum {
     ZIGGY_METAL_OK = 0,
     ZIGGY_METAL_UNAVAILABLE = 1,
@@ -171,6 +177,17 @@ int ziggy_metal_run_matvec_q6k_add_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q6k_argmax_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_packed,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_q8_0_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
@@ -315,6 +332,13 @@ int ziggy_metal_commit_sequence(
     size_t error_message_len
 );
 
+int ziggy_metal_commit_sequence_timed(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalCommitStats *out_stats,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_add_in_place_f32(
     ZiggyMetalContext *ctx,
     ZiggyMetalBuffer *dst,
@@ -340,6 +364,28 @@ int ziggy_metal_argmax_f32(
     const ZiggyMetalBuffer *input,
     ZiggyMetalBuffer *output_token,
     uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_entries,
+    uint32_t count,
+    uint32_t top_k,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_sample_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_token,
+    uint32_t count,
+    uint32_t top_k,
+    float temperature,
+    float random_uniform,
     char *error_message,
     size_t error_message_len
 );

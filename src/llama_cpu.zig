@@ -5,6 +5,7 @@ const llama_gpu = @import("runtime/llama_gpu.zig");
 const metal_profile = @import("runtime/metal_profile.zig");
 const moon_quant_calibration = @import("moon_quant_calibration.zig");
 const runtime_types = @import("runtime/types.zig");
+const sampling = @import("sampling.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -36,6 +37,9 @@ pub const GenerateReport = struct {
     ttft_ns: u64,
     decode_ns: u64,
     backend: runtime_types.BackendUsed,
+    sampling_strategy: runtime_types.SamplingStrategy = .auto,
+    sampling_path: runtime_types.EffectiveSamplingPath = .cpu_logits,
+    readback_mode: runtime_types.ReadbackMode = .none,
     startup_breakdown: runtime_types.StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
@@ -81,6 +85,13 @@ const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
+
+fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOptions) runtime_types.EffectiveSamplingPath {
+    if (!has_gpu_session) return .cpu_logits;
+    const path = runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
+    if (path == .gpu_topk_sampler and !runtime_types.canUseGpuTopKSampling(options)) return .cpu_logits;
+    return path;
+}
 
 const ValueType = enum(u32) {
     uint8 = 0,
@@ -446,6 +457,7 @@ pub const ReusableSession = struct {
 
     pub fn reset(self: *ReusableSession) void {
         self.session.position = 0;
+        self.session.pending_greedy_token = null;
     }
 };
 
@@ -465,6 +477,9 @@ const Session = struct {
     gate: []f32,
     up: []f32,
     logits: []f32,
+    pending_greedy_token: ?u32 = null,
+    pending_shortlist: [llama_gpu.max_shortlist_len]llama_gpu.ShortlistEntry = undefined,
+    pending_shortlist_len: usize = 0,
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
@@ -544,9 +559,66 @@ const Session = struct {
         self.* = undefined;
     }
 
-    fn runPrompt(self: *Session, prompt_tokens: []const u32) !void {
+    fn runPrompt(
+        self: *Session,
+        prompt_tokens: []const u32,
+        sampling_path: runtime_types.EffectiveSamplingPath,
+        shortlist_len: usize,
+    ) !void {
         if (prompt_tokens.len == 0) return error.EmptyPrompt;
-        for (prompt_tokens) |token_id| _ = try self.step(token_id);
+        if (prompt_tokens.len > 1) {
+            for (prompt_tokens[0 .. prompt_tokens.len - 1]) |token_id| {
+                try self.stepNoOutput(token_id);
+            }
+        }
+
+        const last_token = prompt_tokens[prompt_tokens.len - 1];
+        switch (sampling_path) {
+            .gpu_greedy_argmax => _ = try self.stepGreedy(last_token),
+            .gpu_topk_sampler => unreachable,
+            .gpu_shortlist_cpu_sampler => _ = try self.stepShortlist(last_token, shortlist_len),
+            .cpu_logits => _ = try self.step(last_token),
+        }
+    }
+
+    fn stepShortlist(self: *Session, token_id: u32, shortlist_len: usize) ![]const llama_gpu.ShortlistEntry {
+        if (self.gpu_session == null) {
+            _ = try self.step(token_id);
+            self.pending_shortlist_len = 0;
+            return self.pending_shortlist[0..0];
+        }
+        try self.runTokenCore(token_id);
+        const gpu_session = &self.gpu_session.?;
+        const shortlist = try gpu_session.runOutputShortlist(
+            adaptTensorDesc(self.model.output_norm),
+            adaptTensorDesc(self.model.output),
+            shortlist_len,
+            self.pending_shortlist[0..shortlist_len],
+        );
+        self.pending_shortlist_len = shortlist.len;
+        self.pending_greedy_token = null;
+        self.finishToken(token_id);
+        return shortlist;
+    }
+
+    fn stepGpuTopK(self: *Session, token_id: u32, top_k: usize, temperature: f32, random_uniform: f32) !u32 {
+        if (self.gpu_session == null) {
+            _ = try self.step(token_id);
+            return argmax(self.logits);
+        }
+        try self.runTokenCore(token_id);
+        const gpu_session = &self.gpu_session.?;
+        const next_token = try gpu_session.runOutputSampleTopK(
+            adaptTensorDesc(self.model.output_norm),
+            adaptTensorDesc(self.model.output),
+            top_k,
+            temperature,
+            random_uniform,
+        );
+        self.pending_greedy_token = next_token;
+        self.pending_shortlist_len = 0;
+        self.finishToken(token_id);
+        return next_token;
     }
 
     fn stepGreedy(self: *Session, token_id: u32) !u32 {
@@ -554,24 +626,41 @@ const Session = struct {
             _ = try self.step(token_id);
             return argmax(self.logits);
         }
-        if (self.position >= self.model.context_length) return error.ContextOverflow;
-        try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
-
-        for (self.model.layers, 0..) |layer, layer_index| {
-            const gpu_session = &self.gpu_session.?;
-            if (layer_index == 0) try gpu_session.beginToken(self.hidden);
-            try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
-            try gpu_session.runFfnBlock(adaptLayerDesc(layer));
-        }
-
+        try self.runTokenCore(token_id);
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
-        self.token_buffer[self.position] = token_id;
-        self.position += 1;
+        self.pending_greedy_token = next_token;
+        self.finishToken(token_id);
         return next_token;
     }
 
+    fn stepNoOutput(self: *Session, token_id: u32) !void {
+        try self.runTokenCore(token_id);
+        if (self.gpu_session) |*gpu_session| {
+            try gpu_session.commitToken();
+        }
+        self.pending_greedy_token = null;
+        self.pending_shortlist_len = 0;
+        self.finishToken(token_id);
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
+        try self.runTokenCore(token_id);
+        self.pending_greedy_token = null;
+        self.pending_shortlist_len = 0;
+        if (self.gpu_session) |*gpu_session| {
+            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+        } else {
+            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
+            try self.recordCalibration(self.model.output, .output, self.normed);
+            try self.matVec(self.logits, self.model.output, self.normed);
+        }
+
+        self.finishToken(token_id);
+        return self.logits;
+    }
+
+    fn runTokenCore(self: *Session, token_id: u32) !void {
         if (self.position >= self.model.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
@@ -612,18 +701,11 @@ const Session = struct {
             }
             addInPlace(self.hidden, self.attn_tmp);
         }
+    }
 
-        if (self.gpu_session) |*gpu_session| {
-            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
-        } else {
-            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-            try self.recordCalibration(self.model.output, .output, self.normed);
-            try self.matVec(self.logits, self.model.output, self.normed);
-        }
-
+    fn finishToken(self: *Session, token_id: u32) void {
         self.token_buffer[self.position] = token_id;
         self.position += 1;
-        return self.logits;
     }
 
     fn recordCalibration(self: *Session, tensor: TensorRef, role: moon_quant_calibration.Role, input: []const f32) !void {
@@ -941,30 +1023,59 @@ pub fn generateLoadedStreaming(
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
+    const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
+    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+    const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, session.token_buffer);
-    try session.runPrompt(session.token_buffer[0..prompt_token_count]);
+    switch (sampling_path) {
+        .gpu_topk_sampler => {
+            if (prompt_token_count == 0) return error.EmptyPrompt;
+            if (prompt_token_count > 1) {
+                for (session.token_buffer[0 .. prompt_token_count - 1]) |token_id| {
+                    try session.stepNoOutput(token_id);
+                }
+            }
+            _ = try session.stepGpuTopK(session.token_buffer[prompt_token_count - 1], gpu_top_k, options.temperature, random.float(f32));
+        },
+        else => try session.runPrompt(session.token_buffer[0..prompt_token_count], sampling_path, shortlist_len),
+    }
     const prompt_end = std.time.nanoTimestamp();
 
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
-    const sample_candidates = try allocator.alloc(SampleCandidate, session.logits.len);
+    const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
+    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
-    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
-    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
-
+    const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    const gpu_topk = sampling_path == .gpu_topk_sampler;
+    const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
+    var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const next_token = if (gpu_greedy) blk: {
+        const next_token = if (gpu_greedy or gpu_topk) blk: {
             break :blk greedy_next_token.?;
+        } else if (gpu_shortlist) blk: {
+            const sample_begin = std.time.nanoTimestamp();
+            const sampled = sampling.sampleShortlist(
+                session.pending_shortlist[0..session.pending_shortlist_len],
+                session.token_buffer[0..session.position],
+                options,
+                random,
+                sample_candidates,
+            );
+            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            break :blk sampled;
         } else blk: {
             const sample_begin = std.time.nanoTimestamp();
-            const sampled = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
+            const sampled = sampling.sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
@@ -976,7 +1087,14 @@ pub fn generateLoadedStreaming(
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
             const chunk = output.items[chunk_start..];
-            if (chunk.len > 0) try callback(stream_ctx, chunk);
+            if (chunk.len > 0) callback(stream_ctx, chunk) catch |err| switch (err) {
+                error.StopStreaming => {
+                    profiler.endDecodeToken();
+                    generated_token_count += 1;
+                    break;
+                },
+                else => return err,
+            };
         }
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
@@ -984,6 +1102,10 @@ pub fn generateLoadedStreaming(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             greedy_next_token = try session.stepGreedy(next_token);
+        } else if (gpu_topk) {
+            greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
+        } else if (gpu_shortlist) {
+            _ = try session.stepShortlist(next_token, shortlist_len);
         } else {
             _ = try session.step(next_token);
         }
@@ -1004,7 +1126,10 @@ pub fn generateLoadedStreaming(
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
-        .backend = if (backend == null) .cpu else .metal,
+        .backend = backend_used,
+        .sampling_strategy = options.sampling_strategy,
+        .sampling_path = sampling_path,
+        .readback_mode = runtime_types.readbackModeFor(backend_used, sampling_path),
         .startup_breakdown = .{
             .session_init_ns = session_init_ns,
             .first_decode_step_ns = first_decode_step_ns,
@@ -1056,28 +1181,60 @@ pub fn generateLoadedStreamingCached(
     }
 
     if (session.position < prompt_token_count) {
-        try session.runPrompt(prompt_tokens[session.position..prompt_token_count]);
+        const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+        const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+        const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
+        if (sampling_path == .gpu_topk_sampler) {
+            const remaining = prompt_tokens[session.position..prompt_token_count];
+            if (remaining.len > 1) {
+                for (remaining[0 .. remaining.len - 1]) |token_id| {
+                    try session.stepNoOutput(token_id);
+                }
+            }
+            _ = try session.stepGpuTopK(remaining[remaining.len - 1], gpu_top_k, options.temperature, random.float(f32));
+        } else {
+            try session.runPrompt(prompt_tokens[session.position..prompt_token_count], sampling_path, shortlist_len);
+        }
     }
     const prompt_end = std.time.nanoTimestamp();
 
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
-    const sample_candidates = try allocator.alloc(SampleCandidate, session.logits.len);
+    const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
+    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+    const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
+    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
-    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
-    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
+    const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    const gpu_topk = sampling_path == .gpu_topk_sampler;
+    const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
+    var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
+    const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const next_token = if (gpu_greedy) blk: {
+        const next_token = if (gpu_greedy or gpu_topk) blk: {
             break :blk greedy_next_token.?;
+        } else if (gpu_shortlist) blk: {
+            const sample_begin = std.time.nanoTimestamp();
+            const sampled = sampling.sampleShortlist(
+                session.pending_shortlist[0..session.pending_shortlist_len],
+                session.token_buffer[0..session.position],
+                options,
+                random,
+                sample_candidates,
+            );
+            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            break :blk sampled;
         } else blk: {
             const sample_begin = std.time.nanoTimestamp();
-            const sampled = sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
+            const sampled = sampling.sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
@@ -1089,7 +1246,14 @@ pub fn generateLoadedStreamingCached(
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
             const chunk = output.items[chunk_start..];
-            if (chunk.len > 0) try callback(stream_ctx, chunk);
+            if (chunk.len > 0) callback(stream_ctx, chunk) catch |err| switch (err) {
+                error.StopStreaming => {
+                    profiler.endDecodeToken();
+                    generated_token_count += 1;
+                    break;
+                },
+                else => return err,
+            };
         }
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
@@ -1097,6 +1261,10 @@ pub fn generateLoadedStreamingCached(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             greedy_next_token = try session.stepGreedy(next_token);
+        } else if (gpu_topk) {
+            greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
+        } else if (gpu_shortlist) {
+            _ = try session.stepShortlist(next_token, shortlist_len);
         } else {
             _ = try session.step(next_token);
         }
@@ -1117,7 +1285,10 @@ pub fn generateLoadedStreamingCached(
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
-        .backend = if (backend == null) .cpu else .metal,
+        .backend = backend_used,
+        .sampling_strategy = options.sampling_strategy,
+        .sampling_path = sampling_path,
+        .readback_mode = runtime_types.readbackModeFor(backend_used, sampling_path),
         .startup_breakdown = .{
             .session_init_ns = 0,
             .first_decode_step_ns = first_decode_step_ns,
@@ -1139,7 +1310,7 @@ pub const CalibrationSession = struct {
     }
 
     pub fn runPrompt(self: *CalibrationSession, prompt_tokens: []const u32) !void {
-        try self.session.runPrompt(prompt_tokens);
+        try self.session.runPrompt(prompt_tokens, .cpu_logits, 0);
     }
 };
 
@@ -1817,147 +1988,6 @@ fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize,
     }
 }
 
-const SampleCandidate = struct {
-    token_id: u32 = 0,
-    logit: f32 = 0,
-    weight: f64 = 0,
-};
-
-fn sampleToken(
-    logits: []const f32,
-    recent_tokens: []const u32,
-    options: runtime_types.GenerationOptions,
-    random: std.Random,
-    candidates: []SampleCandidate,
-) u32 {
-    if (options.temperature <= 0) return argmax(logits);
-
-    const top_k = if (options.top_k == 0) logits.len else @min(options.top_k, logits.len);
-    const candidate_count = if (top_k < logits.len)
-        collectTopKCandidates(logits, top_k, candidates[0..top_k])
-    else
-        collectAllCandidates(logits, candidates[0..logits.len]);
-
-    var active = candidates[0..candidate_count];
-    if (active.len == 0) return argmax(logits);
-
-    var max_logit = -std.math.inf(f32);
-    var total_weight: f64 = 0;
-    for (active) |*candidate| {
-        const adjusted_logit = applyRepeatPenalty(candidate.logit, candidate.token_id, recent_tokens, options.repeat_penalty);
-        candidate.logit = adjusted_logit;
-        max_logit = @max(max_logit, adjusted_logit);
-    }
-    for (active) |*candidate| {
-        const shifted = (@as(f64, candidate.logit) - @as(f64, max_logit)) / @as(f64, options.temperature);
-        candidate.weight = @exp(shifted);
-        total_weight += candidate.weight;
-    }
-    if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
-
-    if (options.min_p > 0) {
-        const kept = truncateByMinP(active, options.min_p);
-        active = active[0..kept];
-        total_weight = 0;
-        for (active) |candidate| total_weight += candidate.weight;
-        if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
-    }
-
-    if (options.top_p < 1.0) {
-        std.mem.sort(SampleCandidate, active, {}, lessSampleCandidate);
-        const kept = truncateByTopP(active, total_weight, options.top_p);
-        active = active[0..kept];
-        total_weight = 0;
-        for (active) |candidate| total_weight += candidate.weight;
-        if (total_weight <= 0 or !std.math.isFinite(total_weight)) return argmax(logits);
-    }
-
-    const target = random.float(f64) * total_weight;
-    var cumulative: f64 = 0;
-    for (active) |candidate| {
-        cumulative += candidate.weight;
-        if (target <= cumulative) return candidate.token_id;
-    }
-
-    return active[active.len - 1].token_id;
-}
-
-fn applyRepeatPenalty(logit: f32, token_id: u32, recent_tokens: []const u32, repeat_penalty: f32) f32 {
-    if (repeat_penalty <= 1.0) return logit;
-    for (recent_tokens) |recent| {
-        if (recent != token_id) continue;
-        return if (logit < 0) logit * repeat_penalty else logit / repeat_penalty;
-    }
-    return logit;
-}
-
-fn collectAllCandidates(logits: []const f32, out: []SampleCandidate) usize {
-    for (logits, 0..) |logit, index| {
-        out[index] = .{
-            .token_id = @intCast(index),
-            .logit = logit,
-        };
-    }
-    return logits.len;
-}
-
-fn collectTopKCandidates(logits: []const f32, top_k: usize, out: []SampleCandidate) usize {
-    var count: usize = 0;
-    for (logits, 0..) |logit, index| {
-        const candidate = SampleCandidate{
-            .token_id = @intCast(index),
-            .logit = logit,
-        };
-
-        if (count < top_k) {
-            out[count] = candidate;
-            count += 1;
-            var pos = count - 1;
-            while (pos > 0 and out[pos].logit > out[pos - 1].logit) : (pos -= 1) {
-                std.mem.swap(SampleCandidate, &out[pos], &out[pos - 1]);
-            }
-            continue;
-        }
-
-        if (candidate.logit <= out[top_k - 1].logit) continue;
-        out[top_k - 1] = candidate;
-        var pos = top_k - 1;
-        while (pos > 0 and out[pos].logit > out[pos - 1].logit) : (pos -= 1) {
-            std.mem.swap(SampleCandidate, &out[pos], &out[pos - 1]);
-        }
-    }
-    return count;
-}
-
-fn truncateByTopP(candidates: []SampleCandidate, total_weight: f64, top_p: f32) usize {
-    var cumulative: f64 = 0;
-    for (candidates, 0..) |candidate, index| {
-        cumulative += candidate.weight;
-        if (cumulative / total_weight >= @as(f64, top_p)) return index + 1;
-    }
-    return candidates.len;
-}
-
-fn truncateByMinP(candidates: []SampleCandidate, min_p: f32) usize {
-    var max_weight: f64 = 0;
-    for (candidates) |candidate| {
-        max_weight = @max(max_weight, candidate.weight);
-    }
-    const threshold = max_weight * @as(f64, min_p);
-    var kept: usize = 0;
-    for (candidates) |candidate| {
-        if (candidate.weight >= threshold) {
-            candidates[kept] = candidate;
-            kept += 1;
-        }
-    }
-    return @max(@as(usize, 1), kept);
-}
-
-fn lessSampleCandidate(_: void, lhs: SampleCandidate, rhs: SampleCandidate) bool {
-    return lhs.weight > rhs.weight;
-}
-
 fn argmax(values: []const f32) u32 {
     var best_index: usize = 0;
     var best_value = values[0];
@@ -1968,76 +1998,6 @@ fn argmax(values: []const f32) u32 {
         }
     }
     return @intCast(best_index);
-}
-
-test "sampleToken uses seed-driven randomness when temperature is enabled" {
-    const logits = [_]f32{ 2.0, 1.8, 1.7, 1.6 };
-    var candidates_a: [logits.len]SampleCandidate = undefined;
-    var candidates_b: [logits.len]SampleCandidate = undefined;
-    var candidates_c: [logits.len]SampleCandidate = undefined;
-
-    var prng_a = std.Random.DefaultPrng.init(42);
-    var prng_b = std.Random.DefaultPrng.init(42);
-    var prng_c = std.Random.DefaultPrng.init(99);
-
-    const sample_a = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_a.random(), &candidates_a);
-    const sample_b = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_b.random(), &candidates_b);
-    const sample_c = sampleToken(&logits, &.{}, .{ .temperature = 0.8 }, prng_c.random(), &candidates_c);
-
-    try std.testing.expectEqual(sample_a, sample_b);
-    try std.testing.expect(sample_a < logits.len);
-    try std.testing.expect(sample_c < logits.len);
-}
-
-test "sampleToken falls back to argmax for non-positive temperature" {
-    const logits = [_]f32{ -1.0, 3.0, 0.5 };
-    var candidates: [logits.len]SampleCandidate = undefined;
-    var prng = std.Random.DefaultPrng.init(7);
-    try std.testing.expectEqual(@as(u32, 1), sampleToken(&logits, &.{}, .{ .temperature = 0 }, prng.random(), &candidates));
-}
-
-test "sampleToken top-k restricts sampling set" {
-    const logits = [_]f32{ 10.0, 9.0, 1.0, 0.5 };
-    var candidates: [logits.len]SampleCandidate = undefined;
-    var prng = std.Random.DefaultPrng.init(123);
-
-    for (0..32) |_| {
-        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .top_k = 2 }, prng.random(), &candidates);
-        try std.testing.expect(sample == 0 or sample == 1);
-    }
-}
-
-test "sampleToken top-p trims low-mass tail" {
-    const logits = [_]f32{ 8.0, 7.5, 1.0, 0.2 };
-    var candidates: [logits.len]SampleCandidate = undefined;
-    var prng = std.Random.DefaultPrng.init(321);
-
-    for (0..32) |_| {
-        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .top_p = 0.9 }, prng.random(), &candidates);
-        try std.testing.expect(sample == 0 or sample == 1);
-    }
-}
-
-test "sampleToken repeat penalty demotes repeated tokens" {
-    const logits = [_]f32{ 4.0, 3.9, 1.0 };
-    var candidates: [logits.len]SampleCandidate = undefined;
-    var prng = std.Random.DefaultPrng.init(5);
-
-    for (0..32) |_| {
-        const sample = sampleToken(&logits, &.{0}, .{ .temperature = 0.7, .repeat_penalty = 1.5 }, prng.random(), &candidates);
-        try std.testing.expect(sample != 2);
-    }
-}
-
-test "sampleToken min-p drops low relative probability tail" {
-    const logits = [_]f32{ 6.0, 5.5, 0.5, 0.2 };
-    var candidates: [logits.len]SampleCandidate = undefined;
-    var prng = std.Random.DefaultPrng.init(777);
-
-    for (0..32) |_| {
-        const sample = sampleToken(&logits, &.{}, .{ .temperature = 1.0, .min_p = 0.5 }, prng.random(), &candidates);
-        try std.testing.expect(sample == 0 or sample == 1);
-    }
 }
 
 fn addInPlace(dst: []f32, src: []const f32) void {

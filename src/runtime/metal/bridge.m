@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <stdio.h>
 #import <string.h>
+#import <time.h>
 
 @interface ZiggyMetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
@@ -20,6 +21,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAddPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAdd2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAdd5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KArgmaxPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ80Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ80AddPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KPipeline;
@@ -35,6 +37,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> argmaxPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> topKPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> sampleTopKPipeline;
 @property(nonatomic, strong) id<MTLCommandBuffer> pendingCommandBuffer;
 @end
 
@@ -92,6 +96,33 @@ static void ziggy_dispatch_standard(
     MTLSize grid_size = MTLSizeMake(grid_width, 1, 1);
     MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
     [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
+}
+
+static uint64_t ziggy_now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void ziggy_fill_commit_stats(
+    id<MTLCommandBuffer> command_buffer,
+    uint64_t cpu_wait_ns,
+    ZiggyMetalCommitStats *out_stats
+) {
+    if (out_stats == NULL) return;
+    out_stats->cpu_wait_ns = cpu_wait_ns;
+    out_stats->gpu_elapsed_ns = 0;
+    out_stats->gpu_timestamps_valid = false;
+
+    if (![command_buffer respondsToSelector:@selector(GPUStartTime)] ||
+        ![command_buffer respondsToSelector:@selector(GPUEndTime)]) {
+        return;
+    }
+
+    const CFTimeInterval gpu_start = command_buffer.GPUStartTime;
+    const CFTimeInterval gpu_end = command_buffer.GPUEndTime;
+    if (!(gpu_end > gpu_start) || gpu_start <= 0.0) return;
+
+    out_stats->gpu_elapsed_ns = (uint64_t)((gpu_end - gpu_start) * 1000000000.0);
+    out_stats->gpu_timestamps_valid = out_stats->gpu_elapsed_ns > 0;
 }
 
 static void ziggy_dispatch_q4k_rows(
@@ -157,11 +188,7 @@ static id<MTLComputePipelineState> ziggy_select_q6k_add_pipeline(
     return state.matvecQ6KAddPipeline;
 }
 
-static void ziggy_dispatch_rowwise(
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLComputePipelineState> pipeline,
-    NSUInteger row_count
-) {
+static NSUInteger ziggy_rowwise_thread_count(id<MTLComputePipelineState> pipeline) {
     NSUInteger thread_width = pipeline.threadExecutionWidth;
     if (thread_width == 0) thread_width = 1;
     NSUInteger max_total_threads = pipeline.maxTotalThreadsPerThreadgroup;
@@ -171,6 +198,15 @@ static void ziggy_dispatch_rowwise(
     }
     if (threads_per_group == 0) threads_per_group = thread_width;
     if (threads_per_group > 256) threads_per_group = 256;
+    return threads_per_group;
+}
+
+static void ziggy_dispatch_rowwise(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count
+) {
+    NSUInteger threads_per_group = ziggy_rowwise_thread_count(pipeline);
 
     MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
     MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
@@ -179,15 +215,22 @@ static void ziggy_dispatch_rowwise(
 
 static int ziggy_commit_pending(
     ZiggyMetalState *state,
+    ZiggyMetalCommitStats *out_stats,
     char *error_message,
     size_t error_message_len
 ) {
     id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
-    if (command_buffer == nil) return ZIGGY_METAL_OK;
+    if (command_buffer == nil) {
+        if (out_stats != NULL) memset(out_stats, 0, sizeof(*out_stats));
+        return ZIGGY_METAL_OK;
+    }
 
+    const uint64_t wait_start_ns = ziggy_now_ns();
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
+    const uint64_t cpu_wait_ns = ziggy_now_ns() - wait_start_ns;
     state.pendingCommandBuffer = nil;
+    ziggy_fill_commit_stats(command_buffer, cpu_wait_ns, out_stats);
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
@@ -221,6 +264,47 @@ static int ziggy_run_compute(
     [encoder setComputePipelineState:pipeline];
     encode(encoder);
     ziggy_dispatch_standard(encoder, pipeline, grid_width);
+    [encoder endEncoding];
+
+    if (has_pending) return ZIGGY_METAL_OK;
+
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+    return ZIGGY_METAL_OK;
+}
+
+static int ziggy_run_single_threadgroup(
+    ZiggyMetalState *state,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger thread_count,
+    void (^encode)(id<MTLComputeCommandEncoder> encoder),
+    char *error_message,
+    size_t error_message_len
+) {
+    id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+    const bool has_pending = command_buffer != nil;
+    if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
+    if (command_buffer == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    [encoder setComputePipelineState:pipeline];
+    encode(encoder);
+    MTLSize grid_size = MTLSizeMake(1, 1, 1);
+    MTLSize group_size = MTLSizeMake(thread_count, 1, 1);
+    [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
     [encoder endEncoding];
 
     if (has_pending) return ZIGGY_METAL_OK;
@@ -385,6 +469,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k matvec pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> matvec_q6k_argmax_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_argmax_f32", &pipeline_error);
+        if (matvec_q6k_argmax_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k argmax pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
         id<MTLComputePipelineState> matvec_q6k_add_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_add_f32", &pipeline_error);
         if (matvec_q6k_add_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k add pipeline");
@@ -481,6 +570,16 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal argmax pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> topk_pipeline = ziggy_pipeline(device, library, @"topk_f32", &pipeline_error);
+        if (topk_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal top-k pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> sample_topk_pipeline = ziggy_pipeline(device, library, @"sample_topk_f32", &pipeline_error);
+        if (sample_topk_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal sample top-k pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         ZiggyMetalState *state = [ZiggyMetalState new];
         state.device = device;
@@ -494,6 +593,7 @@ int ziggy_metal_create_context(
         state.matvecQ4KAdd2048Pipeline = matvec_q4k_add_2048_pipeline;
         state.matvecQ4KAdd5632Pipeline = matvec_q4k_add_5632_pipeline;
         state.matvecQ6KPipeline = matvec_q6k_pipeline;
+        state.matvecQ6KArgmaxPipeline = matvec_q6k_argmax_pipeline;
         state.matvecQ6KAddPipeline = matvec_q6k_add_pipeline;
         state.matvecQ6KAdd2048Pipeline = matvec_q6k_add_2048_pipeline;
         state.matvecQ6KAdd5632Pipeline = matvec_q6k_add_5632_pipeline;
@@ -512,6 +612,8 @@ int ziggy_metal_create_context(
         state.addInPlacePipeline = add_in_place_pipeline;
         state.rmsNormPipeline = rms_norm_pipeline;
         state.argmaxPipeline = argmax_pipeline;
+        state.topKPipeline = topk_pipeline;
+        state.sampleTopKPipeline = sample_topk_pipeline;
         *out_ctx = (__bridge_retained void *)state;
 
         if (out_info != NULL) {
@@ -990,6 +1092,68 @@ int ziggy_metal_run_matvec_q6k_add_f32(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q6k add command buffer failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q6k_argmax_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_packed,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || output_packed == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q6k argmax request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output_packed);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
+        if (command_buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        if (input_buffer.length < ((size_t)cols * sizeof(float)) ||
+            output_buffer.length < sizeof(uint64_t)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal q6k argmax exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecQ6KArgmaxPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        ziggy_dispatch_q4k_rows(encoder, state.matvecQ6KArgmaxPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q6k argmax command buffer failed");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         return ZIGGY_METAL_OK;
@@ -1524,7 +1688,24 @@ int ziggy_metal_commit_sequence(
 
     @autoreleasepool {
         ZiggyMetalState *state = ziggy_state(ctx);
-        return ziggy_commit_pending(state, error_message, error_message_len);
+        return ziggy_commit_pending(state, NULL, error_message, error_message_len);
+    }
+}
+
+int ziggy_metal_commit_sequence_timed(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalCommitStats *out_stats,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sequence commit request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        return ziggy_commit_pending(state, out_stats, error_message, error_message_len);
     }
 }
 
@@ -1580,10 +1761,21 @@ int ziggy_metal_rms_norm_f32(
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(weights);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-        return ziggy_run_compute(
+        const NSUInteger thread_count = ziggy_rowwise_thread_count(state.rmsNormPipeline);
+        if (thread_count == 0 || thread_count > 256) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        if (input_buffer.length < ((size_t)count * sizeof(float)) ||
+            weights_buffer.length < ((size_t)count * sizeof(float)) ||
+            output_buffer.length < ((size_t)count * sizeof(float))) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+        return ziggy_run_single_threadgroup(
             state,
             state.rmsNormPipeline,
-            count,
+            thread_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:1];
@@ -1614,18 +1806,131 @@ int ziggy_metal_argmax_f32(
         ZiggyMetalState *state = ziggy_state(ctx);
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output_token);
+        const NSUInteger thread_width = state.argmaxPipeline.threadExecutionWidth;
+        const NSUInteger max_total_threads = state.argmaxPipeline.maxTotalThreadsPerThreadgroup;
+        uint32_t thread_count = 256;
+        if (thread_width > 0 && thread_count < thread_width) thread_count = (uint32_t)thread_width;
+        if (max_total_threads > 0 && thread_count > max_total_threads) thread_count = (uint32_t)max_total_threads;
+        if (thread_count == 0 || thread_count > 256) {
+            ziggy_write_error(error_message, error_message_len, @"Metal argmax threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
         if (input_buffer.length < ((size_t)count * sizeof(float)) || output_buffer.length < sizeof(uint32_t)) {
             ziggy_write_error(error_message, error_message_len, @"Metal argmax exceeded allocation");
             return ZIGGY_METAL_BUFFER_FAILED;
         }
-        return ziggy_run_compute(
+        return ziggy_run_single_threadgroup(
             state,
             state.argmaxPipeline,
-            1,
+            thread_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:output_buffer.buffer offset:0 atIndex:1];
                 [encoder setBytes:&count length:sizeof(count) atIndex:2];
+                [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:3];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_entries,
+    uint32_t count,
+    uint32_t top_k,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || input == NULL || output_entries == NULL || count == 0 || top_k == 0 || top_k > 64) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal top-k request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *entry_buffer = ziggy_buffer(output_entries);
+        const NSUInteger thread_width = state.topKPipeline.threadExecutionWidth;
+        const NSUInteger max_total_threads = state.topKPipeline.maxTotalThreadsPerThreadgroup;
+        uint32_t thread_count = 32;
+        if (thread_width > 0 && thread_count < thread_width) thread_count = (uint32_t)thread_width;
+        if (max_total_threads > 0 && thread_count > max_total_threads) thread_count = (uint32_t)max_total_threads;
+        if (thread_count == 0 || thread_count > 32) {
+            ziggy_write_error(error_message, error_message_len, @"Metal top-k threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        if (input_buffer.length < ((size_t)count * sizeof(float)) ||
+            entry_buffer.length < ((size_t)top_k * (sizeof(uint32_t) + sizeof(float)))) {
+            ziggy_write_error(error_message, error_message_len, @"Metal top-k exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        return ziggy_run_single_threadgroup(
+            state,
+            state.topKPipeline,
+            thread_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:entry_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:3];
+                [encoder setBytes:&top_k length:sizeof(top_k) atIndex:4];
+                [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:5];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_sample_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_token,
+    uint32_t count,
+    uint32_t top_k,
+    float temperature,
+    float random_uniform,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || input == NULL || output_token == NULL || count == 0 || top_k == 0 || top_k > 64 || !(temperature > 0.0f)) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sample top-k request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *token_buffer = ziggy_buffer(output_token);
+        const NSUInteger thread_width = state.sampleTopKPipeline.threadExecutionWidth;
+        const NSUInteger max_total_threads = state.sampleTopKPipeline.maxTotalThreadsPerThreadgroup;
+        uint32_t thread_count = 32;
+        if (thread_width > 0 && thread_count < thread_width) thread_count = (uint32_t)thread_width;
+        if (max_total_threads > 0 && thread_count > max_total_threads) thread_count = (uint32_t)max_total_threads;
+        if (thread_count == 0 || thread_count > 32) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sample top-k threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        if (input_buffer.length < ((size_t)count * sizeof(float)) || token_buffer.length < sizeof(uint32_t)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sample top-k exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        return ziggy_run_single_threadgroup(
+            state,
+            state.sampleTopKPipeline,
+            thread_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:token_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:3];
+                [encoder setBytes:&top_k length:sizeof(top_k) atIndex:4];
+                [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:5];
+                [encoder setBytes:&temperature length:sizeof(temperature) atIndex:6];
+                [encoder setBytes:&random_uniform length:sizeof(random_uniform) atIndex:7];
             },
             error_message,
             error_message_len

@@ -79,6 +79,9 @@ pub fn generate(
         .seed = options.seed,
         .temperature = options.temperature,
         .backend = llama_report.backend,
+        .sampling_strategy = llama_report.sampling_strategy,
+        .sampling_path = llama_report.sampling_path,
+        .readback_mode = llama_report.readback_mode,
         .startup_breakdown = llama_report.startup_breakdown,
         .metal_profile_summary = combined_profile_summary,
     };
