@@ -806,6 +806,58 @@ test "metal rope-to-dst writes rotated kv slice directly" {
     }
 }
 
+test "metal rope at offset rotates kv slice in place" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 6;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+
+    var expected = [_]f32{-9.0} ** (dst_prefix + head_count * head_dim + 3);
+    var actual = expected;
+    for (actual[dst_prefix .. dst_prefix + head_count * head_dim], 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index)) - 7)) * 0.125) + 0.05;
+    }
+    @memcpy(expected[dst_prefix .. dst_prefix + head_count * head_dim], actual[dst_prefix .. dst_prefix + head_count * head_dim]);
+    applyRoPEReference(
+        expected[dst_prefix .. dst_prefix + head_count * head_dim],
+        expected[dst_prefix .. dst_prefix + head_count * head_dim],
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+    );
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const buffer = try metal_backend.createScratchBuffer(backend, actual.len);
+    defer metal_backend.destroyBuffer(buffer);
+
+    try metal_backend.writeBufferF32(buffer, &actual);
+    try metal_backend.applyRoPEAtOffset(
+        backend,
+        buffer,
+        dst_prefix * @sizeOf(f32),
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+    );
+    try metal_backend.readBufferF32(buffer, &actual);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.0005);
+    }
+}
+
 test "metal argmax returns best token index" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);

@@ -1454,6 +1454,32 @@ int ziggy_metal_apply_rope_f32(
     char *error_message,
     size_t error_message_len
 ) {
+    return ziggy_metal_apply_rope_at_offset_f32(
+        ctx,
+        vector,
+        0,
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+        error_message,
+        error_message_len
+    );
+}
+
+int ziggy_metal_apply_rope_at_offset_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *vector,
+    size_t vector_offset_bytes,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    char *error_message,
+    size_t error_message_len
+) {
     if (ctx == NULL || vector == NULL || head_count == 0 || head_dim == 0) {
         ziggy_write_error(error_message, error_message_len, @"invalid Metal rope request");
         return ZIGGY_METAL_EXECUTION_FAILED;
@@ -1465,17 +1491,25 @@ int ziggy_metal_apply_rope_f32(
     @autoreleasepool {
         ZiggyMetalState *state = ziggy_state(ctx);
         ZiggyMetalBufferState *buffer = ziggy_buffer(vector);
+        const size_t element_count = (size_t)head_count * (size_t)head_dim;
+        const size_t byte_count = element_count * sizeof(float);
+        if (byte_count == 0 || vector_offset_bytes + byte_count > buffer.length) {
+            ziggy_write_error(error_message, error_message_len, @"Metal rope exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+        const uint32_t vector_base = (uint32_t)(vector_offset_bytes / sizeof(float));
         return ziggy_run_compute(
             state,
             state.ropePipeline,
             head_count * pair_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:buffer.buffer offset:0 atIndex:0];
-                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:1];
-                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:2];
-                [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:3];
-                [encoder setBytes:&position length:sizeof(position) atIndex:4];
-                [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:5];
+                [encoder setBytes:&vector_base length:sizeof(vector_base) atIndex:1];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:2];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:3];
+                [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:4];
+                [encoder setBytes:&position length:sizeof(position) atIndex:5];
+                [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:6];
             },
             error_message,
             error_message_len

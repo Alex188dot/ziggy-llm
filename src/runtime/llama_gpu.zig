@@ -70,8 +70,6 @@ pub const Session = struct {
     hidden: metal_backend.BufferHandle,
     normed: metal_backend.BufferHandle,
     q: metal_backend.BufferHandle,
-    k: metal_backend.BufferHandle,
-    v: metal_backend.BufferHandle,
     attn: metal_backend.BufferHandle,
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
@@ -98,10 +96,6 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(normed);
         const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
-        const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
-        errdefer metal_backend.destroyBuffer(k);
-        const v = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
-        errdefer metal_backend.destroyBuffer(v);
         const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(attn);
         const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
@@ -128,8 +122,6 @@ pub const Session = struct {
             .hidden = hidden,
             .normed = normed,
             .q = q,
-            .k = k,
-            .v = v,
             .attn = attn,
             .gate = gate,
             .up = up,
@@ -147,8 +139,6 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.hidden);
         metal_backend.destroyBuffer(self.normed);
         metal_backend.destroyBuffer(self.q);
-        metal_backend.destroyBuffer(self.k);
-        metal_backend.destroyBuffer(self.v);
         metal_backend.destroyBuffer(self.attn);
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
@@ -174,8 +164,6 @@ pub const Session = struct {
     ) !void {
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
         try self.runProjection(layer.attn_q, self.normed, self.q);
-        try self.runProjection(layer.attn_k, self.normed, self.k);
-        try self.runProjection(layer.attn_v, self.normed, self.v);
 
         const q_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
@@ -197,9 +185,9 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
         const kv_k_start = std.time.nanoTimestamp();
-        try metal_backend.applyRoPEToDst(
+        try self.runProjectionToDst(layer.attn_k, self.normed, self.k_cache, kv_offset);
+        try metal_backend.applyRoPEAtOffset(
             self.backend,
-            self.k,
             self.k_cache,
             kv_offset,
             self.model.head_count_kv,

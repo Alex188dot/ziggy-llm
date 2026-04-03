@@ -754,6 +754,33 @@ pub fn applyRoPE(
     ), &error_buf);
 }
 
+pub fn applyRoPEAtOffset(
+    backend: backend_api.MatVecBackend,
+    vector: BufferHandle,
+    vector_offset_bytes: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_apply_rope_at_offset_f32(
+        state.context,
+        vector.raw,
+        vector_offset_bytes,
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn applyRoPEToDst(
     backend: backend_api.MatVecBackend,
     src: BufferHandle,
