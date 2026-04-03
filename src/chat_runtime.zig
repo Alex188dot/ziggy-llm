@@ -80,7 +80,8 @@ fn handleUserTurn(
     try prompt_builder.appendMessage(allocator, messages, .assistant, trimmed);
     try stream_state.flushFinal(trimmed);
 
-    try writer.print("\n\n", .{});
+    try printTurnTimings(writer, &report);
+    try writer.print("\n", .{});
 }
 
 fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOptions {
@@ -142,4 +143,49 @@ fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
     const state: *StreamState = @ptrCast(@alignCast(ctx.?));
     try state.buffer.appendSlice(state.allocator, chunk);
     try state.flushSafePrefix();
+}
+
+fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationReport) !void {
+    try writer.print(
+        \\
+        \\chat_turn_metrics:
+        \\prompt_tokens: {d}
+        \\reused_prompt_tokens: {d}
+        \\prompt_ms: {d:.3}
+        \\ttft_ms: {d:.3}
+        \\
+    ,
+        .{
+            report.prompt_token_count,
+            report.reused_prompt_token_count,
+            runtime.nsToMs(report.prompt_ns),
+            runtime.nsToMs(report.ttft_ns),
+        },
+    );
+
+    if (report.startup_breakdown.model_load_ns != 0 or
+        report.startup_breakdown.tensor_prepare_ns != 0 or
+        report.startup_breakdown.backend_init_ns != 0 or
+        report.startup_breakdown.metal_prewarm_ns != 0 or
+        report.startup_breakdown.session_init_ns != 0)
+    {
+        try writer.print(
+            \\startup_ms: {d:.3}
+            \\startup.model_load_ms: {d:.3}
+            \\startup.tensor_prepare_ms: {d:.3}
+            \\startup.backend_init_ms: {d:.3}
+            \\startup.metal_prewarm_ms: {d:.3}
+            \\startup.session_init_ms: {d:.3}
+            \\
+        ,
+            .{
+                runtime.nsToMs(report.startup_ns),
+                runtime.nsToMs(report.startup_breakdown.model_load_ns),
+                runtime.nsToMs(report.startup_breakdown.tensor_prepare_ns),
+                runtime.nsToMs(report.startup_breakdown.backend_init_ns),
+                runtime.nsToMs(report.startup_breakdown.metal_prewarm_ns),
+                runtime.nsToMs(report.startup_breakdown.session_init_ns),
+            },
+        );
+    }
 }
