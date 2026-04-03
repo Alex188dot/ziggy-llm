@@ -92,6 +92,7 @@ fn generationOptions(config: cli.Config) runtime.GenerationOptions {
         .min_p = config.min_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
+        .sampling_strategy = config.sampling_strategy,
     };
 }
 

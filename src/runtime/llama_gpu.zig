@@ -263,6 +263,10 @@ pub const Session = struct {
         });
     }
 
+    pub fn commitToken(self: *Session) !void {
+        try metal_backend.commitSequence(self.backend);
+    }
+
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);

@@ -165,6 +165,7 @@ fn mergeOptions(config: cli.Config, payload: anytype) runtime.GenerationOptions 
         .min_p = payload.min_p orelse config.min_p,
         .backend = config.backend,
         .metal_profile = config.metal_profile,
+        .sampling_strategy = config.sampling_strategy,
     };
 }
 

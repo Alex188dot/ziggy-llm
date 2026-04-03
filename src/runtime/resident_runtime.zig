@@ -153,6 +153,9 @@ pub const ResidentRuntime = struct {
             .seed = options.seed,
             .temperature = options.temperature,
             .backend = report.backend,
+            .sampling_strategy = report.sampling_strategy,
+            .sampling_path = report.sampling_path,
+            .readback_mode = report.readback_mode,
             .startup_breakdown = report.startup_breakdown,
             .metal_profile_summary = combined_profile_summary,
         };

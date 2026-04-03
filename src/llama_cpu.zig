@@ -36,6 +36,9 @@ pub const GenerateReport = struct {
     ttft_ns: u64,
     decode_ns: u64,
     backend: runtime_types.BackendUsed,
+    sampling_strategy: runtime_types.SamplingStrategy = .auto,
+    sampling_path: runtime_types.EffectiveSamplingPath = .cpu_logits,
+    readback_mode: runtime_types.ReadbackMode = .none,
     startup_breakdown: runtime_types.StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
@@ -446,6 +449,7 @@ pub const ReusableSession = struct {
 
     pub fn reset(self: *ReusableSession) void {
         self.session.position = 0;
+        self.session.pending_greedy_token = null;
     }
 };
 
@@ -465,6 +469,7 @@ const Session = struct {
     gate: []f32,
     up: []f32,
     logits: []f32,
+    pending_greedy_token: ?u32 = null,
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
@@ -544,9 +549,19 @@ const Session = struct {
         self.* = undefined;
     }
 
-    fn runPrompt(self: *Session, prompt_tokens: []const u32) !void {
+    fn runPrompt(self: *Session, prompt_tokens: []const u32, sampling_path: runtime_types.EffectiveSamplingPath) !void {
         if (prompt_tokens.len == 0) return error.EmptyPrompt;
-        for (prompt_tokens) |token_id| _ = try self.step(token_id);
+        if (prompt_tokens.len > 1) {
+            for (prompt_tokens[0 .. prompt_tokens.len - 1]) |token_id| {
+                try self.stepNoOutput(token_id);
+            }
+        }
+
+        const last_token = prompt_tokens[prompt_tokens.len - 1];
+        switch (sampling_path) {
+            .gpu_greedy_argmax => _ = try self.stepGreedy(last_token),
+            .cpu_logits => _ = try self.step(last_token),
+        }
     }
 
     fn stepGreedy(self: *Session, token_id: u32) !u32 {
@@ -554,24 +569,39 @@ const Session = struct {
             _ = try self.step(token_id);
             return argmax(self.logits);
         }
-        if (self.position >= self.model.context_length) return error.ContextOverflow;
-        try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
-
-        for (self.model.layers, 0..) |layer, layer_index| {
-            const gpu_session = &self.gpu_session.?;
-            if (layer_index == 0) try gpu_session.beginToken(self.hidden);
-            try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
-            try gpu_session.runFfnBlock(adaptLayerDesc(layer));
-        }
-
+        try self.runTokenCore(token_id);
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
-        self.token_buffer[self.position] = token_id;
-        self.position += 1;
+        self.pending_greedy_token = next_token;
+        self.finishToken(token_id);
         return next_token;
     }
 
+    fn stepNoOutput(self: *Session, token_id: u32) !void {
+        try self.runTokenCore(token_id);
+        if (self.gpu_session) |*gpu_session| {
+            try gpu_session.commitToken();
+        }
+        self.pending_greedy_token = null;
+        self.finishToken(token_id);
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
+        try self.runTokenCore(token_id);
+        self.pending_greedy_token = null;
+        if (self.gpu_session) |*gpu_session| {
+            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+        } else {
+            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
+            try self.recordCalibration(self.model.output, .output, self.normed);
+            try self.matVec(self.logits, self.model.output, self.normed);
+        }
+
+        self.finishToken(token_id);
+        return self.logits;
+    }
+
+    fn runTokenCore(self: *Session, token_id: u32) !void {
         if (self.position >= self.model.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
@@ -612,18 +642,11 @@ const Session = struct {
             }
             addInPlace(self.hidden, self.attn_tmp);
         }
+    }
 
-        if (self.gpu_session) |*gpu_session| {
-            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
-        } else {
-            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-            try self.recordCalibration(self.model.output, .output, self.normed);
-            try self.matVec(self.logits, self.model.output, self.normed);
-        }
-
+    fn finishToken(self: *Session, token_id: u32) void {
         self.token_buffer[self.position] = token_id;
         self.position += 1;
-        return self.logits;
     }
 
     fn recordCalibration(self: *Session, tensor: TensorRef, role: moon_quant_calibration.Role, input: []const f32) !void {
@@ -941,10 +964,12 @@ pub fn generateLoadedStreaming(
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
+    const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
+    const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, session.token_buffer);
-    try session.runPrompt(session.token_buffer[0..prompt_token_count]);
+    try session.runPrompt(session.token_buffer[0..prompt_token_count], sampling_path);
     const prompt_end = std.time.nanoTimestamp();
 
     var output = std.ArrayList(u8).empty;
@@ -954,8 +979,8 @@ pub fn generateLoadedStreaming(
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
-    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
-    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
+    const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -1004,7 +1029,10 @@ pub fn generateLoadedStreaming(
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
-        .backend = if (backend == null) .cpu else .metal,
+        .backend = backend_used,
+        .sampling_strategy = options.sampling_strategy,
+        .sampling_path = sampling_path,
+        .readback_mode = runtime_types.readbackModeFor(backend_used, sampling_path),
         .startup_breakdown = .{
             .session_init_ns = session_init_ns,
             .first_decode_step_ns = first_decode_step_ns,
@@ -1056,7 +1084,8 @@ pub fn generateLoadedStreamingCached(
     }
 
     if (session.position < prompt_token_count) {
-        try session.runPrompt(prompt_tokens[session.position..prompt_token_count]);
+        const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
+        try session.runPrompt(prompt_tokens[session.position..prompt_token_count], sampling_path);
     }
     const prompt_end = std.time.nanoTimestamp();
 
@@ -1067,8 +1096,10 @@ pub fn generateLoadedStreamingCached(
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
-    const gpu_greedy = session.gpu_session != null and options.temperature <= 0;
-    var greedy_next_token: ?u32 = if (gpu_greedy) argmax(session.logits) else null;
+    const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
+    const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
+    const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -1117,7 +1148,10 @@ pub fn generateLoadedStreamingCached(
         .prompt_ns = deltaNs(prompt_begin, prompt_end),
         .ttft_ns = ttft_ns,
         .decode_ns = deltaNs(decode_begin, decode_end),
-        .backend = if (backend == null) .cpu else .metal,
+        .backend = backend_used,
+        .sampling_strategy = options.sampling_strategy,
+        .sampling_path = sampling_path,
+        .readback_mode = runtime_types.readbackModeFor(backend_used, sampling_path),
         .startup_breakdown = .{
             .session_init_ns = 0,
             .first_decode_step_ns = first_decode_step_ns,
@@ -1139,7 +1173,7 @@ pub const CalibrationSession = struct {
     }
 
     pub fn runPrompt(self: *CalibrationSession, prompt_tokens: []const u32) !void {
-        try self.session.runPrompt(prompt_tokens);
+        try self.session.runPrompt(prompt_tokens, .cpu_logits);
     }
 };
 

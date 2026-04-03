@@ -14,6 +14,9 @@ pub const RuntimeError = types.RuntimeError;
 pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;
 pub const MoonQuantMode = types.MoonQuantMode;
+pub const SamplingStrategy = types.SamplingStrategy;
+pub const EffectiveSamplingPath = types.EffectiveSamplingPath;
+pub const ReadbackMode = types.ReadbackMode;
 pub const GenerationOptions = types.GenerationOptions;
 pub const GenerationReport = types.GenerationReport;
 pub const BenchSummary = bench_runner.BenchSummary;
@@ -55,6 +58,9 @@ pub fn runCommand(
         \\top_k: {d}
         \\top_p: {d:.3}
         \\min_p: {d:.3}
+        \\sampling_strategy: {s}
+        \\sampling_path: {s}
+        \\readback_mode: {s}
         \\startup_ms: {d:.3}
         \\startup.model_load_ms: {d:.3}
         \\startup.tensor_prepare_ms: {d:.3}
@@ -79,6 +85,9 @@ pub fn runCommand(
             options.top_k,
             options.top_p,
             options.min_p,
+            report.sampling_strategy.label(),
+            report.sampling_path.label(),
+            report.readback_mode.label(),
             nsToMs(report.startup_ns),
             nsToMs(report.startup_breakdown.model_load_ns),
             nsToMs(report.startup_breakdown.tensor_prepare_ns),
@@ -111,6 +120,9 @@ pub fn benchCommand(
 
         try writer.print(
             \\backend={s}
+            \\sampling_strategy={s}
+            \\sampling_path={s}
+            \\readback_mode={s}
             \\bench_runs={d}
             \\cold.startup_ms={d:.3}
             \\cold.startup.model_load_ms={d:.3}
@@ -126,6 +138,31 @@ pub fn benchCommand(
             \\cold.generated_tokens={d}
             \\cold.tps={d:.3}
             \\cold.decode_tok_s={d:.3}
+            \\
+        ,
+            .{
+                summary.cold.backend.label(),
+                summary.cold.sampling_strategy.label(),
+                summary.cold.sampling_path.label(),
+                summary.cold.readback_mode.label(),
+                bench_runs,
+                nsToMs(summary.cold.startup_ns),
+                nsToMs(summary.cold.startup_breakdown.model_load_ns),
+                nsToMs(summary.cold.startup_breakdown.tensor_prepare_ns),
+                nsToMs(summary.cold.startup_breakdown.backend_init_ns),
+                nsToMs(summary.cold.startup_breakdown.metal_prewarm_ns),
+                nsToMs(summary.cold.startup_breakdown.session_init_ns),
+                nsToMs(summary.cold.prompt_ns),
+                nsToMs(summary.cold.ttft_ns),
+                nsToMs(summary.cold.startup_breakdown.first_decode_step_ns),
+                nsToMs(summary.cold.decode_ns),
+                summary.cold.prompt_token_count,
+                summary.cold.generated_token_count,
+                summary.cold.decodeTokensPerSecond(),
+                summary.cold.decodeTokensPerSecond(),
+            },
+        );
+        try writer.print(
             \\warm.runs={d}
             \\warm.startup_ms_avg={d:.3}
             \\warm.startup.model_load_ms_avg={d:.3}
@@ -144,22 +181,6 @@ pub fn benchCommand(
             \\
         ,
             .{
-                summary.cold.backend.label(),
-                bench_runs,
-                nsToMs(summary.cold.startup_ns),
-                nsToMs(summary.cold.startup_breakdown.model_load_ns),
-                nsToMs(summary.cold.startup_breakdown.tensor_prepare_ns),
-                nsToMs(summary.cold.startup_breakdown.backend_init_ns),
-                nsToMs(summary.cold.startup_breakdown.metal_prewarm_ns),
-                nsToMs(summary.cold.startup_breakdown.session_init_ns),
-                nsToMs(summary.cold.prompt_ns),
-                nsToMs(summary.cold.ttft_ns),
-                nsToMs(summary.cold.startup_breakdown.first_decode_step_ns),
-                nsToMs(summary.cold.decode_ns),
-                summary.cold.prompt_token_count,
-                summary.cold.generated_token_count,
-                summary.cold.decodeTokensPerSecond(),
-                summary.cold.decodeTokensPerSecond(),
                 summary.warm_runs,
                 nsToMs(summary.warm_startup_ns_avg),
                 nsToMs(summary.warm_startup_breakdown_avg.model_load_ns),
@@ -188,6 +209,9 @@ pub fn benchCommand(
 
     try writer.print(
         \\backend={s}
+        \\sampling_strategy={s}
+        \\sampling_path={s}
+        \\readback_mode={s}
         \\repeat_penalty={d:.3}
         \\top_k={d}
         \\top_p={d:.3}
@@ -210,6 +234,9 @@ pub fn benchCommand(
     ,
         .{
             report.backend.label(),
+            report.sampling_strategy.label(),
+            report.sampling_path.label(),
+            report.readback_mode.label(),
             options.repeat_penalty,
             options.top_k,
             options.top_p,

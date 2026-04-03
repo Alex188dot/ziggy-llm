@@ -86,6 +86,53 @@ pub const MoonQuantMode = enum {
     }
 };
 
+pub const SamplingStrategy = enum {
+    auto,
+    gpu_greedy,
+    cpu_full_logits,
+
+    pub fn parse(name: []const u8) ?SamplingStrategy {
+        if (std.mem.eql(u8, name, "auto")) return .auto;
+        if (std.mem.eql(u8, name, "gpu-greedy")) return .gpu_greedy;
+        if (std.mem.eql(u8, name, "cpu-full-logits")) return .cpu_full_logits;
+        return null;
+    }
+
+    pub fn label(self: SamplingStrategy) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .gpu_greedy => "gpu-greedy",
+            .cpu_full_logits => "cpu-full-logits",
+        };
+    }
+};
+
+pub const EffectiveSamplingPath = enum {
+    cpu_logits,
+    gpu_greedy_argmax,
+
+    pub fn label(self: EffectiveSamplingPath) []const u8 {
+        return switch (self) {
+            .cpu_logits => "cpu-logits",
+            .gpu_greedy_argmax => "gpu-greedy-argmax",
+        };
+    }
+};
+
+pub const ReadbackMode = enum {
+    none,
+    full_logits_f32,
+    sampled_token_u32,
+
+    pub fn label(self: ReadbackMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .full_logits_f32 => "full-logits-f32",
+            .sampled_token_u32 => "sampled-token-u32",
+        };
+    }
+};
+
 pub const GenerationOptions = struct {
     max_tokens: usize = 16,
     seed: u64 = 0,
@@ -97,6 +144,7 @@ pub const GenerationOptions = struct {
     backend: BackendPreference = .auto,
     moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
+    sampling_strategy: SamplingStrategy = .auto,
 };
 
 pub const StartupBreakdown = struct {
@@ -120,6 +168,9 @@ pub const GenerationReport = struct {
     seed: u64,
     temperature: f32,
     backend: BackendUsed,
+    sampling_strategy: SamplingStrategy = .auto,
+    sampling_path: EffectiveSamplingPath = .cpu_logits,
+    readback_mode: ReadbackMode = .none,
     startup_breakdown: StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
@@ -141,4 +192,35 @@ pub fn deltaNs(start: i128, end: i128) u64 {
 
 pub fn nsToMs(value: u64) f64 {
     return @as(f64, @floatFromInt(value)) / std.time.ns_per_ms;
+}
+
+pub fn resolveSamplingPath(has_gpu_session: bool, temperature: f32, strategy: SamplingStrategy) EffectiveSamplingPath {
+    if (!has_gpu_session) return .cpu_logits;
+    if (temperature > 0) return .cpu_logits;
+    return switch (strategy) {
+        .auto, .gpu_greedy => .gpu_greedy_argmax,
+        .cpu_full_logits => .cpu_logits,
+    };
+}
+
+pub fn readbackModeFor(backend: BackendUsed, sampling_path: EffectiveSamplingPath) ReadbackMode {
+    if (backend != .metal) return .none;
+    return switch (sampling_path) {
+        .cpu_logits => .full_logits_f32,
+        .gpu_greedy_argmax => .sampled_token_u32,
+    };
+}
+
+test "sampling strategy parser accepts benchmark path values" {
+    try std.testing.expectEqual(SamplingStrategy.auto, SamplingStrategy.parse("auto").?);
+    try std.testing.expectEqual(SamplingStrategy.gpu_greedy, SamplingStrategy.parse("gpu-greedy").?);
+    try std.testing.expectEqual(SamplingStrategy.cpu_full_logits, SamplingStrategy.parse("cpu-full-logits").?);
+    try std.testing.expect(SamplingStrategy.parse("bogus") == null);
+}
+
+test "resolveSamplingPath keeps stochastic and cpu backends on cpu logits" {
+    try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(false, 0, .auto));
+    try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(true, 0.8, .gpu_greedy));
+    try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(true, 0, .cpu_full_logits));
+    try std.testing.expectEqual(EffectiveSamplingPath.gpu_greedy_argmax, resolveSamplingPath(true, 0, .auto));
 }

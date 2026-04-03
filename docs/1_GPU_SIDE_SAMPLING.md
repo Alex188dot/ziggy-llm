@@ -224,13 +224,49 @@ The first success condition is:
 - the gain is measurable
 - the new path is stable and reproducible
 
+## Current Isolation Harness
+
+The repo now has an explicit benchmark switch to isolate the two current `temperature <= 0` Metal decode paths:
+
+- `--sampling-path gpu-greedy` keeps the existing GPU argmax fast path active
+- `--sampling-path cpu-full-logits` forces the Metal decode path to read back full logits and sample on CPU even for greedy decode
+
+Canonical isolation commands:
+
+```sh
+zig build run -- bench -m /path/to/model.gguf -p "a" --backend metal --temperature 0 --max-tokens 128 --bench-runs 6 --sampling-path gpu-greedy --metal-profile
+zig build run -- bench -m /path/to/model.gguf -p "a" --backend metal --temperature 0 --max-tokens 128 --bench-runs 6 --sampling-path cpu-full-logits --metal-profile
+```
+
+Benchmark output now prints:
+
+- `sampling_strategy`
+- `sampling_path`
+- `readback_mode`
+
+That makes the greedy A/B comparison explicit in both normal bench output and profiled runs.
+
+For Metal profiling, the distinction is visible in two places:
+
+- `readback_mode=sampled-token-u32` versus `readback_mode=full-logits-f32`
+- `profile.shape_*` entries for `readback`, where greedy GPU argmax shows `cols=1` and full-logits mode shows `cols=vocab_size`
+
+## Implementation Notes
+
+The current code now makes the greedy fast path explicit instead of implicit:
+
+- `temperature <= 0` still defaults to GPU greedy argmax when a Metal session is active
+- the old full-logits path can be forced only for benchmarking and validation with `--sampling-path cpu-full-logits`
+- greedy prompt ingestion no longer reads back full logits for every prompt token
+- prompt prefix tokens now advance with no output readback, and the final prompt token uses GPU argmax on the fast path
+
 ## Checklist
 
 - [ ] Document the current baseline for greedy decode and non-greedy decode on TinyLlama `1.1B`.
 - [ ] Confirm from profiling output how much time is currently spent in `readback` and `cpu_sampling`.
-- [ ] Make GPU greedy sampling the explicit default fast path for `temperature <= 0`.
-- [ ] Verify the greedy Metal path reads back only one token id, not the full logits vector.
-- [ ] Add benchmark output that clearly distinguishes full-logits readback from tiny-token readback.
+- [x] Make GPU greedy sampling the explicit default fast path for `temperature <= 0`.
+- [x] Verify the greedy Metal path reads back only one token id, not the full logits vector.
+- [x] Add benchmark output that clearly distinguishes full-logits readback from tiny-token readback.
 - [ ] Add a Metal backend API for shortlist extraction rather than full-logits readback.
 - [ ] Implement a first fixed-size GPU `top-k` or shortlist kernel in [`src/runtime/metal/matvec.metal`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/matvec.metal).
 - [ ] Add the Objective-C bridge plumbing in [`src/runtime/metal/bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) and [`src/runtime/metal/bridge.h`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.h).
