@@ -110,6 +110,7 @@ const StreamState = struct {
     writer: *std.Io.Writer,
     buffer: std.ArrayList(u8) = .empty,
     emitted_len: usize = 0,
+    stopped: bool = false,
 
     fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) StreamState {
         return .{
@@ -143,6 +144,10 @@ fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
     const state: *StreamState = @ptrCast(@alignCast(ctx.?));
     try state.buffer.appendSlice(state.allocator, chunk);
     try state.flushSafePrefix();
+    if (prompt_builder.hasCompletedAssistantReply(state.buffer.items)) {
+        state.stopped = true;
+        return error.StopStreaming;
+    }
 }
 
 fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationReport) !void {
@@ -153,6 +158,7 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
         \\reused_prompt_tokens: {d}
         \\prompt_ms: {d:.3}
         \\ttft_ms: {d:.3}
+        \\tps: {d:.3}
         \\
     ,
         .{
@@ -160,6 +166,7 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
             report.reused_prompt_token_count,
             runtime.nsToMs(report.prompt_ns),
             runtime.nsToMs(report.ttft_ns),
+            report.decodeTokensPerSecond(),
         },
     );
 

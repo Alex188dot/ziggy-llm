@@ -1087,7 +1087,14 @@ pub fn generateLoadedStreaming(
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
             const chunk = output.items[chunk_start..];
-            if (chunk.len > 0) try callback(stream_ctx, chunk);
+            if (chunk.len > 0) callback(stream_ctx, chunk) catch |err| switch (err) {
+                error.StopStreaming => {
+                    profiler.endDecodeToken();
+                    generated_token_count += 1;
+                    break;
+                },
+                else => return err,
+            };
         }
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
@@ -1239,7 +1246,14 @@ pub fn generateLoadedStreamingCached(
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
             const chunk = output.items[chunk_start..];
-            if (chunk.len > 0) try callback(stream_ctx, chunk);
+            if (chunk.len > 0) callback(stream_ctx, chunk) catch |err| switch (err) {
+                error.StopStreaming => {
+                    profiler.endDecodeToken();
+                    generated_token_count += 1;
+                    break;
+                },
+                else => return err,
+            };
         }
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());

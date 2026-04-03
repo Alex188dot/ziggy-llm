@@ -107,6 +107,21 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
     return std.mem.trim(u8, reply[0..end], " \n\r\t");
 }
 
+pub fn hasCompletedAssistantReply(reply: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    var offset: usize = 0;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (offset > 0 and isDialogueBoundary(trimmed)) return true;
+        offset += line.len + 1;
+    }
+
+    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|" }) |marker| {
+        if (std.mem.indexOf(u8, reply, marker) != null) return true;
+    }
+    return false;
+}
+
 fn isDialogueBoundary(line: []const u8) bool {
     if (line.len == 0) return false;
 
