@@ -347,8 +347,7 @@ int ziggy_metal_argmax_f32(
 int ziggy_metal_topk_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
-    ZiggyMetalBuffer *output_tokens,
-    ZiggyMetalBuffer *output_scores,
+    ZiggyMetalBuffer *output_entries,
     uint32_t count,
     uint32_t top_k,
     char *error_message,

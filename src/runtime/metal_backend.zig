@@ -20,6 +20,11 @@ pub const BufferHandle = if (build_enabled_value) struct {
     byte_len: usize,
 } else struct {};
 
+pub const ShortlistEntry = extern struct {
+    token_id: u32,
+    score: f32,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -198,6 +203,16 @@ pub fn createScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) 
     return .{
         .raw = raw,
         .byte_len = elements * @sizeOf(f32),
+    };
+}
+
+pub fn createByteScratchBuffer(backend: backend_api.MatVecBackend, byte_len: usize) !BufferHandle {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const raw = try createEmptyBuffer(state.context, byte_len);
+    return .{
+        .raw = raw,
+        .byte_len = byte_len,
     };
 }
 
@@ -829,8 +844,7 @@ pub fn argmax(
 pub fn topKShortlist(
     backend: backend_api.MatVecBackend,
     input: BufferHandle,
-    output_tokens: BufferHandle,
-    output_scores: BufferHandle,
+    output_entries: BufferHandle,
     count: usize,
     top_k: usize,
 ) !void {
@@ -841,13 +855,18 @@ pub fn topKShortlist(
     try mapStatus(c.ziggy_metal_topk_f32(
         state.context,
         input.raw,
-        output_tokens.raw,
-        output_scores.raw,
+        output_entries.raw,
         @intCast(count),
         @intCast(top_k),
         &error_buf,
         error_buf.len,
     ), &error_buf);
+}
+
+pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;
+    try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
 }
 
 fn metalMatVec(

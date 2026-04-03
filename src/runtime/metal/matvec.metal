@@ -822,10 +822,14 @@ kernel void argmax_f32(
 constant uint ZIGGY_SHORTLIST_MAX_K = 64;
 constant uint ZIGGY_SHORTLIST_THREAD_COUNT = 32;
 
+struct ZiggyShortlistEntry {
+    uint token_id;
+    float score;
+};
+
 kernel void topk_f32(
     device const float *input [[buffer(0)]],
-    device uint *output_tokens [[buffer(1)]],
-    device float *output_scores [[buffer(2)]],
+    device ZiggyShortlistEntry *output_entries [[buffer(1)]],
     constant uint &count [[buffer(3)]],
     constant uint &top_k [[buffer(4)]],
     constant uint &thread_count [[buffer(5)]],
@@ -903,7 +907,7 @@ kernel void topk_f32(
     }
 
     for (uint i = 0; i < top_k; i += 1) {
-        output_tokens[i] = best_indices[i];
-        output_scores[i] = best_values[i];
+        output_entries[i].token_id = best_indices[i];
+        output_entries[i].score = best_values[i];
     }
 }

@@ -77,8 +77,7 @@ pub const Session = struct {
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
     sampled_token: metal_backend.BufferHandle,
-    shortlist_tokens: metal_backend.BufferHandle,
-    shortlist_scores: metal_backend.BufferHandle,
+    shortlist_entries: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
@@ -112,10 +111,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(tmp);
         const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(sampled_token);
-        const shortlist_tokens = try metal_backend.createScratchBuffer(backend, max_shortlist_len);
-        errdefer metal_backend.destroyBuffer(shortlist_tokens);
-        const shortlist_scores = try metal_backend.createScratchBuffer(backend, max_shortlist_len);
-        errdefer metal_backend.destroyBuffer(shortlist_scores);
+        const shortlist_entries = try metal_backend.createByteScratchBuffer(backend, max_shortlist_len * @sizeOf(metal_backend.ShortlistEntry));
+        errdefer metal_backend.destroyBuffer(shortlist_entries);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -135,8 +132,7 @@ pub const Session = struct {
             .up = up,
             .tmp = tmp,
             .sampled_token = sampled_token,
-            .shortlist_tokens = shortlist_tokens,
-            .shortlist_scores = shortlist_scores,
+            .shortlist_entries = shortlist_entries,
             .k_cache = k_cache,
             .v_cache = v_cache,
             .profiler = profiler,
@@ -154,8 +150,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
         metal_backend.destroyBuffer(self.sampled_token);
-        metal_backend.destroyBuffer(self.shortlist_tokens);
-        metal_backend.destroyBuffer(self.shortlist_scores);
+        metal_backend.destroyBuffer(self.shortlist_entries);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
         self.* = undefined;
@@ -316,21 +311,18 @@ pub const Session = struct {
         try metal_backend.topKShortlist(
             self.backend,
             self.tmp,
-            self.shortlist_tokens,
-            self.shortlist_scores,
+            self.shortlist_entries,
             self.model.vocab_size,
             shortlist_len,
         );
         try metal_backend.commitSequence(self.backend);
 
-        var token_ids: [max_shortlist_len]u32 = [_]u32{0} ** max_shortlist_len;
-        var scores: [max_shortlist_len]f32 = [_]f32{0} ** max_shortlist_len;
-        try metal_backend.readBufferU32(self.shortlist_tokens, token_ids[0..shortlist_len]);
-        try metal_backend.readBufferF32(self.shortlist_scores, scores[0..shortlist_len]);
+        var entries: [max_shortlist_len]metal_backend.ShortlistEntry = undefined;
+        try metal_backend.readShortlistEntries(self.shortlist_entries, entries[0..shortlist_len]);
         for (0..shortlist_len) |index| {
             out[index] = .{
-                .token_id = token_ids[index],
-                .logit = scores[index],
+                .token_id = entries[index].token_id,
+                .logit = entries[index].score,
             };
         }
         self.recordCategoryWithShape(.readback, readback_start, .{

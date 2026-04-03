@@ -55,23 +55,19 @@ test "metal top-k shortlist returns descending logits with stable ties" {
 
     const input_buffer = try metal_backend.createScratchBuffer(backend, logits.len);
     defer metal_backend.destroyBuffer(input_buffer);
-    const token_buffer = try metal_backend.createScratchBuffer(backend, 3);
-    defer metal_backend.destroyBuffer(token_buffer);
-    const score_buffer = try metal_backend.createScratchBuffer(backend, 3);
-    defer metal_backend.destroyBuffer(score_buffer);
+    const shortlist_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(metal_backend.ShortlistEntry));
+    defer metal_backend.destroyBuffer(shortlist_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &logits);
-    try metal_backend.topKShortlist(backend, input_buffer, token_buffer, score_buffer, logits.len, 3);
+    try metal_backend.topKShortlist(backend, input_buffer, shortlist_buffer, logits.len, 3);
 
-    var token_ids: [3]u32 = undefined;
-    var scores: [3]f32 = undefined;
-    try metal_backend.readBufferU32(token_buffer, &token_ids);
-    try metal_backend.readBufferF32(score_buffer, &scores);
+    var entries: [3]metal_backend.ShortlistEntry = undefined;
+    try metal_backend.readShortlistEntries(shortlist_buffer, &entries);
 
-    try std.testing.expectEqualSlices(u32, &.{ 4, 1, 6 }, &token_ids);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), scores[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), scores[1], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), scores[2], 0.0001);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 1, 6 }, &.{ entries[0].token_id, entries[1].token_id, entries[2].token_id });
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), entries[0].score, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), entries[1].score, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), entries[2].score, 0.0001);
 }
 
 test "metal q4k fused add matches cpu dequantized reference for dominant llama shape" {

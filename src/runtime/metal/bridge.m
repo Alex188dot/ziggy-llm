@@ -1684,14 +1684,13 @@ int ziggy_metal_argmax_f32(
 int ziggy_metal_topk_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
-    ZiggyMetalBuffer *output_tokens,
-    ZiggyMetalBuffer *output_scores,
+    ZiggyMetalBuffer *output_entries,
     uint32_t count,
     uint32_t top_k,
     char *error_message,
     size_t error_message_len
 ) {
-    if (ctx == NULL || input == NULL || output_tokens == NULL || output_scores == NULL || count == 0 || top_k == 0 || top_k > 64) {
+    if (ctx == NULL || input == NULL || output_entries == NULL || count == 0 || top_k == 0 || top_k > 64) {
         ziggy_write_error(error_message, error_message_len, @"invalid Metal top-k request");
         return ZIGGY_METAL_EXECUTION_FAILED;
     }
@@ -1699,8 +1698,7 @@ int ziggy_metal_topk_f32(
     @autoreleasepool {
         ZiggyMetalState *state = ziggy_state(ctx);
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
-        ZiggyMetalBufferState *token_buffer = ziggy_buffer(output_tokens);
-        ZiggyMetalBufferState *score_buffer = ziggy_buffer(output_scores);
+        ZiggyMetalBufferState *entry_buffer = ziggy_buffer(output_entries);
         const NSUInteger thread_width = state.topKPipeline.threadExecutionWidth;
         const NSUInteger max_total_threads = state.topKPipeline.maxTotalThreadsPerThreadgroup;
         uint32_t thread_count = 32;
@@ -1711,8 +1709,7 @@ int ziggy_metal_topk_f32(
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         if (input_buffer.length < ((size_t)count * sizeof(float)) ||
-            token_buffer.length < ((size_t)top_k * sizeof(uint32_t)) ||
-            score_buffer.length < ((size_t)top_k * sizeof(float))) {
+            entry_buffer.length < ((size_t)top_k * (sizeof(uint32_t) + sizeof(float)))) {
             ziggy_write_error(error_message, error_message_len, @"Metal top-k exceeded allocation");
             return ZIGGY_METAL_BUFFER_FAILED;
         }
@@ -1723,8 +1720,7 @@ int ziggy_metal_topk_f32(
             thread_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
-                [encoder setBuffer:token_buffer.buffer offset:0 atIndex:1];
-                [encoder setBuffer:score_buffer.buffer offset:0 atIndex:2];
+                [encoder setBuffer:entry_buffer.buffer offset:0 atIndex:1];
                 [encoder setBytes:&count length:sizeof(count) atIndex:3];
                 [encoder setBytes:&top_k length:sizeof(top_k) atIndex:4];
                 [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:5];
