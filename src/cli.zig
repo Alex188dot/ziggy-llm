@@ -198,7 +198,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  -m, --model <path>    Path to a GGUF model
         \\  -p, --prompt <text>   Prompt text for one-shot generation
         \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
-        \\      --bench-runs <n>  Bench only: one cold run plus warm averages over reused runtime (default: {d})
+        \\      --bench-runs <n>  Bench only: one cold run plus warm averages over the resident runtime path (default: {d})
         \\      --seed <n>        Seed for deterministic sampling (default: {d})
         \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
         \\      --repeat-penalty  Penalize previously seen tokens; 1.0 disables it (default: {d:.1})

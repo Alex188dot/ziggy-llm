@@ -69,6 +69,7 @@ pub const Session = struct {
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
+    sampled_token: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
@@ -100,6 +101,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(up);
         const tmp = try metal_backend.createScratchBuffer(backend, max_vec);
         errdefer metal_backend.destroyBuffer(tmp);
+        const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
+        errdefer metal_backend.destroyBuffer(sampled_token);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -118,6 +121,7 @@ pub const Session = struct {
             .gate = gate,
             .up = up,
             .tmp = tmp,
+            .sampled_token = sampled_token,
             .k_cache = k_cache,
             .v_cache = v_cache,
             .profiler = profiler,
@@ -134,6 +138,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
+        metal_backend.destroyBuffer(self.sampled_token);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
         self.* = undefined;
@@ -172,28 +177,26 @@ pub const Session = struct {
             .extra = position + 1,
         });
 
-        const k_rope_start = std.time.nanoTimestamp();
-        try metal_backend.applyRoPE(
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
+        const kv_k_start = std.time.nanoTimestamp();
+        try metal_backend.applyRoPEToDst(
             self.backend,
             self.k,
+            self.k_cache,
+            kv_offset,
             self.model.head_count_kv,
             self.model.head_dimension,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
         );
-        self.recordCategoryWithShape(.elementwise_ops, k_rope_start, .{
+        self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
             .cols = self.model.head_dimension,
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
-
-        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
-        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
-        const kv_k_start = std.time.nanoTimestamp();
-        try metal_backend.copyBufferRegion(self.backend, self.k, 0, self.k_cache, kv_offset, kv_bytes);
         self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
             .rows = 1,
             .cols = self.model.kv_dimension,
@@ -201,7 +204,7 @@ pub const Session = struct {
             .extra = position + 1,
         });
         const kv_v_start = std.time.nanoTimestamp();
-        try metal_backend.copyBufferRegion(self.backend, self.v, 0, self.v_cache, kv_offset, kv_bytes);
+        try self.runProjectionToDst(layer.attn_v, self.normed, self.v_cache, kv_offset);
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
             .cols = self.model.kv_dimension,
@@ -260,6 +263,22 @@ pub const Session = struct {
         });
     }
 
+    pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const readback_start = std.time.nanoTimestamp();
+        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        try metal_backend.commitSequence(self.backend);
+        var token: [1]u32 = .{0};
+        try metal_backend.readBufferU32(self.sampled_token, &token);
+        self.recordCategoryWithShape(.readback, readback_start, .{
+            .rows = 1,
+            .cols = 1,
+            .depth = self.model.vocab_size,
+        });
+        return token[0];
+    }
+
     fn runRmsNorm(
         self: *Session,
         tensor: TensorDesc,
@@ -304,6 +323,10 @@ pub const Session = struct {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecToBuffer(
@@ -314,6 +337,51 @@ pub const Session = struct {
                     tensor.rows,
                     tensor.cols,
                 );
+            },
+        }
+        const shape = metal_profile.ShapeDesc{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+        }
+    }
+
+    fn runProjectionToDst(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        output_offset_bytes: usize,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
+        switch (tensor.tensor_type) {
+            12 => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                    used_moon_quant = true;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                }
+            },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+            },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+            },
+            else => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
             },
         }
         const shape = metal_profile.ShapeDesc{
@@ -344,18 +412,20 @@ pub const Session = struct {
                     used_moon_quant = true;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                    try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
-                    try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                    try metal_backend.runMatVecQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
                 }
             },
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 try metal_backend.runMatVecQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0AddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
-                try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                try metal_backend.runMatVecAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
         }
         const shape = metal_profile.ShapeDesc{

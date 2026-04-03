@@ -2,7 +2,7 @@ const std = @import("std");
 const gguf = @import("gguf.zig");
 
 pub const supported_quantization =
-    "MoonQuant target set: Q4_K_M, Q5_K_M, Q6_K, and Q8_0. Current runnable paths: F32, F16, Q4_K, and Q6_K.";
+    "MoonQuant target set: Q4_K_M, Q5_K_M, Q6_K, and Q8_0. Current runnable paths: F32, F16, Q4_K, Q6_K, and Q8_0.";
 
 pub const q4_k_block_values: usize = 256;
 pub const q4_k_block_raw_bytes: usize = 144;
@@ -251,8 +251,8 @@ fn detectTier(format: TargetFormat) Tier {
 
 fn detectRuntimePath(format: TargetFormat) RuntimePath {
     return switch (format) {
-        .q4_k_m, .q6_k, .f16_reference, .f32_reference, .legacy_q4_k, .legacy_q6_k => .available_now,
-        .q5_k_m, .q8_0 => .planned,
+        .q4_k_m, .q6_k, .q8_0, .f16_reference, .f32_reference, .legacy_q4_k, .legacy_q6_k => .available_now,
+        .q5_k_m => .planned,
         .other => .unsupported,
     };
 }
@@ -270,7 +270,7 @@ fn detectNote(format: TargetFormat) []const u8 {
         .q4_k_m => "first MoonQuant target; loader now packs Q4_K blocks into a Metal-oriented fixed-stride layout",
         .q5_k_m => "MoonQuant target format; runtime support still needs a dedicated Q5_K path",
         .q6_k => "MoonQuant target format and current decode path overlap on Q6_K blocks",
-        .q8_0 => "MoonQuant target format; runtime support still needs a dedicated Q8_0 path",
+        .q8_0 => "MoonQuant target format with a direct raw Metal matvec path and fused decode add support",
         .f16_reference => "reference-validation path kept for correctness and calibration",
         .f32_reference => "full-precision reference path remains useful for correctness checks",
         .legacy_q4_k => "runnable legacy path; loader can repack Q4_K blocks into the MoonQuant row layout",

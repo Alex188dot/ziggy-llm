@@ -299,3 +299,5 @@ Current implementation note:
 | 2026-04-02 | `run` | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1563.252 | 320.713 | 1989.136 | 70.525 |
 | 2026-04-02 | Cold `bench --bench-runs 5` | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 2 | 12 | 9.148 | 443.531 | 554.913 | 73.174 |
 | 2026-04-02 | Warm avg (`4` reused runs) | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 2 | 12 | 0.321 | 34.351 | 137.284 | 68.302 |
+| 2026-04-03 | Cold `bench --bench-runs 5` | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1171.360 | 313.356 | 1485.989 | 69.353 |
+| 2026-04-03 | Warm avg (`4` reused runs) | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.019 | 273.043 | 273.241 | 71.899 |
