@@ -172,28 +172,27 @@ pub const Session = struct {
             .extra = position + 1,
         });
 
-        const k_rope_start = std.time.nanoTimestamp();
-        try metal_backend.applyRoPE(
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
+        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
+        const kv_k_start = std.time.nanoTimestamp();
+        try metal_backend.applyRoPEToDst(
             self.backend,
             self.k,
+            self.k_cache,
+            kv_offset,
             self.model.head_count_kv,
             self.model.head_dimension,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
         );
-        self.recordCategoryWithShape(.elementwise_ops, k_rope_start, .{
+        self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
             .cols = self.model.head_dimension,
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
-
-        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
-        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
-        const kv_k_start = std.time.nanoTimestamp();
-        try metal_backend.copyBufferRegion(self.backend, self.k, 0, self.k_cache, kv_offset, kv_bytes);
         self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
             .rows = 1,
             .cols = self.model.kv_dimension,

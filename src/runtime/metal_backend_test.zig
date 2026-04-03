@@ -441,6 +441,55 @@ test "metal fused attention matches cpu reference" {
     }
 }
 
+test "metal rope-to-dst writes rotated kv slice directly" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 6;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+
+    var src: [head_count * head_dim]f32 = undefined;
+    for (&src, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index)) - 7)) * 0.125) + 0.05;
+    }
+
+    var expected = [_]f32{-9.0} ** (dst_prefix + src.len + 3);
+    var actual = expected;
+    applyRoPEReference(expected[dst_prefix .. dst_prefix + src.len], &src, head_count, head_dim, rope_dim, position, freq_base);
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const src_buffer = try metal_backend.createScratchBuffer(backend, src.len);
+    defer metal_backend.destroyBuffer(src_buffer);
+    const dst_buffer = try metal_backend.createScratchBuffer(backend, actual.len);
+    defer metal_backend.destroyBuffer(dst_buffer);
+
+    try metal_backend.writeBufferF32(src_buffer, &src);
+    try metal_backend.writeBufferF32(dst_buffer, &actual);
+    try metal_backend.applyRoPEToDst(
+        backend,
+        src_buffer,
+        dst_buffer,
+        dst_prefix * @sizeOf(f32),
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+    );
+    try metal_backend.readBufferF32(dst_buffer, &actual);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.0005);
+    }
+}
+
 fn fillQ4KMatrix(buffer: []u8, rows: usize, cols: usize) void {
     const row_size = cols / 256 * 144;
     for (0..rows) |row| {
@@ -521,6 +570,26 @@ fn attentionReference(
                 sum += weight * v_cache[layer_base + token * kv_dim + kv_offset + dim];
             }
             output[head * head_dim + dim] = sum;
+        }
+    }
+}
+
+fn applyRoPEReference(values: []f32, src: []const f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32) void {
+    @memcpy(values, src);
+    const n_rot = @min(rope_dim, head_dim);
+    const pair_count = n_rot / 2;
+    for (0..head_count) |head_index| {
+        const head = values[head_index * head_dim ..][0..head_dim];
+        for (0..pair_count) |pair| {
+            const index = pair * 2;
+            const exponent = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(n_rot));
+            const theta = @as(f32, @floatFromInt(position)) / std.math.pow(f32, freq_base, exponent);
+            const cos_theta = @cos(theta);
+            const sin_theta = @sin(theta);
+            const x0 = src[head_index * head_dim + index];
+            const x1 = src[head_index * head_dim + index + 1];
+            head[index] = x0 * cos_theta - x1 * sin_theta;
+            head[index + 1] = x0 * sin_theta + x1 * cos_theta;
         }
     }
 }

@@ -27,6 +27,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KAdd2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KAdd5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> ropePipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> ropeToDstPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> attentionFusedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
@@ -370,6 +371,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal rope pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> rope_to_dst_pipeline = ziggy_pipeline(device, library, @"apply_rope_to_dst_f32", &pipeline_error);
+        if (rope_to_dst_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal rope-to-dst pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         id<MTLComputePipelineState> attention_fused_pipeline = ziggy_pipeline(device, library, @"attention_fused_f32", &pipeline_error);
         if (attention_fused_pipeline == nil) {
@@ -417,6 +423,7 @@ int ziggy_metal_create_context(
         state.matvecMoonQ4KAdd2048Pipeline = matvec_moon_q4k_add_2048_pipeline;
         state.matvecMoonQ4KAdd5632Pipeline = matvec_moon_q4k_add_5632_pipeline;
         state.ropePipeline = rope_pipeline;
+        state.ropeToDstPipeline = rope_to_dst_pipeline;
         state.attentionFusedPipeline = attention_fused_pipeline;
         state.siluMulPipeline = silu_mul_pipeline;
         state.addInPlacePipeline = add_in_place_pipeline;
@@ -1104,6 +1111,58 @@ int ziggy_metal_apply_rope_f32(
                 [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:3];
                 [encoder setBytes:&position length:sizeof(position) atIndex:4];
                 [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:5];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_apply_rope_to_dst_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_bytes,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || src == NULL || dst == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal rope-to-dst request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    const uint32_t pair_count = (rope_dim < head_dim ? rope_dim : head_dim) / 2;
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *src_buffer = ziggy_const_buffer(src);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+        const size_t element_count = (size_t)head_count * (size_t)head_dim;
+        const size_t byte_count = element_count * sizeof(float);
+        if (byte_count == 0 || src_buffer.length < byte_count || dst_offset_bytes + byte_count > dst_buffer.length) {
+            ziggy_write_error(error_message, error_message_len, @"Metal rope-to-dst exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        const uint32_t dst_base = (uint32_t)(dst_offset_bytes / sizeof(float));
+        return ziggy_run_compute(
+            state,
+            state.ropeToDstPipeline,
+            element_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:src_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&dst_base length:sizeof(dst_base) atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+                [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:5];
+                [encoder setBytes:&position length:sizeof(position) atIndex:6];
+                [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:7];
             },
             error_message,
             error_message_len

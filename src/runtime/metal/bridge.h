@@ -180,6 +180,20 @@ int ziggy_metal_apply_rope_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_apply_rope_to_dst_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_bytes,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_attention_fused_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *q,

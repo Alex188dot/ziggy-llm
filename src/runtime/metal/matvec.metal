@@ -536,6 +536,44 @@ kernel void apply_rope_f32(
     vector[base + 1] = x0 * sin_theta + x1 * cos_theta;
 }
 
+kernel void apply_rope_to_dst_f32(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant uint &dst_base [[buffer(2)]],
+    constant uint &head_count [[buffer(3)]],
+    constant uint &head_dim [[buffer(4)]],
+    constant uint &pair_count [[buffer(5)]],
+    constant uint &position [[buffer(6)]],
+    constant float &freq_base [[buffer(7)]],
+    uint index [[thread_position_in_grid]]
+) {
+    const uint total_values = head_count * head_dim;
+    if (index >= total_values) return;
+
+    const uint head = index / head_dim;
+    const uint dim = index % head_dim;
+    const uint dst_index = dst_base + index;
+    if (pair_count == 0 || dim >= pair_count * 2) {
+        dst[dst_index] = src[index];
+        return;
+    }
+
+    const uint pair = dim / 2;
+    const uint base = head * head_dim + pair * 2;
+    const float exponent = float(pair * 2) / float(pair_count * 2);
+    const float theta = float(position) / pow(freq_base, exponent);
+    const float cos_theta = cos(theta);
+    const float sin_theta = sin(theta);
+    const float x0 = src[base];
+    const float x1 = src[base + 1];
+
+    if ((dim & 1) == 0) {
+        dst[dst_index] = x0 * cos_theta - x1 * sin_theta;
+    } else {
+        dst[dst_index] = x0 * sin_theta + x1 * cos_theta;
+    }
+}
+
 constant uint ZIGGY_MAX_ATTENTION_CONTEXT = 4096;
 
 kernel void attention_fused_f32(
