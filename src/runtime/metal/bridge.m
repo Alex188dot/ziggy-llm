@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #import <stdio.h>
 #import <string.h>
+#import <time.h>
 
 @interface ZiggyMetalState : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
@@ -96,6 +97,33 @@ static void ziggy_dispatch_standard(
     [encoder dispatchThreads:grid_size threadsPerThreadgroup:group_size];
 }
 
+static uint64_t ziggy_now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void ziggy_fill_commit_stats(
+    id<MTLCommandBuffer> command_buffer,
+    uint64_t cpu_wait_ns,
+    ZiggyMetalCommitStats *out_stats
+) {
+    if (out_stats == NULL) return;
+    out_stats->cpu_wait_ns = cpu_wait_ns;
+    out_stats->gpu_elapsed_ns = 0;
+    out_stats->gpu_timestamps_valid = false;
+
+    if (![command_buffer respondsToSelector:@selector(GPUStartTime)] ||
+        ![command_buffer respondsToSelector:@selector(GPUEndTime)]) {
+        return;
+    }
+
+    const CFTimeInterval gpu_start = command_buffer.GPUStartTime;
+    const CFTimeInterval gpu_end = command_buffer.GPUEndTime;
+    if (!(gpu_end > gpu_start) || gpu_start <= 0.0) return;
+
+    out_stats->gpu_elapsed_ns = (uint64_t)((gpu_end - gpu_start) * 1000000000.0);
+    out_stats->gpu_timestamps_valid = out_stats->gpu_elapsed_ns > 0;
+}
+
 static void ziggy_dispatch_q4k_rows(
     id<MTLComputeCommandEncoder> encoder,
     id<MTLComputePipelineState> pipeline,
@@ -181,15 +209,22 @@ static void ziggy_dispatch_rowwise(
 
 static int ziggy_commit_pending(
     ZiggyMetalState *state,
+    ZiggyMetalCommitStats *out_stats,
     char *error_message,
     size_t error_message_len
 ) {
     id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
-    if (command_buffer == nil) return ZIGGY_METAL_OK;
+    if (command_buffer == nil) {
+        if (out_stats != NULL) memset(out_stats, 0, sizeof(*out_stats));
+        return ZIGGY_METAL_OK;
+    }
 
+    const uint64_t wait_start_ns = ziggy_now_ns();
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
+    const uint64_t cpu_wait_ns = ziggy_now_ns() - wait_start_ns;
     state.pendingCommandBuffer = nil;
+    ziggy_fill_commit_stats(command_buffer, cpu_wait_ns, out_stats);
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
@@ -1579,7 +1614,24 @@ int ziggy_metal_commit_sequence(
 
     @autoreleasepool {
         ZiggyMetalState *state = ziggy_state(ctx);
-        return ziggy_commit_pending(state, error_message, error_message_len);
+        return ziggy_commit_pending(state, NULL, error_message, error_message_len);
+    }
+}
+
+int ziggy_metal_commit_sequence_timed(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalCommitStats *out_stats,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sequence commit request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        return ziggy_commit_pending(state, out_stats, error_message, error_message_len);
     }
 }
 
@@ -1669,18 +1721,28 @@ int ziggy_metal_argmax_f32(
         ZiggyMetalState *state = ziggy_state(ctx);
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output_token);
+        const NSUInteger thread_width = state.argmaxPipeline.threadExecutionWidth;
+        const NSUInteger max_total_threads = state.argmaxPipeline.maxTotalThreadsPerThreadgroup;
+        uint32_t thread_count = 256;
+        if (thread_width > 0 && thread_count < thread_width) thread_count = (uint32_t)thread_width;
+        if (max_total_threads > 0 && thread_count > max_total_threads) thread_count = (uint32_t)max_total_threads;
+        if (thread_count == 0 || thread_count > 256) {
+            ziggy_write_error(error_message, error_message_len, @"Metal argmax threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
         if (input_buffer.length < ((size_t)count * sizeof(float)) || output_buffer.length < sizeof(uint32_t)) {
             ziggy_write_error(error_message, error_message_len, @"Metal argmax exceeded allocation");
             return ZIGGY_METAL_BUFFER_FAILED;
         }
-        return ziggy_run_compute(
+        return ziggy_run_single_threadgroup(
             state,
             state.argmaxPipeline,
-            1,
+            thread_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:output_buffer.buffer offset:0 atIndex:1];
                 [encoder setBytes:&count length:sizeof(count) atIndex:2];
+                [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:3];
             },
             error_message,
             error_message_len

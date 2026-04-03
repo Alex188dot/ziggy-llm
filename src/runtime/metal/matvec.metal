@@ -804,19 +804,44 @@ kernel void argmax_f32(
     device const float *input [[buffer(0)]],
     device uint *output_token [[buffer(1)]],
     constant uint &count [[buffer(2)]],
-    uint index [[thread_position_in_grid]]
+    constant uint &thread_count [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]]
 ) {
-    if (index != 0 || count == 0) return;
+    if (count == 0 || thread_count == 0 || thread_count > 256) return;
+    if (tid >= thread_count) return;
+
+    float best_value = -INFINITY;
     uint best_index = 0;
-    float best_value = input[0];
-    for (uint i = 1; i < count; i += 1) {
+    for (uint i = tid; i < count; i += thread_count) {
         const float value = input[i];
-        if (value > best_value) {
+        if (value > best_value || (value == best_value && i < best_index)) {
             best_value = value;
             best_index = i;
         }
     }
-    output_token[0] = best_index;
+
+    threadgroup float scratch_values[256];
+    threadgroup uint scratch_indices[256];
+    scratch_values[tid] = best_value;
+    scratch_indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = thread_count / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            const float rhs_value = scratch_values[tid + stride];
+            const uint rhs_index = scratch_indices[tid + stride];
+            const float lhs_value = scratch_values[tid];
+            const uint lhs_index = scratch_indices[tid];
+            if (rhs_value > lhs_value || (rhs_value == lhs_value && rhs_index < lhs_index)) {
+                scratch_values[tid] = rhs_value;
+                scratch_indices[tid] = rhs_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid != 0) return;
+    output_token[0] = scratch_indices[0];
 }
 
 constant uint ZIGGY_SHORTLIST_MAX_K = 64;

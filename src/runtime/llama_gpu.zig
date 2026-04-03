@@ -266,13 +266,15 @@ pub const Session = struct {
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
-        try metal_backend.commitSequence(self.backend);
-        try metal_backend.readBufferF32(self.tmp, out);
-        self.recordCategoryWithShape(.readback, readback_start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = out.len,
-        });
+        };
+        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+        self.recordCommitWait(shape, commit_stats);
+        const host_readback_start = std.time.nanoTimestamp();
+        try metal_backend.readBufferF32(self.tmp, out);
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
     }
 
     pub fn commitToken(self: *Session) !void {
@@ -282,16 +284,20 @@ pub const Session = struct {
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
-        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
-        try metal_backend.commitSequence(self.backend);
-        var token: [1]u32 = .{0};
-        try metal_backend.readBufferU32(self.sampled_token, &token);
-        self.recordCategoryWithShape(.readback, readback_start, .{
+        const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = 1,
             .depth = self.model.vocab_size,
-        });
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
+        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+        self.recordCommitWait(shape, commit_stats);
+        var token: [1]u32 = .{0};
+        const host_readback_start = std.time.nanoTimestamp();
+        try metal_backend.readBufferU32(self.sampled_token, &token);
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }
 
@@ -305,7 +311,13 @@ pub const Session = struct {
     ) !u32 {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
+        const shape = metal_profile.ShapeDesc{
+            .rows = 1,
+            .cols = 1,
+            .depth = self.model.vocab_size,
+            .extra = top_k,
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
         try metal_backend.sampleTopK(
             self.backend,
             self.tmp,
@@ -315,15 +327,13 @@ pub const Session = struct {
             temperature,
             random_uniform,
         );
-        try metal_backend.commitSequence(self.backend);
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+        self.recordCommitWait(shape, commit_stats);
         var token: [1]u32 = .{0};
+        const host_readback_start = std.time.nanoTimestamp();
         try metal_backend.readBufferU32(self.sampled_token, &token);
-        self.recordCategoryWithShape(.readback, readback_start, .{
-            .rows = 1,
-            .cols = 1,
-            .depth = self.model.vocab_size,
-            .extra = top_k,
-        });
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }
 
@@ -339,7 +349,12 @@ pub const Session = struct {
 
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
-        const readback_start = std.time.nanoTimestamp();
+        const shape = metal_profile.ShapeDesc{
+            .rows = 2,
+            .cols = shortlist_len,
+            .depth = self.model.vocab_size,
+        };
+        const output_reduce_start = std.time.nanoTimestamp();
         try metal_backend.topKShortlist(
             self.backend,
             self.tmp,
@@ -347,9 +362,12 @@ pub const Session = struct {
             self.model.vocab_size,
             shortlist_len,
         );
-        try metal_backend.commitSequence(self.backend);
+        self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
+        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+        self.recordCommitWait(shape, commit_stats);
 
         var entries: [max_shortlist_len]metal_backend.ShortlistEntry = undefined;
+        const host_readback_start = std.time.nanoTimestamp();
         try metal_backend.readShortlistEntries(self.shortlist_entries, entries[0..shortlist_len]);
         for (0..shortlist_len) |index| {
             out[index] = .{
@@ -357,11 +375,7 @@ pub const Session = struct {
                 .logit = entries[index].score,
             };
         }
-        self.recordCategoryWithShape(.readback, readback_start, .{
-            .rows = 2,
-            .cols = shortlist_len,
-            .depth = self.model.vocab_size,
-        });
+        self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return out[0..shortlist_len];
     }
 
@@ -536,6 +550,13 @@ pub const Session = struct {
     ) void {
         if (self.profiler) |profiler| {
             profiler.recordWithShape(category, elapsedSince(start_ns), shape);
+        }
+    }
+
+    fn recordCommitWait(self: *Session, shape: metal_profile.ShapeDesc, stats: metal_backend.CommitStats) void {
+        if (self.profiler) |profiler| {
+            profiler.recordWithShape(.commit_wait, stats.cpu_wait_ns, shape);
+            if (stats.gpu_timestamps_valid) profiler.recordCommitWaitGpu(stats.gpu_elapsed_ns);
         }
     }
 

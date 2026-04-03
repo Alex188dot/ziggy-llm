@@ -15,6 +15,31 @@ The practical strategy is:
 - read back only the selected token, or at most a tiny shortlist
 - preserve CPU fallback and correctness validation while the GPU path matures
 
+## Status Update
+
+As of `2026-04-03`, this track has been partially rolled back and re-scoped.
+
+What landed:
+
+- Metal profiling now splits the old monolithic `readback` bucket into:
+  - `output_reduce`
+  - `commit_wait`
+  - `host_readback`
+- `commit_wait` also records Metal command-buffer GPU elapsed time when the platform reports valid GPU timestamps.
+- the greedy Metal `argmax` kernel is now a real parallel threadgroup reduction instead of a single-thread linear scan
+
+What changed in the plan:
+
+- stochastic GPU top-k and shortlist decode paths are now intentionally gated off in runtime selection
+- `--sampling-path gpu-topk-sample` and `--sampling-path gpu-shortlist` fall back to `cpu-logits` for `temperature > 0`
+- full GPU stochastic sampling is explicitly blocked until a hierarchical top-k reduction exists and wins on benchmark
+
+What the new instrumentation shows on the current greedy path:
+
+- `commit_wait` is the dominant stall
+- `host_readback` is tiny once only a sampled token is copied back
+- the remaining bottleneck is the output-stage synchronization boundary, not CPU sampling policy
+
 ## Why This Is The Best First Bet
 
 Right now the Metal path already keeps most decode math on GPU:
@@ -55,7 +80,7 @@ Current relevant facts:
 - the Metal shader set already includes an `argmax_f32` kernel in [`src/runtime/metal/matvec.metal`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/matvec.metal)
 - greedy decode with `temperature <= 0` already uses GPU argmax, then reads back a single `u32`
 - non-greedy sampling still depends on CPU-side `sampleToken`
-- profiling already tracks `readback` and `cpu_sampling`, which makes this optimization measurable
+- profiling now tracks `output_reduce`, `commit_wait`, `host_readback`, and `cpu_sampling`, which makes the output-stage stall measurable at a finer granularity
 
 This means Phase 1 is not “invent GPU sampling.” Phase 1 is “turn the existing GPU argmax path into a benchmarked, explicit, default-first throughput strategy.”
 
@@ -91,7 +116,7 @@ Expected outcome:
 
 ### Stage B: Add GPU Top-K / Shortlist Extraction
 
-This is the most important bridge step.
+This remains the most important bridge step, but it is now explicitly blocked on a better reduction design.
 
 Instead of reading back `vocab_size` logits, the GPU should produce a tiny candidate bundle:
 
@@ -103,9 +128,9 @@ CPU then performs repeat penalty, top-p, min-p, and RNG-based final choice on a 
 
 This gives most of the readback win without forcing the entire sampling policy onto GPU at once.
 
-Recommended first target:
+Recommended next target:
 
-- fixed `top_k = 32` or `64` shortlist kernel
+- hierarchical multi-pass `top_k` reduction rather than the current single-threadgroup prototype
 - one compact GPU output buffer per token
 - read back only shortlist ids and scores
 
@@ -197,9 +222,9 @@ Risk control:
 
 1. Benchmark and isolate current greedy GPU path versus full-logits CPU path.
 2. Make greedy GPU sampling the clearly documented fast path.
-3. Add a Metal top-k or shortlist kernel and backend bridge API.
-4. Add a decode mode that reads back only shortlist ids and scores.
-5. Reuse existing CPU sampler logic over the shortlist where possible.
+3. Improve output-stage instrumentation until reduction, GPU wait, and host copy are independently visible.
+4. Keep GPU greedy argmax as the only active GPU reduction path.
+5. Land a hierarchical Metal top-k reduction before re-enabling shortlist decode.
 6. Compare TPS, TTFT, and output quality against the current full-logits path.
 7. Only after that, prototype full GPU stochastic sampling.
 
@@ -212,7 +237,10 @@ Minimum metrics to track:
 - decode TPS
 - decode ms per token
 - TTFT
-- `readback` time
+- `output_reduce` time
+- `commit_wait` time
+- `commit_wait.gpu_ns`
+- `host_readback` time
 - `cpu_sampling` time
 - correctness versus the CPU reference path
 
@@ -249,7 +277,7 @@ That makes the greedy A/B comparison explicit in both normal bench output and pr
 For Metal profiling, the distinction is visible in two places:
 
 - `readback_mode=sampled-token-u32` versus `readback_mode=full-logits-f32`
-- `profile.shape_*` entries for `readback`, where greedy GPU argmax shows `cols=1` and full-logits mode shows `cols=vocab_size`
+- `profile.shape_*` entries for `commit_wait` / `host_readback`, where greedy GPU argmax shows `cols=1` and full-logits mode shows `cols=vocab_size`
 
 ## Current TinyLlama Baseline
 
@@ -274,42 +302,43 @@ Prompt and generation settings used for all runs:
   --metal-profile
 ```
 
-Warm baseline snapshots:
+Warm baseline snapshots after the instrumentation split and runtime gating update:
 
 | Mode | Extra flags | warm prompt ms avg | warm TTFT ms avg | warm TPS avg | readback mode |
 | --- | --- | ---: | ---: | ---: | --- |
-| Greedy GPU argmax | `--temperature 0 --sampling-path gpu-greedy` | `561.975` | `562.125` | `33.474` | `sampled-token-u32` |
-| Greedy forced full logits | `--temperature 0 --sampling-path cpu-full-logits` | `551.710` | `551.928` | `33.484` | `full-logits-f32` |
-| Non-greedy current path | `--temperature 0.7` | `548.177` | `548.892` | `33.506` | `full-logits-f32` |
+| Greedy GPU argmax | `--temperature 0 --sampling-path gpu-greedy` | `336.342` | `336.575` | `60.262` | `sampled-token-u32` |
+| Forced GPU top-k request | `--temperature 0.7 --sampling-path gpu-topk-sample` | `334.674` | `335.336` | `58.358` | `full-logits-f32` |
 
 Current profiling snapshots from those same runs:
 
-- Greedy GPU argmax: `profile.readback.ns=3744686000` and `profile.cpu_sampling.ns=0`
-- Greedy forced full logits: `profile.readback.ns=3653074000` and `profile.cpu_sampling.ns=6675000`
-- Non-greedy current path: `profile.readback.ns=3648060000` and `profile.cpu_sampling.ns=24190000`
+- Greedy GPU argmax: `profile.output_reduce.ns=44000`, `profile.commit_wait.ns=264064041`, `profile.commit_wait.gpu_ns=259577950`, `profile.host_readback.ns=25000`, and `profile.cpu_sampling.ns=0`
+- Forced GPU top-k request: `sampling_path=cpu-logits`, `profile.commit_wait.ns=263799875`, `profile.commit_wait.gpu_ns=259655453`, `profile.host_readback.ns=148000`, and `profile.cpu_sampling.ns=7764000`
 
 What that means right now:
 
 - the fast path isolation is real and measurable in output
 - greedy GPU sampling is functionally on the tiny-readback path
-- on this benchmark, readback plus synchronization still dominates both greedy modes, so the throughput gain is not yet material
+- the host-side readback itself is now small on greedy decode
+- the dominant cost is `commit_wait`, and the GPU timestamps show that most of that stall is real GPU execution time rather than CPU-side copy overhead
+- stochastic GPU top-k is not ready, so the runtime now falls back to the CPU logits path for non-greedy decode
 
 ## Shortlist API Status
 
-The repo now contains the first fixed-size shortlist extraction slice:
+The repo still contains the first fixed-size shortlist extraction slice:
 
 - a Metal `topk_f32` kernel with `top_k <= 64`
 - Objective-C bridge entrypoint `ziggy_metal_topk_f32`
 - Zig backend wrapper `topKShortlist`
 - GPU session method `runOutputShortlist`
 
-This is an API and kernel landing, not a full decode-path switch yet. CPU shortlist sampling reuse still remains as the next step.
+This remains an API and kernel landing only. It is not currently enabled in runtime path resolution because the existing single-threadgroup top-k reduction did not produce a throughput win.
 
-The repo now also contains the first end-to-end decode mode for that path:
+Current runtime behavior:
 
-- `--sampling-path gpu-shortlist` forces stochastic decode to read back only shortlist ids and scores
-- CPU sampler policy is reused over the shortlist rather than over the full vocabulary
-- `auto` still stays on full-logits CPU sampling for stochastic decode until the Metal top-k kernel is fast enough to win on benchmark
+- `auto` stays on full-logits CPU sampling for stochastic decode
+- `--sampling-path gpu-topk-sample` falls back to `cpu-logits` for `temperature > 0`
+- `--sampling-path gpu-shortlist` falls back to `cpu-logits` for `temperature > 0`
+- shortlist and GPU top-k will stay disabled until a hierarchical reduction replaces the current prototype
 
 ## Implementation Notes
 
@@ -323,7 +352,7 @@ The current code now makes the greedy fast path explicit instead of implicit:
 ## Checklist
 
 - [x] Document the current baseline for greedy decode and non-greedy decode on TinyLlama `1.1B`.
-- [x] Confirm from profiling output how much time is currently spent in `readback` and `cpu_sampling`.
+- [x] Confirm from profiling output how much time is currently spent in output-stage synchronization and `cpu_sampling`.
 - [x] Make GPU greedy sampling the explicit default fast path for `temperature <= 0`.
 - [x] Verify the greedy Metal path reads back only one token id, not the full logits vector.
 - [x] Add benchmark output that clearly distinguishes full-logits readback from tiny-token readback.
@@ -333,6 +362,9 @@ The current code now makes the greedy fast path explicit instead of implicit:
 - [x] Add Zig backend wrappers in [`src/runtime/metal_backend.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal_backend.zig) for shortlist extraction and tiny readback.
 - [x] Extend [`src/runtime/llama_gpu.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/llama_gpu.zig) with a `runOutputShortlist` path.
 - [x] Reuse the existing CPU sampling logic over shortlist candidates before attempting full GPU stochastic sampling.
+- [x] Split decode profiling into `output_reduce`, `commit_wait`, and `host_readback`, and record command-buffer GPU elapsed time when available.
+- [x] Replace the greedy Metal `argmax` single-thread scan with a parallel threadgroup reduction.
+- [x] Gate off stochastic GPU top-k / shortlist runtime selection until a hierarchical top-k reduction exists.
 - [ ] Prove shortlist mode is faster than full-logits readback on the canonical TinyLlama benchmark.
 - [ ] Add correctness tests that compare shortlist-assisted sampling against the full CPU sampler under fixed seeds.
 - [ ] Add stress tests for edge cases such as `top_k = 0`, `top_p = 1`, tiny candidate sets, and EOS-heavy outputs.
@@ -344,17 +376,15 @@ The current code now makes the greedy fast path explicit instead of implicit:
 
 ## Current Shortlist Decode Result
 
-Shortlist decode is now functionally wired, but it is not yet the fast path on the current Metal kernel.
+Shortlist decode is still functionally wired in code, but it is no longer an active runtime path.
 
-Measured on `2026-04-03` with the same TinyLlama benchmark:
+What changed:
 
-| Mode | Extra flags | warm TPS avg | readback mode | Notes |
-| --- | --- | ---: | --- | --- |
-| Full logits CPU sampler | `--temperature 0.7` | `71.768` | `full-logits-f32` | current default |
-| GPU shortlist + CPU sampler reuse | `--temperature 0.7 --sampling-path gpu-shortlist --top-k 8` | `24.488` | `shortlist-ids-scores` | works, but Metal top-k kernel dominates |
-| GPU shortlist + CPU sampler reuse | `--temperature 0.7 --sampling-path gpu-shortlist` | `4.760` | `shortlist-ids-scores` | fixed shortlist `64` is much too slow right now |
+- the old single-threadgroup top-k prototype did not deliver a throughput win
+- the stochastic GPU path is now gated off before decode path selection
+- shortlist decode will remain disabled until a hierarchical top-k reduction replaces the current prototype
 
-That means steps 4 and 5 are implemented, but the kernel from step 3 still needs a substantial rewrite before this path can replace full-logits readback in `auto`.
+That means the next meaningful milestone is not “make shortlist selectable again.” It is “land a hierarchical reduction that beats `cpu-logits` on benchmark.”
 
 ## Definition Of Done For This Moonshot Track
 

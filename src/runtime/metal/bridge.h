@@ -15,6 +15,12 @@ typedef struct {
     bool low_power;
 } ZiggyMetalDeviceInfo;
 
+typedef struct {
+    uint64_t cpu_wait_ns;
+    uint64_t gpu_elapsed_ns;
+    bool gpu_timestamps_valid;
+} ZiggyMetalCommitStats;
+
 enum {
     ZIGGY_METAL_OK = 0,
     ZIGGY_METAL_UNAVAILABLE = 1,
@@ -311,6 +317,13 @@ int ziggy_metal_begin_sequence(
 
 int ziggy_metal_commit_sequence(
     ZiggyMetalContext *ctx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_commit_sequence_timed(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalCommitStats *out_stats,
     char *error_message,
     size_t error_message_len
 );

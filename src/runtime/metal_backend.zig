@@ -25,6 +25,12 @@ pub const ShortlistEntry = extern struct {
     score: f32,
 };
 
+pub const CommitStats = struct {
+    cpu_wait_ns: u64 = 0,
+    gpu_elapsed_ns: u64 = 0,
+    gpu_timestamps_valid: bool = false,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -251,14 +257,25 @@ pub fn beginSequence(backend: backend_api.MatVecBackend) !void {
 }
 
 pub fn commitSequence(backend: backend_api.MatVecBackend) !void {
+    _ = try commitSequenceTimed(backend);
+}
+
+pub fn commitSequenceTimed(backend: backend_api.MatVecBackend) !CommitStats {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
-    try mapStatus(c.ziggy_metal_commit_sequence(
+    var raw_stats: c.ZiggyMetalCommitStats = std.mem.zeroes(c.ZiggyMetalCommitStats);
+    try mapStatus(c.ziggy_metal_commit_sequence_timed(
         state.context,
+        &raw_stats,
         &error_buf,
         error_buf.len,
     ), &error_buf);
+    return .{
+        .cpu_wait_ns = raw_stats.cpu_wait_ns,
+        .gpu_elapsed_ns = raw_stats.gpu_elapsed_ns,
+        .gpu_timestamps_valid = raw_stats.gpu_timestamps_valid,
+    };
 }
 
 pub fn runMatVecToBuffer(
