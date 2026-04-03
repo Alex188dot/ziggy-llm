@@ -275,8 +275,7 @@ pub const Session = struct {
             .rows = 1,
             .cols = out.len,
         };
-        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
-        self.recordCommitWait(shape, commit_stats);
+        try self.commitOutputSequence(shape);
         const host_readback_start = std.time.nanoTimestamp();
         try metal_backend.readBufferF32(self.tmp, out);
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
@@ -312,8 +311,7 @@ pub const Session = struct {
             try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
         }
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
-        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
-        self.recordCommitWait(shape, commit_stats);
+        try self.commitOutputSequence(shape);
         const host_readback_start = std.time.nanoTimestamp();
         var token: [1]u32 = .{0};
         if (tensor.tensor_type == 14) {
@@ -354,8 +352,7 @@ pub const Session = struct {
             random_uniform,
         );
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
-        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
-        self.recordCommitWait(shape, commit_stats);
+        try self.commitOutputSequence(shape);
         var token: [1]u32 = .{0};
         const host_readback_start = std.time.nanoTimestamp();
         try metal_backend.readBufferU32(self.sampled_token, &token);
@@ -389,8 +386,7 @@ pub const Session = struct {
             shortlist_len,
         );
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
-        const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
-        self.recordCommitWait(shape, commit_stats);
+        try self.commitOutputSequence(shape);
 
         var entries: [max_shortlist_len]metal_backend.ShortlistEntry = undefined;
         const host_readback_start = std.time.nanoTimestamp();
@@ -577,6 +573,15 @@ pub const Session = struct {
         if (self.profiler) |profiler| {
             profiler.recordWithShape(category, elapsedSince(start_ns), shape);
         }
+    }
+
+    fn commitOutputSequence(self: *Session, shape: metal_profile.ShapeDesc) !void {
+        if (self.profiler != null) {
+            const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
+            self.recordCommitWait(shape, commit_stats);
+            return;
+        }
+        try metal_backend.commitSequence(self.backend);
     }
 
     fn recordCommitWait(self: *Session, shape: metal_profile.ShapeDesc, stats: metal_backend.CommitStats) void {
