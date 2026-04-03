@@ -2,6 +2,7 @@
 using namespace metal;
 
 constant uint ZIGGY_MAX_ROW_SIMDGROUPS = 8;
+constant uint ZIGGY_MAX_NORM_SIMDGROUPS = 8;
 
 kernel void matvec_f32(
     device const float *matrix [[buffer(0)]],
@@ -873,17 +874,38 @@ kernel void rms_norm_f32(
     device float *output [[buffer(2)]],
     constant uint &count [[buffer(3)]],
     constant float &eps [[buffer(4)]],
-    uint index [[thread_position_in_grid]]
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
 ) {
-    if (index >= count) return;
+    threadgroup float partial_sums[ZIGGY_MAX_NORM_SIMDGROUPS];
 
-    float sum = 0.0f;
-    for (uint i = 0; i < count; i += 1) {
+    float local_sum = 0.0f;
+    for (uint i = lane; i < count; i += threads_per_group) {
         const float value = input[i];
-        sum += value * value;
+        local_sum += value * value;
     }
-    const float scale = 1.0f / sqrt(sum / float(count) + eps);
-    output[index] = input[index] * scale * weights[index];
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        partial_sums[0] = 1.0f / sqrt(sum / float(count) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = partial_sums[0];
+    for (uint index = lane; index < count; index += threads_per_group) {
+        output[index] = input[index] * scale * weights[index];
+    }
 }
 
 kernel void argmax_f32(

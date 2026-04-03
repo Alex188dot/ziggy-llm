@@ -188,11 +188,7 @@ static id<MTLComputePipelineState> ziggy_select_q6k_add_pipeline(
     return state.matvecQ6KAddPipeline;
 }
 
-static void ziggy_dispatch_rowwise(
-    id<MTLComputeCommandEncoder> encoder,
-    id<MTLComputePipelineState> pipeline,
-    NSUInteger row_count
-) {
+static NSUInteger ziggy_rowwise_thread_count(id<MTLComputePipelineState> pipeline) {
     NSUInteger thread_width = pipeline.threadExecutionWidth;
     if (thread_width == 0) thread_width = 1;
     NSUInteger max_total_threads = pipeline.maxTotalThreadsPerThreadgroup;
@@ -202,6 +198,15 @@ static void ziggy_dispatch_rowwise(
     }
     if (threads_per_group == 0) threads_per_group = thread_width;
     if (threads_per_group > 256) threads_per_group = 256;
+    return threads_per_group;
+}
+
+static void ziggy_dispatch_rowwise(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count
+) {
+    NSUInteger threads_per_group = ziggy_rowwise_thread_count(pipeline);
 
     MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
     MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
@@ -1756,10 +1761,21 @@ int ziggy_metal_rms_norm_f32(
         const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
         const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(weights);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
-        return ziggy_run_compute(
+        const NSUInteger thread_count = ziggy_rowwise_thread_count(state.rmsNormPipeline);
+        if (thread_count == 0 || thread_count > 256) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        if (input_buffer.length < ((size_t)count * sizeof(float)) ||
+            weights_buffer.length < ((size_t)count * sizeof(float)) ||
+            output_buffer.length < ((size_t)count * sizeof(float))) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+        return ziggy_run_single_threadgroup(
             state,
             state.rmsNormPipeline,
-            count,
+            thread_count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:1];

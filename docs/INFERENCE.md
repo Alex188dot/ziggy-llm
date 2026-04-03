@@ -301,3 +301,7 @@ Current implementation note:
 | 2026-04-02 | Warm avg (`4` reused runs) | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 2 | 12 | 0.321 | 34.351 | 137.284 | 68.302 |
 | 2026-04-03 | Cold `bench --bench-runs 5` | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1171.360 | 313.356 | 1485.989 | 69.353 |
 | 2026-04-03 | Warm avg (`4` reused runs) | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.019 | 273.043 | 273.241 | 71.899 |
+| 2026-04-03 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1457.799 | 244.991 | 1702.849 | 102.344 |
+| 2026-04-03 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.027 | 174.280 | 174.363 | 103.311 |
+| 2026-04-03 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 245.947 | 207.742 | 453.947 | 109.525 |
+| 2026-04-03 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.032 | 165.280 | 165.577 | 106.926 |
