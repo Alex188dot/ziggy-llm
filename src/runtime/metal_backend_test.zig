@@ -70,6 +70,33 @@ test "metal top-k shortlist returns descending logits with stable ties" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), entries[2].score, 0.0001);
 }
 
+test "metal sample top-k returns one of the weighted winners" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const logits = [_]f32{ 5.0, 4.0, 0.1, -1.0 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, logits.len);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const token_buffer = try metal_backend.createScratchBuffer(backend, 1);
+    defer metal_backend.destroyBuffer(token_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &logits);
+
+    try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.0);
+    var sampled_low: [1]u32 = undefined;
+    try metal_backend.readBufferU32(token_buffer, &sampled_low);
+    try std.testing.expectEqual(@as(u32, 0), sampled_low[0]);
+
+    try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.999);
+    var sampled_high: [1]u32 = undefined;
+    try metal_backend.readBufferU32(token_buffer, &sampled_high);
+    try std.testing.expect(sampled_high[0] == 0 or sampled_high[0] == 1);
+}
+
 test "metal q4k fused add matches cpu dequantized reference for dominant llama shape" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);

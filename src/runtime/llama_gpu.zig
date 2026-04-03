@@ -295,6 +295,38 @@ pub const Session = struct {
         return token[0];
     }
 
+    pub fn runOutputSampleTopK(
+        self: *Session,
+        norm: TensorDesc,
+        tensor: TensorDesc,
+        top_k: usize,
+        temperature: f32,
+        random_uniform: f32,
+    ) !u32 {
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const readback_start = std.time.nanoTimestamp();
+        try metal_backend.sampleTopK(
+            self.backend,
+            self.tmp,
+            self.sampled_token,
+            self.model.vocab_size,
+            top_k,
+            temperature,
+            random_uniform,
+        );
+        try metal_backend.commitSequence(self.backend);
+        var token: [1]u32 = .{0};
+        try metal_backend.readBufferU32(self.sampled_token, &token);
+        self.recordCategoryWithShape(.readback, readback_start, .{
+            .rows = 1,
+            .cols = 1,
+            .depth = self.model.vocab_size,
+            .extra = top_k,
+        });
+        return token[0];
+    }
+
     pub fn runOutputShortlist(
         self: *Session,
         norm: TensorDesc,

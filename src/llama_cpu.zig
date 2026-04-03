@@ -86,6 +86,13 @@ const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
 
+fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOptions) runtime_types.EffectiveSamplingPath {
+    if (!has_gpu_session) return .cpu_logits;
+    const path = runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
+    if (path == .gpu_topk_sampler and !runtime_types.canUseGpuTopKSampling(options)) return .cpu_logits;
+    return path;
+}
+
 const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
@@ -568,6 +575,7 @@ const Session = struct {
         const last_token = prompt_tokens[prompt_tokens.len - 1];
         switch (sampling_path) {
             .gpu_greedy_argmax => _ = try self.stepGreedy(last_token),
+            .gpu_topk_sampler => unreachable,
             .gpu_shortlist_cpu_sampler => _ = try self.stepShortlist(last_token, shortlist_len),
             .cpu_logits => _ = try self.step(last_token),
         }
@@ -591,6 +599,26 @@ const Session = struct {
         self.pending_greedy_token = null;
         self.finishToken(token_id);
         return shortlist;
+    }
+
+    fn stepGpuTopK(self: *Session, token_id: u32, top_k: usize, temperature: f32, random_uniform: f32) !u32 {
+        if (self.gpu_session == null) {
+            _ = try self.step(token_id);
+            return argmax(self.logits);
+        }
+        try self.runTokenCore(token_id);
+        const gpu_session = &self.gpu_session.?;
+        const next_token = try gpu_session.runOutputSampleTopK(
+            adaptTensorDesc(self.model.output_norm),
+            adaptTensorDesc(self.model.output),
+            top_k,
+            temperature,
+            random_uniform,
+        );
+        self.pending_greedy_token = next_token;
+        self.pending_shortlist_len = 0;
+        self.finishToken(token_id);
+        return next_token;
     }
 
     fn stepGreedy(self: *Session, token_id: u32) !u32 {
@@ -996,29 +1024,43 @@ pub fn generateLoadedStreaming(
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
-    const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
+    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, session.token_buffer);
-    try session.runPrompt(session.token_buffer[0..prompt_token_count], sampling_path, shortlist_len);
+    switch (sampling_path) {
+        .gpu_topk_sampler => {
+            if (prompt_token_count == 0) return error.EmptyPrompt;
+            if (prompt_token_count > 1) {
+                for (session.token_buffer[0 .. prompt_token_count - 1]) |token_id| {
+                    try session.stepNoOutput(token_id);
+                }
+            }
+            _ = try session.stepGpuTopK(session.token_buffer[prompt_token_count - 1], gpu_top_k, options.temperature, random.float(f32));
+        },
+        else => try session.runPrompt(session.token_buffer[0..prompt_token_count], sampling_path, shortlist_len),
+    }
     const prompt_end = std.time.nanoTimestamp();
 
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
     const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
-    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, if (shortlist_sampling) llama_gpu.max_shortlist_len else session.logits.len);
+    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
     const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const next_token = if (gpu_greedy) blk: {
+        const next_token = if (gpu_greedy or gpu_topk) blk: {
             break :blk greedy_next_token.?;
         } else if (gpu_shortlist) blk: {
             const sample_begin = std.time.nanoTimestamp();
@@ -1053,6 +1095,8 @@ pub fn generateLoadedStreaming(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             greedy_next_token = try session.stepGreedy(next_token);
+        } else if (gpu_topk) {
+            greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
             _ = try session.stepShortlist(next_token, shortlist_len);
         } else {
@@ -1130,31 +1174,45 @@ pub fn generateLoadedStreamingCached(
     }
 
     if (session.position < prompt_token_count) {
-        const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
+        const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
         const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
-        try session.runPrompt(prompt_tokens[session.position..prompt_token_count], sampling_path, shortlist_len);
+        const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
+        if (sampling_path == .gpu_topk_sampler) {
+            const remaining = prompt_tokens[session.position..prompt_token_count];
+            if (remaining.len > 1) {
+                for (remaining[0 .. remaining.len - 1]) |token_id| {
+                    try session.stepNoOutput(token_id);
+                }
+            }
+            _ = try session.stepGpuTopK(remaining[remaining.len - 1], gpu_top_k, options.temperature, random.float(f32));
+        } else {
+            try session.runPrompt(prompt_tokens[session.position..prompt_token_count], sampling_path, shortlist_len);
+        }
     }
     const prompt_end = std.time.nanoTimestamp();
 
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
-    const sampling_path = runtime_types.resolveSamplingPath(session.gpu_session != null, options.temperature, options.sampling_strategy);
+    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
-    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, if (shortlist_sampling) llama_gpu.max_shortlist_len else session.logits.len);
+    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
     var ttft_ns = deltaNs(startup_begin, prompt_end);
     var first_decode_step_ns: u64 = 0;
     const gpu_greedy = sampling_path == .gpu_greedy_argmax;
+    const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
-        const next_token = if (gpu_greedy) blk: {
+        const next_token = if (gpu_greedy or gpu_topk) blk: {
             break :blk greedy_next_token.?;
         } else if (gpu_shortlist) blk: {
             const sample_begin = std.time.nanoTimestamp();
@@ -1189,6 +1247,8 @@ pub fn generateLoadedStreamingCached(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             greedy_next_token = try session.stepGreedy(next_token);
+        } else if (gpu_topk) {
+            greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
             _ = try session.stepShortlist(next_token, shortlist_len);
         } else {

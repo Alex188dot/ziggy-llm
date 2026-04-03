@@ -354,4 +354,16 @@ int ziggy_metal_topk_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_sample_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_token,
+    uint32_t count,
+    uint32_t top_k,
+    float temperature,
+    float random_uniform,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif

@@ -863,6 +863,33 @@ pub fn topKShortlist(
     ), &error_buf);
 }
 
+pub fn sampleTopK(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_token: BufferHandle,
+    count: usize,
+    top_k: usize,
+    temperature: f32,
+    random_uniform: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (top_k == 0 or top_k > 64 or !(temperature > 0)) return error.InvalidTensorMetadata;
+    if (output_token.byte_len < @sizeOf(u32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_sample_topk_f32(
+        state.context,
+        input.raw,
+        output_token.raw,
+        @intCast(count),
+        @intCast(top_k),
+        temperature,
+        random_uniform,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;

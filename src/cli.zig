@@ -216,7 +216,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
-        \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-shortlist, cpu-full-logits (default: {s})
+        \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-topk-sample, gpu-shortlist, cpu-full-logits (default: {s})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:

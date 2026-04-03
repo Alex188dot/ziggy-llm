@@ -911,3 +911,113 @@ kernel void topk_f32(
         output_entries[i].score = best_values[i];
     }
 }
+
+kernel void sample_topk_f32(
+    device const float *input [[buffer(0)]],
+    device uint *output_token [[buffer(1)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &top_k [[buffer(4)]],
+    constant uint &thread_count [[buffer(5)]],
+    constant float &temperature [[buffer(6)]],
+    constant float &random_uniform [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (count == 0 || top_k == 0 || top_k > ZIGGY_SHORTLIST_MAX_K || thread_count == 0 || thread_count > ZIGGY_SHORTLIST_THREAD_COUNT) return;
+    if (tid >= thread_count) return;
+
+    float best_values[ZIGGY_SHORTLIST_MAX_K];
+    uint best_indices[ZIGGY_SHORTLIST_MAX_K];
+    for (uint i = 0; i < top_k; i += 1) {
+        best_values[i] = -INFINITY;
+        best_indices[i] = 0;
+    }
+
+    for (uint i = tid; i < count; i += thread_count) {
+        const float value = input[i];
+        uint insert_at = top_k;
+        for (uint slot = 0; slot < top_k; slot += 1) {
+            const bool better_value = value > best_values[slot];
+            const bool equal_value = value == best_values[slot];
+            const bool better_tie = equal_value && i < best_indices[slot];
+            if (better_value || better_tie) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == top_k) continue;
+
+        for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+            best_values[shift] = best_values[shift - 1];
+            best_indices[shift] = best_indices[shift - 1];
+        }
+        best_values[insert_at] = value;
+        best_indices[insert_at] = i;
+    }
+
+    threadgroup float scratch_values[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+    threadgroup uint scratch_indices[ZIGGY_SHORTLIST_THREAD_COUNT * ZIGGY_SHORTLIST_MAX_K];
+    const uint scratch_base = tid * ZIGGY_SHORTLIST_MAX_K;
+    for (uint i = 0; i < top_k; i += 1) {
+        scratch_values[scratch_base + i] = best_values[i];
+        scratch_indices[scratch_base + i] = best_indices[i];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+
+    for (uint worker = 1; worker < thread_count; worker += 1) {
+        const uint worker_base = worker * ZIGGY_SHORTLIST_MAX_K;
+        for (uint candidate_index = 0; candidate_index < top_k; candidate_index += 1) {
+            const float value = scratch_values[worker_base + candidate_index];
+            const uint token = scratch_indices[worker_base + candidate_index];
+            uint insert_at = top_k;
+            for (uint slot = 0; slot < top_k; slot += 1) {
+                const bool better_value = value > best_values[slot];
+                const bool equal_value = value == best_values[slot];
+                const bool better_tie = equal_value && token < best_indices[slot];
+                if (better_value || better_tie) {
+                    insert_at = slot;
+                    break;
+                }
+            }
+            if (insert_at == top_k) continue;
+            for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+                best_values[shift] = best_values[shift - 1];
+                best_indices[shift] = best_indices[shift - 1];
+            }
+            best_values[insert_at] = value;
+            best_indices[insert_at] = token;
+        }
+    }
+
+    float max_logit = best_values[0];
+    for (uint i = 1; i < top_k; i += 1) {
+        max_logit = max(max_logit, best_values[i]);
+    }
+
+    float weights[ZIGGY_SHORTLIST_MAX_K];
+    float total_weight = 0.0f;
+    for (uint i = 0; i < top_k; i += 1) {
+        const float shifted = (best_values[i] - max_logit) / temperature;
+        const float weight = exp(shifted);
+        weights[i] = weight;
+        total_weight += weight;
+    }
+
+    if (!(total_weight > 0.0f) || !isfinite(total_weight)) {
+        output_token[0] = best_indices[0];
+        return;
+    }
+
+    const float clamped_uniform = clamp(random_uniform, 0.0f, 0.99999994f);
+    const float target = clamped_uniform * total_weight;
+    float cumulative = 0.0f;
+    for (uint i = 0; i < top_k; i += 1) {
+        cumulative += weights[i];
+        if (target <= cumulative) {
+            output_token[0] = best_indices[i];
+            return;
+        }
+    }
+    output_token[0] = best_indices[top_k - 1];
+}

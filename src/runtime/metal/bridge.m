@@ -36,6 +36,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> argmaxPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> topKPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> sampleTopKPipeline;
 @property(nonatomic, strong) id<MTLCommandBuffer> pendingCommandBuffer;
 @end
 
@@ -528,6 +529,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal top-k pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> sample_topk_pipeline = ziggy_pipeline(device, library, @"sample_topk_f32", &pipeline_error);
+        if (sample_topk_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal sample top-k pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         ZiggyMetalState *state = [ZiggyMetalState new];
         state.device = device;
@@ -560,6 +566,7 @@ int ziggy_metal_create_context(
         state.rmsNormPipeline = rms_norm_pipeline;
         state.argmaxPipeline = argmax_pipeline;
         state.topKPipeline = topk_pipeline;
+        state.sampleTopKPipeline = sample_topk_pipeline;
         *out_ctx = (__bridge_retained void *)state;
 
         if (out_info != NULL) {
@@ -1724,6 +1731,59 @@ int ziggy_metal_topk_f32(
                 [encoder setBytes:&count length:sizeof(count) atIndex:3];
                 [encoder setBytes:&top_k length:sizeof(top_k) atIndex:4];
                 [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:5];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_sample_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_token,
+    uint32_t count,
+    uint32_t top_k,
+    float temperature,
+    float random_uniform,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || input == NULL || output_token == NULL || count == 0 || top_k == 0 || top_k > 64 || !(temperature > 0.0f)) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sample top-k request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *token_buffer = ziggy_buffer(output_token);
+        const NSUInteger thread_width = state.sampleTopKPipeline.threadExecutionWidth;
+        const NSUInteger max_total_threads = state.sampleTopKPipeline.maxTotalThreadsPerThreadgroup;
+        uint32_t thread_count = 32;
+        if (thread_width > 0 && thread_count < thread_width) thread_count = (uint32_t)thread_width;
+        if (max_total_threads > 0 && thread_count > max_total_threads) thread_count = (uint32_t)max_total_threads;
+        if (thread_count == 0 || thread_count > 32) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sample top-k threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        if (input_buffer.length < ((size_t)count * sizeof(float)) || token_buffer.length < sizeof(uint32_t)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sample top-k exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        return ziggy_run_single_threadgroup(
+            state,
+            state.sampleTopKPipeline,
+            thread_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:token_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:3];
+                [encoder setBytes:&top_k length:sizeof(top_k) atIndex:4];
+                [encoder setBytes:&thread_count length:sizeof(thread_count) atIndex:5];
+                [encoder setBytes:&temperature length:sizeof(temperature) atIndex:6];
+                [encoder setBytes:&random_uniform length:sizeof(random_uniform) atIndex:7];
             },
             error_message,
             error_message_len

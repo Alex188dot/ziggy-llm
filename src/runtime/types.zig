@@ -89,12 +89,14 @@ pub const MoonQuantMode = enum {
 pub const SamplingStrategy = enum {
     auto,
     gpu_greedy,
+    gpu_topk_sample,
     gpu_shortlist,
     cpu_full_logits,
 
     pub fn parse(name: []const u8) ?SamplingStrategy {
         if (std.mem.eql(u8, name, "auto")) return .auto;
         if (std.mem.eql(u8, name, "gpu-greedy")) return .gpu_greedy;
+        if (std.mem.eql(u8, name, "gpu-topk-sample")) return .gpu_topk_sample;
         if (std.mem.eql(u8, name, "gpu-shortlist")) return .gpu_shortlist;
         if (std.mem.eql(u8, name, "cpu-full-logits")) return .cpu_full_logits;
         return null;
@@ -104,6 +106,7 @@ pub const SamplingStrategy = enum {
         return switch (self) {
             .auto => "auto",
             .gpu_greedy => "gpu-greedy",
+            .gpu_topk_sample => "gpu-topk-sample",
             .gpu_shortlist => "gpu-shortlist",
             .cpu_full_logits => "cpu-full-logits",
         };
@@ -113,12 +116,14 @@ pub const SamplingStrategy = enum {
 pub const EffectiveSamplingPath = enum {
     cpu_logits,
     gpu_greedy_argmax,
+    gpu_topk_sampler,
     gpu_shortlist_cpu_sampler,
 
     pub fn label(self: EffectiveSamplingPath) []const u8 {
         return switch (self) {
             .cpu_logits => "cpu-logits",
             .gpu_greedy_argmax => "gpu-greedy-argmax",
+            .gpu_topk_sampler => "gpu-topk-sampler",
             .gpu_shortlist_cpu_sampler => "gpu-shortlist-cpu-sampler",
         };
     }
@@ -206,9 +211,18 @@ pub fn resolveSamplingPath(has_gpu_session: bool, temperature: f32, strategy: Sa
     return switch (strategy) {
         .cpu_full_logits => .cpu_logits,
         .gpu_greedy => if (temperature > 0) .cpu_logits else .gpu_greedy_argmax,
+        .gpu_topk_sample => if (temperature > 0) .gpu_topk_sampler else .gpu_greedy_argmax,
         .gpu_shortlist => if (temperature > 0) .gpu_shortlist_cpu_sampler else .gpu_greedy_argmax,
         .auto => if (temperature > 0) .cpu_logits else .gpu_greedy_argmax,
     };
+}
+
+pub fn canUseGpuTopKSampling(options: GenerationOptions) bool {
+    if (!(options.temperature > 0)) return false;
+    if (options.repeat_penalty > 1.0) return false;
+    if (options.top_p < 1.0) return false;
+    if (options.min_p > 0) return false;
+    return options.top_k == 0 or options.top_k <= 64;
 }
 
 pub fn readbackModeFor(backend: BackendUsed, sampling_path: EffectiveSamplingPath) ReadbackMode {
@@ -216,6 +230,7 @@ pub fn readbackModeFor(backend: BackendUsed, sampling_path: EffectiveSamplingPat
     return switch (sampling_path) {
         .cpu_logits => .full_logits_f32,
         .gpu_greedy_argmax => .sampled_token_u32,
+        .gpu_topk_sampler => .sampled_token_u32,
         .gpu_shortlist_cpu_sampler => .shortlist_ids_scores,
     };
 }
@@ -223,6 +238,7 @@ pub fn readbackModeFor(backend: BackendUsed, sampling_path: EffectiveSamplingPat
 test "sampling strategy parser accepts benchmark path values" {
     try std.testing.expectEqual(SamplingStrategy.auto, SamplingStrategy.parse("auto").?);
     try std.testing.expectEqual(SamplingStrategy.gpu_greedy, SamplingStrategy.parse("gpu-greedy").?);
+    try std.testing.expectEqual(SamplingStrategy.gpu_topk_sample, SamplingStrategy.parse("gpu-topk-sample").?);
     try std.testing.expectEqual(SamplingStrategy.gpu_shortlist, SamplingStrategy.parse("gpu-shortlist").?);
     try std.testing.expectEqual(SamplingStrategy.cpu_full_logits, SamplingStrategy.parse("cpu-full-logits").?);
     try std.testing.expect(SamplingStrategy.parse("bogus") == null);
@@ -232,7 +248,17 @@ test "resolveSamplingPath keeps cpu backend on cpu logits and leaves gpu shortli
     try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(false, 0, .auto));
     try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(true, 0.8, .gpu_greedy));
     try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(true, 0.8, .auto));
+    try std.testing.expectEqual(EffectiveSamplingPath.gpu_topk_sampler, resolveSamplingPath(true, 0.8, .gpu_topk_sample));
     try std.testing.expectEqual(EffectiveSamplingPath.gpu_shortlist_cpu_sampler, resolveSamplingPath(true, 0.8, .gpu_shortlist));
     try std.testing.expectEqual(EffectiveSamplingPath.cpu_logits, resolveSamplingPath(true, 0, .cpu_full_logits));
     try std.testing.expectEqual(EffectiveSamplingPath.gpu_greedy_argmax, resolveSamplingPath(true, 0, .auto));
+}
+
+test "canUseGpuTopKSampling only accepts simple stochastic policy" {
+    try std.testing.expect(canUseGpuTopKSampling(.{ .temperature = 0.7 }));
+    try std.testing.expect(canUseGpuTopKSampling(.{ .temperature = 0.7, .top_k = 8 }));
+    try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .repeat_penalty = 1.1 }));
+    try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .top_p = 0.9 }));
+    try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .min_p = 0.1 }));
+    try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .top_k = 128 }));
 }
