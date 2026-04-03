@@ -77,6 +77,7 @@ pub const Session = struct {
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
     sampled_token: metal_backend.BufferHandle,
+    sampled_token_packed: metal_backend.BufferHandle,
     shortlist_entries: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
@@ -111,6 +112,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(tmp);
         const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(sampled_token);
+        const sampled_token_packed = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+        errdefer metal_backend.destroyBuffer(sampled_token_packed);
         const shortlist_entries = try metal_backend.createByteScratchBuffer(backend, max_shortlist_len * @sizeOf(metal_backend.ShortlistEntry));
         errdefer metal_backend.destroyBuffer(shortlist_entries);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -132,6 +135,7 @@ pub const Session = struct {
             .up = up,
             .tmp = tmp,
             .sampled_token = sampled_token,
+            .sampled_token_packed = sampled_token_packed,
             .shortlist_entries = shortlist_entries,
             .k_cache = k_cache,
             .v_cache = v_cache,
@@ -150,6 +154,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
         metal_backend.destroyBuffer(self.sampled_token);
+        metal_backend.destroyBuffer(self.sampled_token_packed);
         metal_backend.destroyBuffer(self.shortlist_entries);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
@@ -283,20 +288,41 @@ pub const Session = struct {
 
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
         try self.runRmsNorm(norm, self.hidden, self.normed);
-        try self.runProjection(tensor, self.normed, self.tmp);
         const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = 1,
             .depth = self.model.vocab_size,
+            .tensor_type = tensor.tensor_type,
         };
         const output_reduce_start = std.time.nanoTimestamp();
-        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        if (tensor.tensor_type == 14) {
+            const initial_state = [_]u32{ 0, std.math.maxInt(u32) };
+            try metal_backend.writeBufferU32(self.sampled_token_packed, &initial_state);
+            const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+            try metal_backend.runMatVecQ6KArgmaxToBuffer(
+                self.backend,
+                matrix,
+                self.normed,
+                self.sampled_token_packed,
+                tensor.rows,
+                tensor.cols,
+            );
+        } else {
+            try self.runProjection(tensor, self.normed, self.tmp);
+            try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        }
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
         const commit_stats = try metal_backend.commitSequenceTimed(self.backend);
         self.recordCommitWait(shape, commit_stats);
-        var token: [1]u32 = .{0};
         const host_readback_start = std.time.nanoTimestamp();
-        try metal_backend.readBufferU32(self.sampled_token, &token);
+        var token: [1]u32 = .{0};
+        if (tensor.tensor_type == 14) {
+            var argmax_state: [2]u32 = .{ 0, 0 };
+            try metal_backend.readBufferU32(self.sampled_token_packed, &argmax_state);
+            token[0] = argmax_state[1];
+        } else {
+            try metal_backend.readBufferU32(self.sampled_token, &token);
+        }
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }

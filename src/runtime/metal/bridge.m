@@ -21,6 +21,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAddPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAdd2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KAdd5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KArgmaxPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ80Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ80AddPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KPipeline;
@@ -463,6 +464,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k matvec pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> matvec_q6k_argmax_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_argmax_f32", &pipeline_error);
+        if (matvec_q6k_argmax_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k argmax pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
         id<MTLComputePipelineState> matvec_q6k_add_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_add_f32", &pipeline_error);
         if (matvec_q6k_add_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k add pipeline");
@@ -582,6 +588,7 @@ int ziggy_metal_create_context(
         state.matvecQ4KAdd2048Pipeline = matvec_q4k_add_2048_pipeline;
         state.matvecQ4KAdd5632Pipeline = matvec_q4k_add_5632_pipeline;
         state.matvecQ6KPipeline = matvec_q6k_pipeline;
+        state.matvecQ6KArgmaxPipeline = matvec_q6k_argmax_pipeline;
         state.matvecQ6KAddPipeline = matvec_q6k_add_pipeline;
         state.matvecQ6KAdd2048Pipeline = matvec_q6k_add_2048_pipeline;
         state.matvecQ6KAdd5632Pipeline = matvec_q6k_add_5632_pipeline;
@@ -1080,6 +1087,68 @@ int ziggy_metal_run_matvec_q6k_add_f32(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q6k add command buffer failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q6k_argmax_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_packed,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || output_packed == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q6k argmax request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output_packed);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
+        if (command_buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        if (input_buffer.length < ((size_t)cols * sizeof(float)) ||
+            output_buffer.length < sizeof(uint64_t)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal q6k argmax exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecQ6KArgmaxPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        ziggy_dispatch_q4k_rows(encoder, state.matvecQ6KArgmaxPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q6k argmax command buffer failed");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         return ZIGGY_METAL_OK;

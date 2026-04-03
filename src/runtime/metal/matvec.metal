@@ -363,6 +363,92 @@ kernel void matvec_q6k_f32(
     }
 }
 
+inline uint ziggy_ordered_float_bits(float value) {
+    const uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
+}
+
+kernel void matvec_q6k_argmax_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device atomic_uint *output_state [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint blocks_per_row = cols / ZIGGY_Q6K_VALUES_PER_BLOCK;
+    const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+    threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
+        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+        const uint block_half = block_chunk / 32;
+        const uint l = block_chunk % 32;
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
+        const device uchar *ql = block + block_half * 64;
+        const device uchar *qh = block + 128 + block_half * 32;
+        const device uchar *scales = block + 192 + block_half * 8;
+        const float d = read_half_le(block, 208);
+        const uint scale_index = l / 16;
+        const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
+        const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
+        const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
+        const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
+        const uchar qh_value = qh[l];
+        const uchar ql_low = ql[l];
+        const uchar ql_high = ql[l + 32];
+        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f;
+        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
+        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
+        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
+        const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
+
+        local_sum += s0 * q1 * input[input_offset + 0];
+        local_sum += s2 * q2 * input[input_offset + 32];
+        local_sum += s4 * q3 * input[input_offset + 64];
+        local_sum += s6 * q4 * input[input_offset + 96];
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+
+        device atomic_uint *best_value = output_state;
+        device atomic_uint *best_token = output_state + 1;
+        uint observed = atomic_load_explicit(best_value, memory_order_relaxed);
+        const uint ordered = ziggy_ordered_float_bits(sum);
+        while (ordered > observed) {
+            if (atomic_compare_exchange_weak_explicit(
+                    best_value,
+                    &observed,
+                    ordered,
+                    memory_order_relaxed,
+                    memory_order_relaxed)) {
+                atomic_store_explicit(best_token, row, memory_order_relaxed);
+                break;
+            }
+        }
+    }
+}
+
 kernel void matvec_q8_0_f32(
     device const uchar *matrix [[buffer(0)]],
     device const float *input [[buffer(1)]],

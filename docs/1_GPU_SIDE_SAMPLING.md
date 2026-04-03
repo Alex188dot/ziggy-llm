@@ -27,18 +27,21 @@ What landed:
   - `host_readback`
 - `commit_wait` also records Metal command-buffer GPU elapsed time when the platform reports valid GPU timestamps.
 - the greedy Metal `argmax` kernel is now a real parallel threadgroup reduction instead of a single-thread linear scan
+- the q6_k output projection path used by TinyLlama greedy decode now has a fused Metal kernel that computes the output projection and argmax in one pass, so the runtime no longer materializes a full vocab logits buffer for that path
 
 What changed in the plan:
 
 - stochastic GPU top-k and shortlist decode paths are now intentionally gated off in runtime selection
 - `--sampling-path gpu-topk-sample` and `--sampling-path gpu-shortlist` fall back to `cpu-logits` for `temperature > 0`
 - full GPU stochastic sampling is explicitly blocked until a hierarchical top-k reduction exists and wins on benchmark
+- shortlist and full GPU stochastic sampling are also blocked until `gpu-greedy` clearly beats `cpu-full-logits` on the same prompt, model, and settings
 
 What the new instrumentation shows on the current greedy path:
 
 - `commit_wait` is the dominant stall
 - `host_readback` is tiny once only a sampled token is copied back
 - the remaining bottleneck is the output-stage synchronization boundary, not CPU sampling policy
+- after fusing q6_k output projection plus argmax, the canonical TinyLlama benchmark is still effectively tied with `cpu-full-logits` instead of clearly faster, so the boundary is still dominated by command-buffer completion rather than host-side logits handling
 
 ## Why This Is The Best First Bet
 
@@ -113,6 +116,7 @@ Expected outcome:
 
 - immediate reduction in per-token synchronization cost
 - a cleaner measurement baseline for later stochastic sampling work
+- a hard gate for future work: if `gpu-greedy` does not clearly beat `cpu-full-logits`, do not proceed to shortlist or full GPU stochastic sampling
 
 ### Stage B: Add GPU Top-K / Shortlist Extraction
 
@@ -133,6 +137,7 @@ Recommended next target:
 - hierarchical multi-pass `top_k` reduction rather than the current single-threadgroup prototype
 - one compact GPU output buffer per token
 - read back only shortlist ids and scores
+- do not re-enable runtime selection for `gpu-topk-sample` or `gpu-shortlist` until that reduction exists and the greedy fused path is already a measured win
 
 ### Stage C: Move Sampling Policy Onto GPU
 
@@ -364,8 +369,10 @@ The current code now makes the greedy fast path explicit instead of implicit:
 - [x] Reuse the existing CPU sampling logic over shortlist candidates before attempting full GPU stochastic sampling.
 - [x] Split decode profiling into `output_reduce`, `commit_wait`, and `host_readback`, and record command-buffer GPU elapsed time when available.
 - [x] Replace the greedy Metal `argmax` single-thread scan with a parallel threadgroup reduction.
+- [x] Fuse the q6_k output projection plus greedy argmax path used by TinyLlama so decode no longer writes a full logits buffer for that path.
 - [x] Gate off stochastic GPU top-k / shortlist runtime selection until a hierarchical top-k reduction exists.
 - [ ] Prove shortlist mode is faster than full-logits readback on the canonical TinyLlama benchmark.
+- [ ] Prove `gpu-greedy` clearly beats `cpu-full-logits` on the same prompt, model, and settings before resuming shortlist or full GPU stochastic sampling work.
 - [ ] Add correctness tests that compare shortlist-assisted sampling against the full CPU sampler under fixed seeds.
 - [ ] Add stress tests for edge cases such as `top_k = 0`, `top_p = 1`, tiny candidate sets, and EOS-heavy outputs.
 - [ ] Add a guarded experimental mode for full GPU stochastic sampling.
@@ -382,9 +389,29 @@ What changed:
 
 - the old single-threadgroup top-k prototype did not deliver a throughput win
 - the stochastic GPU path is now gated off before decode path selection
+- requesting `gpu-topk-sample` now resolves back to `cpu-logits`, which fixes the invalid-token correctness issue while the GPU stochastic path remains unfinished
 - shortlist decode will remain disabled until a hierarchical top-k reduction replaces the current prototype
 
-That means the next meaningful milestone is not “make shortlist selectable again.” It is “land a hierarchical reduction that beats `cpu-logits` on benchmark.”
+That means the next meaningful milestone is not “make shortlist selectable again.” It is “make `gpu-greedy` clearly beat `cpu-full-logits`, then land a hierarchical reduction that beats `cpu-logits` on benchmark.”
+
+## Latest Benchmark Gate
+
+Latest canonical TinyLlama check on `2026-04-03` with:
+
+- prompt: `"Write one short paragraph about Zig."`
+- backend: `metal`
+- `--max-tokens 16 --bench-runs 2 --seed 42`
+
+Result:
+
+- `gpu-greedy`: warm `25.289 tok/s`, `profile.commit_wait.share_pct=98.885`
+- `cpu-full-logits`: warm `25.371 tok/s`, `profile.commit_wait.share_pct=98.598`
+
+Interpretation:
+
+- the fused q6_k output projection plus argmax path is correct and measurably avoids full-logits readback
+- it is not yet a throughput win on the canonical benchmark
+- do not resume shortlist or full GPU stochastic sampling until this gate flips
 
 ## Definition Of Done For This Moonshot Track
 
