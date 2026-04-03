@@ -216,7 +216,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
-        \\      --sampling-path   Sampling path: auto, gpu-greedy, cpu-full-logits (default: {s})
+        \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-shortlist, cpu-full-logits (default: {s})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -266,7 +266,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "cpu-full-logits" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
@@ -278,5 +278,5 @@ test "runtime flags parse correctly" {
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
     try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
     try std.testing.expect(config.metal_profile);
-    try std.testing.expectEqual(runtime.SamplingStrategy.cpu_full_logits, config.sampling_strategy);
+    try std.testing.expectEqual(runtime.SamplingStrategy.gpu_shortlist, config.sampling_strategy);
 }

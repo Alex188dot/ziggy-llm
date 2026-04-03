@@ -305,6 +305,12 @@ The repo now contains the first fixed-size shortlist extraction slice:
 
 This is an API and kernel landing, not a full decode-path switch yet. CPU shortlist sampling reuse still remains as the next step.
 
+The repo now also contains the first end-to-end decode mode for that path:
+
+- `--sampling-path gpu-shortlist` forces stochastic decode to read back only shortlist ids and scores
+- CPU sampler policy is reused over the shortlist rather than over the full vocabulary
+- `auto` still stays on full-logits CPU sampling for stochastic decode until the Metal top-k kernel is fast enough to win on benchmark
+
 ## Implementation Notes
 
 The current code now makes the greedy fast path explicit instead of implicit:
@@ -326,7 +332,7 @@ The current code now makes the greedy fast path explicit instead of implicit:
 - [x] Add the Objective-C bridge plumbing in [`src/runtime/metal/bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) and [`src/runtime/metal/bridge.h`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.h).
 - [x] Add Zig backend wrappers in [`src/runtime/metal_backend.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal_backend.zig) for shortlist extraction and tiny readback.
 - [x] Extend [`src/runtime/llama_gpu.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/llama_gpu.zig) with a `runOutputShortlist` path.
-- [ ] Reuse the existing CPU sampling logic over shortlist candidates before attempting full GPU stochastic sampling.
+- [x] Reuse the existing CPU sampling logic over shortlist candidates before attempting full GPU stochastic sampling.
 - [ ] Prove shortlist mode is faster than full-logits readback on the canonical TinyLlama benchmark.
 - [ ] Add correctness tests that compare shortlist-assisted sampling against the full CPU sampler under fixed seeds.
 - [ ] Add stress tests for edge cases such as `top_k = 0`, `top_p = 1`, tiny candidate sets, and EOS-heavy outputs.
@@ -335,6 +341,20 @@ The current code now makes the greedy fast path explicit instead of implicit:
 - [ ] Decide whether repeat penalty stays on CPU with shortlist mode or moves to GPU in a later phase.
 - [ ] Keep CPU fallback intact until GPU sampling passes both correctness and benchmark gates.
 - [ ] Record before/after TPS snapshots in this file as the work lands.
+
+## Current Shortlist Decode Result
+
+Shortlist decode is now functionally wired, but it is not yet the fast path on the current Metal kernel.
+
+Measured on `2026-04-03` with the same TinyLlama benchmark:
+
+| Mode | Extra flags | warm TPS avg | readback mode | Notes |
+| --- | --- | ---: | --- | --- |
+| Full logits CPU sampler | `--temperature 0.7` | `71.768` | `full-logits-f32` | current default |
+| GPU shortlist + CPU sampler reuse | `--temperature 0.7 --sampling-path gpu-shortlist --top-k 8` | `24.488` | `shortlist-ids-scores` | works, but Metal top-k kernel dominates |
+| GPU shortlist + CPU sampler reuse | `--temperature 0.7 --sampling-path gpu-shortlist` | `4.760` | `shortlist-ids-scores` | fixed shortlist `64` is much too slow right now |
+
+That means steps 4 and 5 are implemented, but the kernel from step 3 still needs a substantial rewrite before this path can replace full-logits readback in `auto`.
 
 ## Definition Of Done For This Moonshot Track
 
