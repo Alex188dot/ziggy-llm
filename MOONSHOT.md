@@ -38,8 +38,8 @@ This file tracks the moonshot execution path. Every time an item is completed, i
 
 ## Pillar 3: Fused Apple-Specific Kernels
 
-- [ ] Prioritize Apple Silicon and Metal as the first-class optimization target.
-- [ ] Add fused decode-first kernels for the dominant llama shapes.
+- [x] Prioritize Apple Silicon and Metal as the first-class optimization target.
+- [x] Add fused decode-first kernels for the dominant llama shapes.
 - [ ] Add quant-specific fast paths for the MoonQuant target family.
 - [ ] Minimize intermediate memory traffic in the decode loop.
 - [ ] Minimize kernel launch overhead in the decode loop.

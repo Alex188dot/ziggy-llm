@@ -344,8 +344,7 @@ pub const Session = struct {
                     used_moon_quant = true;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                    try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
-                    try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                    try metal_backend.runMatVecQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
                 }
             },
             14 => {
@@ -354,8 +353,7 @@ pub const Session = struct {
             },
             else => {
                 const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecToBuffer(self.backend, matrix, input, self.tmp, tensor.rows, tensor.cols);
-                try metal_backend.addInPlace(self.backend, output, self.tmp, tensor.rows);
+                try metal_backend.runMatVecAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
             },
         }
         const shape = metal_profile.ShapeDesc{

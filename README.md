@@ -13,70 +13,7 @@ A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal suppo
 - CLI first
 - tiny OpenAI-compatible server second
 
-The project is not trying to be Zig vLLM or a broad Ollama replacement. The goal is to build a small, understandable, high-performance inference runner that feels native to a MacBook Pro and is easy to benchmark honestly.
-
-## Status
-
-This repository is in the first Apple Silicon runtime stage.
-
-Today, the codebase provides:
-
-- a working Zig build
-- a CLI surface for the core commands
-- a working `inspect` command for GGUF metadata and tensor-table validation
-- a native CPU `llama` GGUF runtime in Zig
-- a native Metal `llama` GGUF runtime on Apple Silicon
-- deterministic `run` and `bench` execution with seed, backend selection, and timing output
-- explicit TTFT reporting in `run` and `bench`
-- a smaller runtime module layout for backend dispatch, llama loading, and CPU/Metal backends
-- project docs, scope, and roadmap
-
-Interactive chat and the HTTP server are not implemented yet. Metal acceleration currently covers the implemented llama-family GGUF runtime on Apple Silicon.
-
-## Repo Description
-
-Suggested short repo description:
-
-> A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal support
-
-Yes, "inference engine" is the right term here. It is accurate, concise, and strong enough for a public repository description without overclaiming.
-
-## Why This Exists
-
-Most local LLM tools optimize for breadth:
-
-- many backends
-- many model families
-- many deployment modes
-- many integrations
-
-That breadth is useful, but it also creates complexity, larger binaries, more moving parts, and less room to optimize deeply for one machine class.
-
-`ziggy-llm` goes the other direction. It optimizes for depth:
-
-- one model container format
-- one primary platform
-- one primary acceleration path
-- one primary use case
-
-The thesis is simple: a narrow Mac-first inference runner can ship faster, feel cleaner, and make more credible performance claims than a general-purpose platform built too early.
-
-## Target Machine
-
-Primary development target:
-
-- Apple Silicon MacBook Pro
-- Apple M3
-- 18 GB unified memory
-
-That target shapes the project:
-
-- 1B to 3B instruct models should feel great
-- 7B quantized models should be a realistic stretch target
-- startup time and TTFT matter more than feature sprawl
-- Metal is the first-class runtime, not an afterthought
-
-Linux support is intentionally left open for future CPU support, but macOS on Apple Silicon is the only first-class target in the early versions.
+The goal is to build a small, understandable, high-performance inference runner that feels native to a MacBook Pro and is easy to benchmark honestly.
 
 ## Product Shape
 
@@ -114,18 +51,6 @@ Zig is a strong fit for this project because it makes the important tradeoffs vi
 
 For local inference, hidden allocations and accidental complexity matter. Zig keeps both under pressure.
 
-## Differentiation
-
-There are related Zig projects, but this combination is still open:
-
-- `cgbur/llama2.zig` proves there is interest in pure Zig inference, but it is closer to a focused educational runtime than a Mac-first GGUF + Metal product
-- `jaco-bro/MLX.zig` is relevant to Apple Silicon, but it is built around MLX rather than a Zig-native GGUF runtime
-- `zolotukhin/zinc` is the closest serious Zig inference engine in product ambition, but it is AMD GPU + Vulkan + Linux-first rather than Mac-first + Metal-first
-
-The gap this repo is trying to own is:
-
-> a small-surface, Zig-native, GGUF-first, Metal-first local inference runner for Apple Silicon
-
 ## Planned CLI
 
 Target command surface:
@@ -158,7 +83,6 @@ Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve`
 `ziggy-llm inspect` currently supports:
 
 - GGUF `v2` and `v3`
-- little-endian files only
 - `general.type=model` artifacts
 - required `general.architecture` metadata
 - standard inspection fields from `general.*` and `tokenizer.ggml.*`
@@ -182,25 +106,6 @@ Unsupported or rejected today:
 - non-model artifacts such as adapters or auxiliary blobs
 - malformed tensor metadata
 - truncated metadata or tensor payloads
-
-## Runtime Support
-
-The implemented runtime path is intentionally focused:
-
-- architecture: `llama`
-- tokenizer: native `llama` tokenizer path with GGUF vocab, scores, and byte fallback
-- forward pass: native CPU and Metal incremental decode with RMSNorm, RoPE, GQA attention, SiLU-gated FFN, and KV cache
-- currently implemented tensor types: `F32`, `F16`, `Q4_K`, and `Q6_K`
-- intended use: real TinyLlama/LLaMA-family GGUF execution through the native runtime
-
-Current Metal-specific limitations:
-
-- Apple Silicon macOS builds only
-- Metal acceleration is currently implemented for the `llama` runtime only
-- quantized Metal fast paths now cover generic `Q4_K`, packed MoonQuant `Q4_K`, and raw `Q6_K`
-- the canonical MoonQuant comparison path is `zig build moon-quant-guardrail -- --model ...`, and it now reports warm per-op decode deltas plus MoonQuant-attributable projection time
-- `--metal-profile` now reports startup tensor-prepare / prewarm cost alongside the decode profile
-- performance notes and current benchmark numbers for the M3 target machine are recorded in [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
 
 ## Planned HTTP API
 
@@ -287,51 +192,6 @@ Run tests:
 ```bash
 zig build test
 ```
-
-## Repository Docs
-
-- [PROJECT_OUTLINE.md](/Users/alessioleodori/HelloWorld/zig_/PROJECT_OUTLINE.md)
-- [ROADMAP.md](/Users/alessioleodori/HelloWorld/zig_/ROADMAP.md)
-- [docs/apple-silicon-runtime.md](/Users/alessioleodori/HelloWorld/zig_/docs/apple-silicon-runtime.md)
-
-## Error Handling Conventions
-
-Early scaffold conventions:
-
-- CLI parsing returns explicit errors for unknown commands, unknown flags, missing values, and invalid ports
-- command handlers print scaffold status instead of pretending unimplemented features already exist
-- unsupported functionality should fail clearly and specifically rather than silently degrade
-- initialization-time failures and runtime hot-path behavior should stay conceptually separate as the engine grows
-
-## Success Criteria
-
-Technical success:
-
-- a compact, understandable codebase
-- stable inference on Apple Silicon
-- low startup time
-- competitive TTFT on small and medium GGUF models
-- benchmark methodology that other people can reproduce
-
-Product success:
-
-- one-command first run
-- clear support matrix
-- a README that feels intentional rather than vague
-
-Community success:
-
-- people benchmark it against other serious local runtimes
-- people share MacBook results
-- the repo becomes a credible Zig systems project rather than just an experiment
-
-## Near-Term Priorities
-
-- finish the repo scaffold
-- implement GGUF inspection and validation
-- improve llama CPU and Metal throughput
-- add a minimal OpenAI-compatible server
-- publish honest M3 benchmark results
 
 ## License
 

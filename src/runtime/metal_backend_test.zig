@@ -44,6 +44,62 @@ test "metal q4k matvec matches cpu dequantized reference" {
     }
 }
 
+test "metal q4k fused add matches cpu dequantized reference for dominant llama shape" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q4_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q4k-add.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q4k-add.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const rows = 3;
+    const cols = model.feed_forward_length;
+    const tensor = model.layers[0].ffn_down;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    const matrix = try llama_cpu.tensorBytes(&model, tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 31)) - 15)) * 0.03125) + 0.02;
+    }
+
+    var base: [rows]f32 = .{ 0.25, -0.75, 1.5 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.runMatVecQ4KAddToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+
+    var actual: [rows]f32 = undefined;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected: [rows]f32 = base;
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, row_bytes, cols);
+        expected[row] += dot(dequantized_row, input);
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.05);
+    }
+}
+
 test "metal MoonQuant q4k matvec matches cpu dequantized reference" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -182,6 +238,62 @@ test "metal q6k matvec matches cpu dequantized reference" {
     }
 }
 
+test "metal q6k fused add matches cpu dequantized reference for dominant llama shape" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q6_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q6k-add.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q6k-add.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const rows = 3;
+    const cols = model.feed_forward_length;
+    const tensor = model.layers[0].ffn_down;
+    const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
+    const matrix = try llama_cpu.tensorBytes(&model, tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 37)) - 18)) * 0.02) + 0.01;
+    }
+
+    var base: [rows]f32 = .{ -0.5, 0.75, 1.25 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.runMatVecQ6KAddToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+
+    var actual: [rows]f32 = undefined;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected: [rows]f32 = base;
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q6_k, row_bytes, cols);
+        expected[row] += dot(dequantized_row, input);
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.05);
+    }
+}
+
 test "metal dense matvec matches cpu reference" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -214,6 +326,49 @@ test "metal dense matvec matches cpu reference" {
 
     for (0..rows) |row| {
         try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.0005);
+    }
+}
+
+test "metal dense fused add matches cpu reference for dominant llama shape" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const rows = 3;
+    const cols = 2048;
+    const matrix = try std.testing.allocator.alloc(f32, rows * cols);
+    defer std.testing.allocator.free(matrix);
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    var expected: [rows]f32 = .{ 0.5, -1.0, 2.5 };
+    var actual: [rows]f32 = expected;
+
+    for (input, 0..) |*value, col| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(col % 29)) - 14)) * 0.02;
+    }
+    for (0..cols) |col| {
+        for (0..rows) |row| {
+            matrix[row + col * rows] = (@as(f32, @floatFromInt((row * 11 + col * 5) % 37)) - 18.0) * 0.015;
+        }
+    }
+    for (0..rows) |row| {
+        for (0..cols) |col| expected[row] += matrix[row + col * rows] * input[col];
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferF32(output_buffer, &actual);
+    try metal_backend.runMatVecAddToBuffer(backend, matrix, input_buffer, output_buffer, rows, cols);
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.005);
     }
 }
 

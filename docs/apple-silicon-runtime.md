@@ -97,7 +97,8 @@ Current limitations:
 - llama-family GGUF models only
 - sampling still happens on CPU
 - MoonQuant packing remains specific to `Q4_K`, while `Q6_K` now has a direct raw Metal matvec fast path instead of forcing dense `f32` expansion
-- more kernel fusion is still available, especially around projection and sampling work
+- decode-first fused-add kernels now cover dense, raw `Q4_K`, `Q6_K`, and packed MoonQuant `Q4_K` residual projections, with `2048` and `5632` column specializations for the dominant llama decode shapes
+- more kernel fusion is still available, especially around normalization, attention-adjacent work, and sampling
 
 ## Running Inference On GPU
 
@@ -116,5 +117,7 @@ Notes:
 - `zig build moon-quant-guardrail -- ...` is the canonical MoonQuant comparison command to preserve across optimization work
 - `Q6_K` Metal runs now stay on a raw quantized matvec path instead of dequantizing through the dense fallback first
 - `Q6_K` residual-add projections now stay on the direct quantized Metal path instead of paying for a temp-buffer add round-trip
+- `Q4_K` residual-add projections now also stay on a direct fused-add path even when MoonQuant packing is disabled
+- dense residual projections now use a fused-add Metal kernel rather than a matvec-to-temp plus separate add pass
 - prefer `bench` over `run` for published numbers, because `bench --bench-runs N` separates cold startup from warm reused-runtime measurements
 - compare CPU and Metal with the same prompt, token count, seed, and model when tracking regressions
