@@ -44,6 +44,36 @@ test "metal q4k matvec matches cpu dequantized reference" {
     }
 }
 
+test "metal top-k shortlist returns descending logits with stable ties" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const logits = [_]f32{ 0.2, 1.5, -2.0, 1.0, 3.0, 0.4, 1.5, -1.0 };
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, logits.len);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const token_buffer = try metal_backend.createScratchBuffer(backend, 3);
+    defer metal_backend.destroyBuffer(token_buffer);
+    const score_buffer = try metal_backend.createScratchBuffer(backend, 3);
+    defer metal_backend.destroyBuffer(score_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &logits);
+    try metal_backend.topKShortlist(backend, input_buffer, token_buffer, score_buffer, logits.len, 3);
+
+    var token_ids: [3]u32 = undefined;
+    var scores: [3]f32 = undefined;
+    try metal_backend.readBufferU32(token_buffer, &token_ids);
+    try metal_backend.readBufferF32(score_buffer, &scores);
+
+    try std.testing.expectEqualSlices(u32, &.{ 4, 1, 6 }, &token_ids);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), scores[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), scores[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), scores[2], 0.0001);
+}
+
 test "metal q4k fused add matches cpu dequantized reference for dominant llama shape" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);

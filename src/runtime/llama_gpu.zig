@@ -56,6 +56,13 @@ pub const ModelDesc = struct {
     rms_norm_eps: f32,
 };
 
+pub const ShortlistEntry = struct {
+    token_id: u32,
+    logit: f32,
+};
+
+pub const max_shortlist_len: usize = 64;
+
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
     dense_lookup: DenseLookup,
@@ -70,6 +77,8 @@ pub const Session = struct {
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
     sampled_token: metal_backend.BufferHandle,
+    shortlist_tokens: metal_backend.BufferHandle,
+    shortlist_scores: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
@@ -103,6 +112,10 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(tmp);
         const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(sampled_token);
+        const shortlist_tokens = try metal_backend.createScratchBuffer(backend, max_shortlist_len);
+        errdefer metal_backend.destroyBuffer(shortlist_tokens);
+        const shortlist_scores = try metal_backend.createScratchBuffer(backend, max_shortlist_len);
+        errdefer metal_backend.destroyBuffer(shortlist_scores);
         const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
@@ -122,6 +135,8 @@ pub const Session = struct {
             .up = up,
             .tmp = tmp,
             .sampled_token = sampled_token,
+            .shortlist_tokens = shortlist_tokens,
+            .shortlist_scores = shortlist_scores,
             .k_cache = k_cache,
             .v_cache = v_cache,
             .profiler = profiler,
@@ -139,6 +154,8 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
         metal_backend.destroyBuffer(self.sampled_token);
+        metal_backend.destroyBuffer(self.shortlist_tokens);
+        metal_backend.destroyBuffer(self.shortlist_scores);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
         self.* = undefined;
@@ -281,6 +298,47 @@ pub const Session = struct {
             .depth = self.model.vocab_size,
         });
         return token[0];
+    }
+
+    pub fn runOutputShortlist(
+        self: *Session,
+        norm: TensorDesc,
+        tensor: TensorDesc,
+        shortlist_len: usize,
+        out: []ShortlistEntry,
+    ) ![]const ShortlistEntry {
+        if (shortlist_len == 0 or shortlist_len > max_shortlist_len) return error.InvalidTensorMetadata;
+        if (out.len < shortlist_len) return error.InvalidTensorMetadata;
+
+        try self.runRmsNorm(norm, self.hidden, self.normed);
+        try self.runProjection(tensor, self.normed, self.tmp);
+        const readback_start = std.time.nanoTimestamp();
+        try metal_backend.topKShortlist(
+            self.backend,
+            self.tmp,
+            self.shortlist_tokens,
+            self.shortlist_scores,
+            self.model.vocab_size,
+            shortlist_len,
+        );
+        try metal_backend.commitSequence(self.backend);
+
+        var token_ids: [max_shortlist_len]u32 = [_]u32{0} ** max_shortlist_len;
+        var scores: [max_shortlist_len]f32 = [_]f32{0} ** max_shortlist_len;
+        try metal_backend.readBufferU32(self.shortlist_tokens, token_ids[0..shortlist_len]);
+        try metal_backend.readBufferF32(self.shortlist_scores, scores[0..shortlist_len]);
+        for (0..shortlist_len) |index| {
+            out[index] = .{
+                .token_id = token_ids[index],
+                .logit = scores[index],
+            };
+        }
+        self.recordCategoryWithShape(.readback, readback_start, .{
+            .rows = 2,
+            .cols = shortlist_len,
+            .depth = self.model.vocab_size,
+        });
+        return out[0..shortlist_len];
     }
 
     fn runRmsNorm(

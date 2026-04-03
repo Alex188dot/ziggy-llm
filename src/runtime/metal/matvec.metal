@@ -818,3 +818,50 @@ kernel void argmax_f32(
     }
     output_token[0] = best_index;
 }
+
+constant uint ZIGGY_SHORTLIST_MAX_K = 64;
+
+kernel void topk_f32(
+    device const float *input [[buffer(0)]],
+    device uint *output_tokens [[buffer(1)]],
+    device float *output_scores [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &top_k [[buffer(4)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0 || count == 0 || top_k == 0 || top_k > ZIGGY_SHORTLIST_MAX_K) return;
+
+    float best_values[ZIGGY_SHORTLIST_MAX_K];
+    uint best_indices[ZIGGY_SHORTLIST_MAX_K];
+    for (uint i = 0; i < top_k; i += 1) {
+        best_values[i] = -INFINITY;
+        best_indices[i] = 0;
+    }
+
+    for (uint i = 0; i < count; i += 1) {
+        const float value = input[i];
+        uint insert_at = top_k;
+        for (uint slot = 0; slot < top_k; slot += 1) {
+            const bool better_value = value > best_values[slot];
+            const bool equal_value = value == best_values[slot];
+            const bool better_tie = equal_value && i < best_indices[slot];
+            if (better_value || better_tie) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == top_k) continue;
+
+        for (uint shift = top_k - 1; shift > insert_at; shift -= 1) {
+            best_values[shift] = best_values[shift - 1];
+            best_indices[shift] = best_indices[shift - 1];
+        }
+        best_values[insert_at] = value;
+        best_indices[insert_at] = i;
+    }
+
+    for (uint i = 0; i < top_k; i += 1) {
+        output_tokens[i] = best_indices[i];
+        output_scores[i] = best_values[i];
+    }
+}

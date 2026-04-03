@@ -251,6 +251,60 @@ For Metal profiling, the distinction is visible in two places:
 - `readback_mode=sampled-token-u32` versus `readback_mode=full-logits-f32`
 - `profile.shape_*` entries for `readback`, where greedy GPU argmax shows `cols=1` and full-logits mode shows `cols=vocab_size`
 
+## Current TinyLlama Baseline
+
+Measured on `2026-04-03` on:
+
+- model: `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`
+- machine: `Mac15,6`
+- CPU/GPU class: `Apple M3 Pro`
+- memory: `18 GB`
+- OS: `macOS 26.0.1`
+
+Prompt and generation settings used for all runs:
+
+```sh
+./zig-out/bin/ziggy-llm bench \
+  --model /Users/alessioleodori/HelloWorld/zig_/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --prompt "Write one short paragraph about Zig." \
+  --backend metal \
+  --max-tokens 128 \
+  --seed 42 \
+  --bench-runs 5 \
+  --metal-profile
+```
+
+Warm baseline snapshots:
+
+| Mode | Extra flags | warm prompt ms avg | warm TTFT ms avg | warm TPS avg | readback mode |
+| --- | --- | ---: | ---: | ---: | --- |
+| Greedy GPU argmax | `--temperature 0 --sampling-path gpu-greedy` | `561.975` | `562.125` | `33.474` | `sampled-token-u32` |
+| Greedy forced full logits | `--temperature 0 --sampling-path cpu-full-logits` | `551.710` | `551.928` | `33.484` | `full-logits-f32` |
+| Non-greedy current path | `--temperature 0.7` | `548.177` | `548.892` | `33.506` | `full-logits-f32` |
+
+Current profiling snapshots from those same runs:
+
+- Greedy GPU argmax: `profile.readback.ns=3744686000` and `profile.cpu_sampling.ns=0`
+- Greedy forced full logits: `profile.readback.ns=3653074000` and `profile.cpu_sampling.ns=6675000`
+- Non-greedy current path: `profile.readback.ns=3648060000` and `profile.cpu_sampling.ns=24190000`
+
+What that means right now:
+
+- the fast path isolation is real and measurable in output
+- greedy GPU sampling is functionally on the tiny-readback path
+- on this benchmark, readback plus synchronization still dominates both greedy modes, so the throughput gain is not yet material
+
+## Shortlist API Status
+
+The repo now contains the first fixed-size shortlist extraction slice:
+
+- a Metal `topk_f32` kernel with `top_k <= 64`
+- Objective-C bridge entrypoint `ziggy_metal_topk_f32`
+- Zig backend wrapper `topKShortlist`
+- GPU session method `runOutputShortlist`
+
+This is an API and kernel landing, not a full decode-path switch yet. CPU shortlist sampling reuse still remains as the next step.
+
 ## Implementation Notes
 
 The current code now makes the greedy fast path explicit instead of implicit:
@@ -262,16 +316,16 @@ The current code now makes the greedy fast path explicit instead of implicit:
 
 ## Checklist
 
-- [ ] Document the current baseline for greedy decode and non-greedy decode on TinyLlama `1.1B`.
-- [ ] Confirm from profiling output how much time is currently spent in `readback` and `cpu_sampling`.
+- [x] Document the current baseline for greedy decode and non-greedy decode on TinyLlama `1.1B`.
+- [x] Confirm from profiling output how much time is currently spent in `readback` and `cpu_sampling`.
 - [x] Make GPU greedy sampling the explicit default fast path for `temperature <= 0`.
 - [x] Verify the greedy Metal path reads back only one token id, not the full logits vector.
 - [x] Add benchmark output that clearly distinguishes full-logits readback from tiny-token readback.
-- [ ] Add a Metal backend API for shortlist extraction rather than full-logits readback.
-- [ ] Implement a first fixed-size GPU `top-k` or shortlist kernel in [`src/runtime/metal/matvec.metal`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/matvec.metal).
-- [ ] Add the Objective-C bridge plumbing in [`src/runtime/metal/bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) and [`src/runtime/metal/bridge.h`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.h).
-- [ ] Add Zig backend wrappers in [`src/runtime/metal_backend.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal_backend.zig) for shortlist extraction and tiny readback.
-- [ ] Extend [`src/runtime/llama_gpu.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/llama_gpu.zig) with a `runOutputShortlist` path.
+- [x] Add a Metal backend API for shortlist extraction rather than full-logits readback.
+- [x] Implement a first fixed-size GPU `top-k` or shortlist kernel in [`src/runtime/metal/matvec.metal`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/matvec.metal).
+- [x] Add the Objective-C bridge plumbing in [`src/runtime/metal/bridge.m`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.m) and [`src/runtime/metal/bridge.h`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal/bridge.h).
+- [x] Add Zig backend wrappers in [`src/runtime/metal_backend.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/metal_backend.zig) for shortlist extraction and tiny readback.
+- [x] Extend [`src/runtime/llama_gpu.zig`](/Users/alessioleodori/HelloWorld/zig_/src/runtime/llama_gpu.zig) with a `runOutputShortlist` path.
 - [ ] Reuse the existing CPU sampling logic over shortlist candidates before attempting full GPU stochastic sampling.
 - [ ] Prove shortlist mode is faster than full-logits readback on the canonical TinyLlama benchmark.
 - [ ] Add correctness tests that compare shortlist-assisted sampling against the full CPU sampler under fixed seeds.

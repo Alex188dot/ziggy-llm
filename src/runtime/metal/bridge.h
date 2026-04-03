@@ -344,4 +344,15 @@ int ziggy_metal_argmax_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_topk_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_tokens,
+    ZiggyMetalBuffer *output_scores,
+    uint32_t count,
+    uint32_t top_k,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif

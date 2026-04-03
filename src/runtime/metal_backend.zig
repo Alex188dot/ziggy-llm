@@ -826,6 +826,30 @@ pub fn argmax(
     ), &error_buf);
 }
 
+pub fn topKShortlist(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_tokens: BufferHandle,
+    output_scores: BufferHandle,
+    count: usize,
+    top_k: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (top_k == 0 or top_k > 64) return error.InvalidTensorMetadata;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_topk_f32(
+        state.context,
+        input.raw,
+        output_tokens.raw,
+        output_scores.raw,
+        @intCast(count),
+        @intCast(top_k),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 fn metalMatVec(
     ctx: ?*anyopaque,
     out: []f32,
