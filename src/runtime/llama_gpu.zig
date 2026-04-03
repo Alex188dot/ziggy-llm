@@ -174,7 +174,6 @@ pub const Session = struct {
 
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
-        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
         const kv_k_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPEToDst(
             self.backend,
@@ -200,7 +199,7 @@ pub const Session = struct {
             .extra = position + 1,
         });
         const kv_v_start = std.time.nanoTimestamp();
-        try metal_backend.copyBufferRegion(self.backend, self.v, 0, self.v_cache, kv_offset, kv_bytes);
+        try self.runProjectionToDst(layer.attn_v, self.normed, self.v_cache, kv_offset);
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
             .cols = self.model.kv_dimension,
@@ -313,6 +312,47 @@ pub const Session = struct {
                     tensor.rows,
                     tensor.cols,
                 );
+            },
+        }
+        const shape = metal_profile.ShapeDesc{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+        }
+    }
+
+    fn runProjectionToDst(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        output_offset_bytes: usize,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
+        switch (tensor.tensor_type) {
+            12 => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                    used_moon_quant = true;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                }
+            },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+            },
+            else => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
             },
         }
         const shape = metal_profile.ShapeDesc{
