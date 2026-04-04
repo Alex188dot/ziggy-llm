@@ -753,6 +753,48 @@ const Session = struct {
         self.finishToken(token_id);
     }
 
+    fn findDraftTokens(self: *Session, next_token: u32, max_draft: usize) []const u32 {
+        if (self.position < 3) return &.{};
+
+        const prev_token = self.token_buffer[self.position - 1];
+        var i: usize = self.position - 3;
+        while (true) {
+            if (self.token_buffer[i] == prev_token and self.token_buffer[i + 1] == next_token) {
+                const match_end = i + 2;
+                const available = self.position - match_end;
+                const draft_len = @min(max_draft, available);
+                if (draft_len > 0) {
+                    return self.token_buffer[match_end .. match_end + draft_len];
+                }
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+        return &.{};
+    }
+
+    fn verifyDraftTokensSequential(self: *Session, current_token: u32, draft_tokens: []const u32, out_accepted: []u32) !usize {
+        var accepted_count: usize = 0;
+        var next_input = current_token;
+
+        for (draft_tokens) |draft| {
+            const predicted = try self.stepGreedy(next_input);
+            out_accepted[accepted_count] = predicted;
+            accepted_count += 1;
+
+            if (predicted != draft) {
+                return accepted_count;
+            }
+            next_input = draft;
+        }
+
+        const bonus_predicted = try self.stepGreedy(next_input);
+        out_accepted[accepted_count] = bonus_predicted;
+        accepted_count += 1;
+
+        return accepted_count;
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
         try self.runTokenCore(token_id);
         self.pending_greedy_token = null;
@@ -1178,6 +1220,9 @@ pub fn generateLoadedStreaming(
     const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
+    const max_draft_len = 3;
+    var accepted_tokens: [max_draft_len + 1]u32 = undefined;
+
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
@@ -1200,10 +1245,12 @@ pub fn generateLoadedStreaming(
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
+
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
         }
+
         const chunk_start = output.items.len;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
@@ -1217,12 +1264,45 @@ pub fn generateLoadedStreaming(
                 else => return err,
             };
         }
+
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
+
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
-            greedy_next_token = try session.stepGreedy(next_token);
+            const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
+            if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else {
+                greedy_next_token = try session.stepGreedy(next_token);
+            }
         } else if (gpu_topk) {
             greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
@@ -1230,6 +1310,7 @@ pub fn generateLoadedStreaming(
         } else {
             _ = try session.step(next_token);
         }
+
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
@@ -1339,6 +1420,9 @@ pub fn generateLoadedStreamingCached(
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
     const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
+    const max_draft_len = 3;
+    var accepted_tokens: [max_draft_len + 1]u32 = undefined;
+
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
@@ -1361,10 +1445,12 @@ pub fn generateLoadedStreamingCached(
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
+
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
         }
+
         const chunk_start = output.items.len;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
@@ -1378,12 +1464,45 @@ pub fn generateLoadedStreamingCached(
                 else => return err,
             };
         }
+
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
+
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
-            greedy_next_token = try session.stepGreedy(next_token);
+            const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
+            if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else {
+                greedy_next_token = try session.stepGreedy(next_token);
+            }
         } else if (gpu_topk) {
             greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
@@ -1391,6 +1510,7 @@ pub fn generateLoadedStreamingCached(
         } else {
             _ = try session.step(next_token);
         }
+
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
