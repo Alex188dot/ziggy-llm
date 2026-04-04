@@ -54,6 +54,7 @@ pub const ModelDesc = struct {
     rope_freq_base: f32,
     vocab_size: usize,
     rms_norm_eps: f32,
+    token_embd_offset: u64,
 };
 
 pub const ShortlistEntry = struct {
@@ -62,6 +63,7 @@ pub const ShortlistEntry = struct {
 };
 
 pub const max_shortlist_len: usize = 64;
+pub const max_draft_len: usize = 4;
 
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
@@ -79,6 +81,8 @@ pub const Session = struct {
     shortlist_entries: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
+    batch_logits: metal_backend.BufferHandle,
+    batch_tokens: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
 
     pub fn init(
@@ -114,6 +118,10 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
         errdefer metal_backend.destroyBuffer(v_cache);
+        const batch_logits = try metal_backend.createScratchBuffer(backend, max_draft_len * model.vocab_size);
+        errdefer metal_backend.destroyBuffer(batch_logits);
+        const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
+        errdefer metal_backend.destroyBuffer(batch_tokens);
 
         return .{
             .backend = backend,
@@ -131,6 +139,8 @@ pub const Session = struct {
             .shortlist_entries = shortlist_entries,
             .k_cache = k_cache,
             .v_cache = v_cache,
+            .batch_logits = batch_logits,
+            .batch_tokens = batch_tokens,
             .profiler = profiler,
         };
     }
@@ -148,6 +158,8 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.shortlist_entries);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
+        metal_backend.destroyBuffer(self.batch_logits);
+        metal_backend.destroyBuffer(self.batch_tokens);
         self.* = undefined;
     }
 
@@ -581,5 +593,124 @@ pub const Session = struct {
 
     fn elapsedSince(start_ns: i128) u64 {
         return @intCast(@max(@as(i128, 0), std.time.nanoTimestamp() - start_ns));
+    }
+
+    pub fn runBatchSpeculativeDecode(
+        self: *Session,
+        layers: []const LayerDesc,
+        draft_tokens: []const u32,
+        base_position: usize,
+        out_tokens: []u32,
+    ) !usize {
+        if (draft_tokens.len == 0 or draft_tokens.len > max_draft_len) return 0;
+        const batch_count = draft_tokens.len;
+
+        try metal_backend.beginSequence(self.backend);
+
+        for (draft_tokens, 0..) |draft_token, i| {
+            const position = base_position + i;
+
+            const emb_rows = self.model.embedding_length;
+            const emb_data = self.dense_lookup.getDense(self.model.token_embd_offset) orelse return error.InvalidTensorMetadata;
+            const src = emb_data[draft_token * emb_rows ..][0..emb_rows];
+            var values: [2048]f32 = undefined;
+            if (emb_rows > values.len) return error.InvalidTensorMetadata;
+            @memcpy(values[0..emb_rows], src);
+            try metal_backend.writeBufferF32(self.hidden, values[0..emb_rows]);
+
+            for (layers, 0..) |layer, layer_index| {
+                try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+                try self.runProjection(layer.attn_q, self.normed, self.q);
+
+                try metal_backend.applyRoPE(
+                    self.backend,
+                    self.q,
+                    self.model.head_count,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    position,
+                    self.model.rope_freq_base,
+                );
+
+                const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+                const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
+                try self.runProjectionToDst(layer.attn_k, self.normed, self.k_cache, kv_offset);
+                try metal_backend.applyRoPEAtOffset(
+                    self.backend,
+                    self.k_cache,
+                    kv_offset,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    position,
+                    self.model.rope_freq_base,
+                );
+                try self.runProjectionToDst(layer.attn_v, self.normed, self.v_cache, kv_offset);
+
+                try metal_backend.attentionFused(
+                    self.backend,
+                    self.q,
+                    self.k_cache,
+                    self.v_cache,
+                    self.attn,
+                    self.model.head_count,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.kv_dimension,
+                    self.model.context_length,
+                    position,
+                    layer_base,
+                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
+                );
+
+                try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
+            }
+
+            for (layers) |layer| {
+                try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
+                try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+                try self.runProjection(layer.ffn_up, self.normed, self.up);
+                try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+                try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+            }
+
+            try self.runRmsNorm(self.model.output_norm, self.hidden, self.normed);
+            try self.runProjection(self.model.output, self.normed, self.tmp);
+
+            const logits_offset = i * self.model.vocab_size;
+            try metal_backend.copyBufferRegion(
+                self.backend,
+                self.tmp,
+                0,
+                self.batch_logits,
+                logits_offset * @sizeOf(f32),
+                self.model.vocab_size * @sizeOf(f32),
+            );
+        }
+
+        try metal_backend.batchArgmax(
+            self.backend,
+            self.batch_logits,
+            self.batch_tokens,
+            self.model.vocab_size,
+            batch_count,
+        );
+
+        _ = try metal_backend.commitSequenceTimed(self.backend);
+
+        var token_ids: [max_draft_len]u32 = undefined;
+        try metal_backend.readBufferU32(self.batch_tokens, token_ids[0..batch_count]);
+
+        var accepted: usize = 0;
+        for (draft_tokens, 0..) |draft, i| {
+            const predicted = token_ids[i];
+            out_tokens[i] = predicted;
+            accepted += 1;
+            if (predicted != draft) {
+                return accepted;
+            }
+        }
+
+        return accepted;
     }
 };

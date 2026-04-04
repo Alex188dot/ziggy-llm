@@ -1247,3 +1247,338 @@ kernel void sample_topk_f32(
     }
     output_token[0] = best_indices[top_k - 1];
 }
+
+constant uint ZIGGY_BATCH_ARGMAX_MAX_DRAFTS = 8;
+
+kernel void batch_argmax_f32(
+    device const float *input [[buffer(0)]],
+    device uint *output_tokens [[buffer(1)]],
+    constant uint &vocab_size [[buffer(2)]],
+    constant uint &batch_count [[buffer(3)]],
+    uint batch_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint thread_count [[threads_per_threadgroup]]
+) {
+    if (batch_idx >= batch_count) return;
+    if (vocab_size == 0 || thread_count == 0 || thread_count > 256) return;
+    if (tid >= thread_count) return;
+
+    device const float *batch_input = input + batch_idx * vocab_size;
+
+    float best_value = -INFINITY;
+    uint best_index = 0;
+    for (uint i = tid; i < vocab_size; i += thread_count) {
+        const float value = batch_input[i];
+        if (value > best_value || (value == best_value && i < best_index)) {
+            best_value = value;
+            best_index = i;
+        }
+    }
+
+    threadgroup float scratch_values[256];
+    threadgroup uint scratch_indices[256];
+    scratch_values[tid] = best_value;
+    scratch_indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = thread_count / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            const float rhs_value = scratch_values[tid + stride];
+            const uint rhs_index = scratch_indices[tid + stride];
+            const float lhs_value = scratch_values[tid];
+            const uint lhs_index = scratch_indices[tid];
+            if (rhs_value > lhs_value || (rhs_value == lhs_value && rhs_index < lhs_index)) {
+                scratch_values[tid] = rhs_value;
+                scratch_indices[tid] = rhs_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid != 0) return;
+    output_tokens[batch_idx] = scratch_indices[0];
+}
+
+kernel void batch_matvec_add_f32(
+    device const float *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    constant uint &batch_idx [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    device const float *batch_input = input + batch_idx * cols;
+    device float *batch_output = output + batch_idx * rows;
+
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+
+    uint col = lane * 4;
+    while (col + 3 < cols) {
+        const float4 input_values = float4(
+            batch_input[col + 0],
+            batch_input[col + 1],
+            batch_input[col + 2],
+            batch_input[col + 3]
+        );
+        const float4 matrix_values = float4(
+            matrix[row + (col + 0) * rows],
+            matrix[row + (col + 1) * rows],
+            matrix[row + (col + 2) * rows],
+            matrix[row + (col + 3) * rows]
+        );
+        local_sum += dot(matrix_values, input_values);
+        col += threads_per_group * 4;
+    }
+
+    for (; col < cols; col += threads_per_group) {
+        local_sum += matrix[row + col * rows] * batch_input[col];
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        batch_output[row] = sum;
+    }
+}
+
+#define ZIGGY_BATCH_Q4K_ADD_KERNEL(NAME, STATIC_COLS) \
+kernel void NAME( \
+    device const uchar *matrix [[buffer(0)]], \
+    device const float *input [[buffer(1)]], \
+    device float *output [[buffer(2)]], \
+    constant uint &rows [[buffer(3)]], \
+    constant uint &cols [[buffer(4)]], \
+    constant uint &batch_idx [[buffer(5)]], \
+    uint row [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]], \
+    uint simd_lane [[thread_index_in_simdgroup]], \
+    uint simd_group [[simdgroup_index_in_threadgroup]], \
+    uint threads_per_group [[threads_per_threadgroup]], \
+    uint threads_per_simdgroup [[threads_per_simdgroup]] \
+) { \
+    if (row >= rows) return; \
+    constexpr uint kStaticCols = STATIC_COLS; \
+    const uint effective_cols = kStaticCols == 0 ? cols : kStaticCols; \
+    if (kStaticCols != 0 && cols != kStaticCols) return; \
+    device const float *batch_input = input + batch_idx * effective_cols; \
+    device float *batch_output = output + batch_idx * rows; \
+    const uint blocks_per_row = effective_cols / ZIGGY_Q4K_VALUES_PER_BLOCK; \
+    const uint row_stride = blocks_per_row * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+    const device uchar *row_bytes = matrix + row * row_stride; \
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+    threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    float local_sum = 0.0f; \
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) { \
+        const uint block_group_index = chunk_index / ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint chunk_in_group = chunk_index % ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint block_index = block_group_index / ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint group = block_group_index % ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint q_offset = chunk_in_group * 4; \
+        const uint input_offset = block_index * ZIGGY_Q4K_VALUES_PER_BLOCK + group * ZIGGY_Q4K_VALUES_PER_GROUP + q_offset; \
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+        const float d = read_half_le(block, 0); \
+        const float dmin = read_half_le(block, 2); \
+        const device uchar *scales = block + 4; \
+        const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+        const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+        const uchar4 low_q = packed & uchar4(0x0F); \
+        const uchar4 high_q = packed >> 4; \
+        const float4 input_low = float4( \
+            batch_input[input_offset + 0], \
+            batch_input[input_offset + 1], \
+            batch_input[input_offset + 2], \
+            batch_input[input_offset + 3] \
+        ); \
+        const float4 input_high = float4( \
+            batch_input[input_offset + 32 + 0], \
+            batch_input[input_offset + 32 + 1], \
+            batch_input[input_offset + 32 + 2], \
+            batch_input[input_offset + 32 + 3] \
+        ); \
+        const uint scale_index = group * 2; \
+        const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+        const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+        const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+        const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+        local_sum += dot(float4(low_q) * d1 - float4(m1), input_low); \
+        local_sum += dot(float4(high_q) * d2 - float4(m2), input_high); \
+    } \
+    const float simd_sum_value = simd_sum(local_sum); \
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (lane == 0) { \
+        float sum = 0.0f; \
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup; \
+        for (uint index = 0; index < simd_group_count; index += 1) sum += partial_sums[index]; \
+        batch_output[row] = sum; \
+    } \
+}
+
+ZIGGY_BATCH_Q4K_ADD_KERNEL(batch_matvec_q4k_add_f32, 0)
+ZIGGY_BATCH_Q4K_ADD_KERNEL(batch_matvec_q4k_add_2048_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_0)
+ZIGGY_BATCH_Q4K_ADD_KERNEL(batch_matvec_q4k_add_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
+
+#undef ZIGGY_BATCH_Q4K_ADD_KERNEL
+
+#define ZIGGY_BATCH_Q4K_MATVEC_KERNEL(NAME, STATIC_COLS) \
+kernel void NAME( \
+    device const uchar *matrix [[buffer(0)]], \
+    device const float *input [[buffer(1)]], \
+    device float *output [[buffer(2)]], \
+    constant uint &rows [[buffer(3)]], \
+    constant uint &cols [[buffer(4)]], \
+    constant uint &batch_idx [[buffer(5)]], \
+    uint row [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]], \
+    uint simd_lane [[thread_index_in_simdgroup]], \
+    uint simd_group [[simdgroup_index_in_threadgroup]], \
+    uint threads_per_group [[threads_per_threadgroup]], \
+    uint threads_per_simdgroup [[threads_per_simdgroup]] \
+) { \
+    if (row >= rows) return; \
+    constexpr uint kStaticCols = STATIC_COLS; \
+    const uint effective_cols = kStaticCols == 0 ? cols : kStaticCols; \
+    if (kStaticCols != 0 && cols != kStaticCols) return; \
+    device const float *batch_input = input + batch_idx * effective_cols; \
+    device float *batch_output = output + batch_idx * rows; \
+    const uint blocks_per_row = effective_cols / ZIGGY_Q4K_VALUES_PER_BLOCK; \
+    const uint row_stride = blocks_per_row * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+    const device uchar *row_bytes = matrix + row * row_stride; \
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+    threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    float local_sum = 0.0f; \
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) { \
+        const uint block_group_index = chunk_index / ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint chunk_in_group = chunk_index % ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint block_index = block_group_index / ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint group = block_group_index % ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint q_offset = chunk_in_group * 4; \
+        const uint input_offset = block_index * ZIGGY_Q4K_VALUES_PER_BLOCK + group * ZIGGY_Q4K_VALUES_PER_GROUP + q_offset; \
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+        const float d = read_half_le(block, 0); \
+        const float dmin = read_half_le(block, 2); \
+        const device uchar *scales = block + 4; \
+        const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+        const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+        const uchar4 low_q = packed & uchar4(0x0F); \
+        const uchar4 high_q = packed >> 4; \
+        const float4 input_low = float4( \
+            batch_input[input_offset + 0], \
+            batch_input[input_offset + 1], \
+            batch_input[input_offset + 2], \
+            batch_input[input_offset + 3] \
+        ); \
+        const float4 input_high = float4( \
+            batch_input[input_offset + 32 + 0], \
+            batch_input[input_offset + 32 + 1], \
+            batch_input[input_offset + 32 + 2], \
+            batch_input[input_offset + 32 + 3] \
+        ); \
+        const uint scale_index = group * 2; \
+        const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+        const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+        const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+        const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+        local_sum += dot(float4(low_q) * d1 - float4(m1), input_low); \
+        local_sum += dot(float4(high_q) * d2 - float4(m2), input_high); \
+    } \
+    const float simd_sum_value = simd_sum(local_sum); \
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (lane == 0) { \
+        float sum = 0.0f; \
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup; \
+        for (uint index = 0; index < simd_group_count; index += 1) sum += partial_sums[index]; \
+        batch_output[row] = sum; \
+    } \
+}
+
+ZIGGY_BATCH_Q4K_MATVEC_KERNEL(batch_matvec_q4k_f32, 0)
+
+#undef ZIGGY_BATCH_Q4K_MATVEC_KERNEL
+
+kernel void batch_silu_mul_f32(
+    device float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    constant uint &batch_idx [[buffer(3)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    device float *batch_gate = gate + batch_idx * count;
+    device const float *batch_up = up + batch_idx * count;
+    const float value = batch_gate[index];
+    batch_gate[index] = (value / (1.0f + exp(-value))) * batch_up[index];
+}
+
+kernel void batch_add_in_place_f32(
+    device float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    constant uint &batch_idx [[buffer(3)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    device float *batch_dst = dst + batch_idx * count;
+    device const float *batch_src = src + batch_idx * count;
+    batch_dst[index] += batch_src[index];
+}
+
+kernel void batch_rms_norm_f32(
+    device const float *input [[buffer(0)]],
+    device const float *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    constant uint &batch_idx [[buffer(5)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    device const float *batch_input = input + batch_idx * count;
+    device float *batch_output = output + batch_idx * count;
+    threadgroup float partial_sums[ZIGGY_MAX_NORM_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint i = lane; i < count; i += threads_per_group) {
+        const float value = batch_input[i];
+        local_sum += value * value;
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        partial_sums[0] = 1.0f / sqrt(sum / float(count) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = partial_sums[0];
+    for (uint index = lane; index < count; index += threads_per_group) {
+        batch_output[index] = batch_input[index] * scale * weights[index];
+    }
+}

@@ -795,6 +795,45 @@ const Session = struct {
         return accepted_count;
     }
 
+    fn verifyDraftTokensBatchGpu(self: *Session, current_token: u32, draft_tokens: []const u32, out_accepted: []u32) !usize {
+        if (self.gpu_session == null) return 0;
+        if (draft_tokens.len == 0) return 0;
+
+        const gpu_session = &self.gpu_session.?;
+        var layers: [64]llama_gpu.LayerDesc = undefined;
+        for (self.model.layers, 0..) |layer, i| {
+            layers[i] = adaptLayerDesc(layer);
+        }
+
+        var all_drafts: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        all_drafts[0] = current_token;
+        for (draft_tokens, 0..) |dt, i| {
+            all_drafts[i + 1] = dt;
+        }
+        const batch_count = draft_tokens.len + 1;
+
+        var predicted: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        const accepted_count = try gpu_session.runBatchSpeculativeDecode(
+            layers[0..self.model.layers.len],
+            all_drafts[0..batch_count],
+            self.position,
+            &predicted,
+        );
+
+        for (0..accepted_count) |i| {
+            out_accepted[i] = predicted[i];
+        }
+
+        if (accepted_count > 0) {
+            for (0..accepted_count) |i| {
+                self.token_buffer[self.position + i] = predicted[i];
+            }
+            self.position += accepted_count;
+        }
+
+        return accepted_count;
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
         try self.runTokenCore(token_id);
         self.pending_greedy_token = null;
@@ -1011,6 +1050,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDes
         .rope_freq_base = model.rope_freq_base,
         .vocab_size = model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
+        .token_embd_offset = model.token_embd.offset,
     };
 }
 
@@ -1273,6 +1313,34 @@ pub fn generateLoadedStreaming(
         if (gpu_greedy) {
             const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
             if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else if (draft_tokens.len > 0) {
                 const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 var i: usize = 0;
                 while (i < accepted_count - 1) : (i += 1) {
