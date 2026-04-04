@@ -693,8 +693,9 @@ const Session = struct {
                 try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
                 try self.matVec(self.gate, layer.ffn_gate, self.normed);
                 try self.matVec(self.up, layer.ffn_up, self.normed);
+                siluInPlace(self.gate);
                 for (self.gate, self.up) |*gate, up| {
-                    gate.* = silu(gate.*) * up;
+                    gate.* *= up;
                 }
                 try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
                 try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
@@ -739,27 +740,36 @@ const Session = struct {
         const kv_group_size = self.model.head_count / self.model.head_count_kv;
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const pos_plus_1 = self.position + 1;
 
         for (0..self.model.head_count) |head_index| {
             const q_head = self.q[head_index * head_dim ..][0..head_dim];
             const kv_head = head_index / kv_group_size;
             const kv_offset = kv_head * head_dim;
 
-            for (0..self.position + 1) |token_index| {
+            for (0..pos_plus_1) |token_index| {
                 const k_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
                 const k_head = self.k_cache[k_base..][0..head_dim];
                 self.scores[token_index] = dot(q_head, k_head) * scale;
             }
-            softmaxInPlace(self.scores[0 .. self.position + 1]);
+            softmaxInPlace(self.scores[0..pos_plus_1]);
 
             const out_head = self.attn_out[head_index * head_dim ..][0..head_dim];
-            @memset(out_head, 0);
-            for (0..self.position + 1) |token_index| {
+            for (0..pos_plus_1) |token_index| {
                 const weight = self.scores[token_index];
                 const v_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
                 const v_head = self.v_cache[v_base..][0..head_dim];
-                for (out_head, v_head) |*dst, src| {
-                    dst.* += weight * src;
+
+                var i: usize = 0;
+                while (i + simd_lane_count <= head_dim) : (i += simd_lane_count) {
+                    const w_vec: F32x = @splat(weight);
+                    const v_vec = loadInputVec(v_head, i);
+                    const out_vec = loadInputVec(out_head, i);
+                    const result = @mulAdd(F32x, w_vec, v_vec, out_vec);
+                    @as(*[simd_lane_count]f32, @ptrCast(out_head[i..])).* = result;
+                }
+                while (i < head_dim) : (i += 1) {
+                    out_head[i] = @mulAdd(f32, weight, v_head[i], out_head[i]);
                 }
             }
         }
@@ -1377,7 +1387,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const architecture = metadata.architecture orelse return error.MissingRequiredMetadata;
     if (!std.mem.eql(u8, architecture, "llama")) return error.UnsupportedArchitecture;
     const tokenizer_model = metadata.tokenizer_model orelse return error.MissingRequiredMetadata;
-    if (!std.mem.eql(u8, tokenizer_model, "llama")) return error.UnsupportedTokenizer;
+    if (!isSupportedTokenizerModel(tokenizer_model)) return error.UnsupportedTokenizer;
 
     var tensors = std.StringHashMap(TensorRef).init(allocator);
     defer tensors.deinit();
@@ -1403,7 +1413,11 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
 
     const token_embd = try takeTensor(allocator, &tensors, "token_embd.weight");
-    const output = try takeTensor(allocator, &tensors, "output.weight");
+    const output = takeTensor(allocator, &tensors, "output.weight") catch |err| switch (err) {
+        // Newer llama-family GGUFs can omit the output projection when embeddings are tied.
+        error.MissingRequiredTensor => try cloneTensorRef(allocator, token_embd),
+        else => return err,
+    };
     const output_norm = try takeTensor(allocator, &tensors, "output_norm.weight");
 
     const layers = try allocator.alloc(LayerRefs, block_count);
@@ -1453,6 +1467,11 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
     const token_buf = try allocator.alloc(u32, model.context_length);
     defer allocator.free(token_buf);
     return model.tokenizer.encodeInto(allocator, prompt, token_buf);
+}
+
+fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {
+    return std.mem.eql(u8, tokenizer_model, "llama") or
+        std.mem.eql(u8, tokenizer_model, "gpt2");
 }
 
 pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
@@ -1636,6 +1655,16 @@ fn takeTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(TensorRe
     return tensor;
 }
 
+fn cloneTensorRef(allocator: std.mem.Allocator, tensor: TensorRef) !TensorRef {
+    return .{
+        .name = try allocator.dupe(u8, tensor.name),
+        .dims = tensor.dims,
+        .n_dims = tensor.n_dims,
+        .tensor_type = tensor.tensor_type,
+        .offset = tensor.offset,
+    };
+}
+
 fn takeLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(TensorRef), layer_index: usize, suffix: []const u8) !TensorRef {
     var buffer: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
@@ -1694,9 +1723,17 @@ fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRe
     mean_square /= @as(f32, @floatFromInt(input.len));
     const scale = @as(f32, 1.0) / @sqrt(mean_square + model.rms_norm_eps);
 
-    for (input, 0..) |value, index| {
-        const weight = readF32(weights[index * 4 ..][0..4]);
-        out[index] = value * scale * weight;
+    var i: usize = 0;
+    while (i + simd_lane_count <= input.len) : (i += simd_lane_count) {
+        const input_vec = loadInputVec(input, i);
+        const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
+        const scale_vec: F32x = @splat(scale);
+        const result = scale_vec * input_vec * weight_vec;
+        @as(*[simd_lane_count]f32, @ptrCast(out[i..])).* = result;
+    }
+    while (i < input.len) : (i += 1) {
+        const weight = readF32(weights[i * 4 ..][0..4]);
+        out[i] = input[i] * scale * weight;
     }
 }
 
@@ -1757,7 +1794,7 @@ fn dotQ8_0Row(row: []const u8, row_len: usize, input: []const f32) !f32 {
         const block = row[block_index .. block_index + 34];
         const d = readF16AsF32(block[0..2]);
         for (0..32) |index| {
-            sum += d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))) * input[input_offset + index];
+            sum = @mulAdd(f32, d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))), input[input_offset + index], sum);
         }
         input_offset += 32;
     }
@@ -1773,7 +1810,7 @@ fn dotF32Row(row: []const u8, input: []const f32) f32 {
 
     var sum = reduceVec(acc);
     while (index < input.len) : (index += 1) {
-        sum += readF32(row[index * 4 ..][0..4]) * input[index];
+        sum = @mulAdd(f32, readF32(row[index * 4 ..][0..4]), input[index], sum);
     }
     return sum;
 }
@@ -1787,7 +1824,7 @@ fn dotF16Row(row: []const u8, input: []const f32) f32 {
 
     var sum = reduceVec(acc);
     while (index < input.len) : (index += 1) {
-        sum += readF16AsF32(row[index * 2 ..][0..2]) * input[index];
+        sum = @mulAdd(f32, readF16AsF32(row[index * 2 ..][0..2]), input[index], sum);
     }
     return sum;
 }
@@ -1861,8 +1898,10 @@ fn dotQ4KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
                 high_input_sum += reduceVec(input_high);
             }
 
-            sum += d1 * low_q_dot - m1 * low_input_sum;
-            sum += d2 * high_q_dot - m2 * high_input_sum;
+            sum = @mulAdd(f32, d1, low_q_dot, sum);
+            sum = @mulAdd(f32, -m1, low_input_sum, sum);
+            sum = @mulAdd(f32, d2, high_q_dot, sum);
+            sum = @mulAdd(f32, -m2, high_input_sum, sum);
             input_offset += 64;
             q = q[32..];
             scale_index += 2;
@@ -1943,10 +1982,10 @@ fn dotQ6KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
                     q4_dot += reduceVec(loadQ6Q4Vec(ql_half, qh_half, base) * loadInputVec(input, input_offset + base + 96));
                 }
 
-                sum += s0 * q1_dot;
-                sum += s2 * q2_dot;
-                sum += s4 * q3_dot;
-                sum += s6 * q4_dot;
+                sum = @mulAdd(f32, s0, q1_dot, sum);
+                sum = @mulAdd(f32, s2, q2_dot, sum);
+                sum = @mulAdd(f32, s4, q3_dot, sum);
+                sum = @mulAdd(f32, s6, q4_dot, sum);
             }
             input_offset += 128;
             ql_half = ql_half[64..];
@@ -1972,18 +2011,19 @@ fn getScaleMinK4(index: usize, scale_bytes: []const u8) ScaleMinK4 {
 
 fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32) void {
     const n_rot = @min(rope_dim, head_dim);
+    const pos_f32 = @as(f32, @floatFromInt(position));
     for (0..head_count) |head_index| {
         const head = values[head_index * head_dim ..][0..head_dim];
         var pair: usize = 0;
         while (pair + 1 < n_rot) : (pair += 2) {
             const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
-            const theta = @as(f32, @floatFromInt(position)) / std.math.pow(f32, freq_base, exponent);
+            const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
             const cos_theta = @cos(theta);
             const sin_theta = @sin(theta);
             const x0 = head[pair];
             const x1 = head[pair + 1];
-            head[pair] = x0 * cos_theta - x1 * sin_theta;
-            head[pair + 1] = x0 * sin_theta + x1 * cos_theta;
+            head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+            head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
         }
     }
 }
@@ -2001,7 +2041,30 @@ fn argmax(values: []const f32) u32 {
 }
 
 fn addInPlace(dst: []f32, src: []const f32) void {
-    for (dst, src) |*lhs, rhs| lhs.* += rhs;
+    var i: usize = 0;
+    while (i + simd_lane_count <= dst.len) : (i += simd_lane_count) {
+        const dst_vec = loadInputVec(dst, i);
+        const src_vec = loadInputVec(src, i);
+        const result = dst_vec + src_vec;
+        @as(*[simd_lane_count]f32, @ptrCast(dst[i..])).* = result;
+    }
+    while (i < dst.len) : (i += 1) {
+        dst[i] += src[i];
+    }
+}
+
+fn siluInPlace(values: []f32) void {
+    var i: usize = 0;
+    while (i + simd_lane_count <= values.len) : (i += simd_lane_count) {
+        const x = loadInputVec(values, i);
+        const neg_x: F32x = -x;
+        const one: F32x = @splat(1.0);
+        const result = x / (one + @exp(neg_x));
+        @as(*[simd_lane_count]f32, @ptrCast(values[i..])).* = result;
+    }
+    while (i < values.len) : (i += 1) {
+        values[i] = values[i] / (1 + @exp(-values[i]));
+    }
 }
 
 fn silu(value: f32) f32 {
@@ -2103,7 +2166,7 @@ fn dot(a: []const f32, b: []const f32) f32 {
 
     var sum = reduceVec(acc);
     while (index < a.len) : (index += 1) {
-        sum += a[index] * b[index];
+        sum = @mulAdd(f32, a[index], b[index], sum);
     }
     return sum;
 }
@@ -2253,6 +2316,12 @@ fn alignForward(value: usize, alignment: u32) usize {
 
 fn deltaNs(start: i128, end: i128) u64 {
     return @intCast(@max(@as(i128, 0), end - start));
+}
+
+test "supported tokenizer model whitelist accepts llama 3 style gguf metadata" {
+    try std.testing.expect(isSupportedTokenizerModel("llama"));
+    try std.testing.expect(isSupportedTokenizerModel("gpt2"));
+    try std.testing.expect(!isSupportedTokenizerModel("sentencepiece"));
 }
 
 test "readU32Array accepts int32 token type arrays" {

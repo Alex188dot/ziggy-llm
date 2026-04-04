@@ -691,11 +691,12 @@ ZIGGY_MOONQ_Q4K_KERNEL(matvec_moonq_q4k_add_5632_f32, true, ZIGGY_MOONQ_Q4K_SPEC
 
 kernel void apply_rope_f32(
     device float *vector [[buffer(0)]],
-    constant uint &head_count [[buffer(1)]],
-    constant uint &head_dim [[buffer(2)]],
-    constant uint &pair_count [[buffer(3)]],
-    constant uint &position [[buffer(4)]],
-    constant float &freq_base [[buffer(5)]],
+    constant uint &vector_base [[buffer(1)]],
+    constant uint &head_count [[buffer(2)]],
+    constant uint &head_dim [[buffer(3)]],
+    constant uint &pair_count [[buffer(4)]],
+    constant uint &position [[buffer(5)]],
+    constant float &freq_base [[buffer(6)]],
     uint index [[thread_position_in_grid]]
 ) {
     if (pair_count == 0) return;
@@ -704,7 +705,7 @@ kernel void apply_rope_f32(
 
     const uint head = index / pair_count;
     const uint pair = index % pair_count;
-    const uint base = head * head_dim + pair * 2;
+    const uint base = vector_base + head * head_dim + pair * 2;
     const float exponent = float(pair * 2) / float(pair_count * 2);
     const float theta = float(position) / pow(freq_base, exponent);
     const float cos_theta = cos(theta);
