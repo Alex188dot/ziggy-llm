@@ -205,7 +205,9 @@ const Metadata = struct {
     rms_norm_eps: ?f32 = null,
     rope_freq_base: ?f32 = null,
     tokenizer_model: ?[]u8 = null,
+    tokenizer_pre: ?[]u8 = null,
     tokenizer_tokens: std.ArrayList([]u8) = .empty,
+    tokenizer_merges: std.ArrayList([]u8) = .empty,
     tokenizer_scores: std.ArrayList(f32) = .empty,
     tokenizer_types: std.ArrayList(u32) = .empty,
     bos_token_id: ?u32 = null,
@@ -218,8 +220,11 @@ const Metadata = struct {
     fn deinit(self: *Metadata, allocator: std.mem.Allocator) void {
         if (self.architecture) |value| allocator.free(value);
         if (self.tokenizer_model) |value| allocator.free(value);
+        if (self.tokenizer_pre) |value| allocator.free(value);
         for (self.tokenizer_tokens.items) |token| allocator.free(token);
+        for (self.tokenizer_merges.items) |merge| allocator.free(merge);
         self.tokenizer_tokens.deinit(allocator);
+        self.tokenizer_merges.deinit(allocator);
         self.tokenizer_scores.deinit(allocator);
         self.tokenizer_types.deinit(allocator);
         self.* = undefined;
@@ -227,10 +232,12 @@ const Metadata = struct {
 };
 
 const Tokenizer = struct {
+    mode: Mode,
     tokens: [][]u8,
     scores: []f32,
     token_types: []u32,
     byte_fallback: [256]?u32,
+    merge_table: std.AutoHashMap(MergeKey, MergeValue),
     bos_token_id: ?u32,
     eos_token_id: ?u32,
     unk_token_id: ?u32,
@@ -238,16 +245,32 @@ const Tokenizer = struct {
     add_bos_token: bool,
     add_eos_token: bool,
 
+    const Mode = enum {
+        score_dp,
+        gpt2_bpe,
+    };
+
+    const MergeKey = struct {
+        left: u32,
+        right: u32,
+    };
+
+    const MergeValue = struct {
+        merged: u32,
+        rank: u32,
+    };
+
     fn deinit(self: *Tokenizer, allocator: std.mem.Allocator) void {
         for (self.tokens) |token| allocator.free(token);
         allocator.free(self.tokens);
         allocator.free(self.scores);
         allocator.free(self.token_types);
+        self.merge_table.deinit();
         self.* = undefined;
     }
 
     fn isByteFallbackToken(self: Tokenizer, token_id: u32) ?u8 {
-        if (token_id >= self.tokens.len) return null;
+        if (self.mode == .gpt2_bpe or token_id >= self.tokens.len) return null;
         return parseByteFallback(self.tokens[token_id]);
     }
 
@@ -259,7 +282,7 @@ const Tokenizer = struct {
         if (self.pad_token_id != null and token_id == self.pad_token_id.?) return false;
         if (self.token_types.len == self.tokens.len) {
             if (!TokenType.isEncodable(self.token_types[token_id])) return false;
-            if (self.token_types[token_id] == @intFromEnum(TokenType.byte)) return false;
+            if (self.mode == .score_dp and self.token_types[token_id] == @intFromEnum(TokenType.byte)) return false;
         }
         return self.tokens[token_id].len > 0;
     }
@@ -267,6 +290,13 @@ const Tokenizer = struct {
     fn encodeInto(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
         if (prompt.len == 0) return error.EmptyPrompt;
 
+        return switch (self.mode) {
+            .score_dp => self.encodeScoreDp(allocator, prompt, out),
+            .gpt2_bpe => self.encodeGpt2Bpe(allocator, prompt, out),
+        };
+    }
+
+    fn encodeScoreDp(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
         var normalized = std.ArrayList(u8).empty;
         defer normalized.deinit(allocator);
         try normalized.appendSlice(allocator, rope_metaspace);
@@ -355,6 +385,63 @@ const Tokenizer = struct {
         return count;
     }
 
+    fn encodeGpt2Bpe(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
+        var pieces = std.ArrayList(u32).empty;
+        defer pieces.deinit(allocator);
+        try pieces.ensureTotalCapacity(allocator, prompt.len);
+
+        for (prompt) |byte| {
+            const token_id = self.byte_fallback[byte] orelse return error.UnknownToken;
+            pieces.appendAssumeCapacity(token_id);
+        }
+
+        while (pieces.items.len >= 2) {
+            var best_index: ?usize = null;
+            var best_rank: u32 = std.math.maxInt(u32);
+            var best_merged: u32 = undefined;
+
+            for (0..pieces.items.len - 1) |index| {
+                const key = MergeKey{
+                    .left = pieces.items[index],
+                    .right = pieces.items[index + 1],
+                };
+                if (self.merge_table.get(key)) |merge| {
+                    if (best_index == null or merge.rank < best_rank) {
+                        best_index = index;
+                        best_rank = merge.rank;
+                        best_merged = merge.merged;
+                    }
+                }
+            }
+
+            const index = best_index orelse break;
+            pieces.items[index] = best_merged;
+            _ = pieces.orderedRemove(index + 1);
+        }
+
+        var count: usize = 0;
+        if (self.add_bos_token) {
+            const bos = self.bos_token_id orelse return error.MissingRequiredMetadata;
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = bos;
+            count += 1;
+        }
+
+        for (pieces.items) |token_id| {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = token_id;
+            count += 1;
+        }
+
+        if (self.add_eos_token and self.eos_token_id != null) {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = self.eos_token_id.?;
+            count += 1;
+        }
+
+        return count;
+    }
+
     fn appendDecodedToken(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
         if (self.bos_token_id != null and token_id == self.bos_token_id.?) return;
         if (self.eos_token_id != null and token_id == self.eos_token_id.?) return;
@@ -362,6 +449,13 @@ const Tokenizer = struct {
         if (self.unk_token_id != null and token_id == self.unk_token_id.?) return;
         if (token_id >= self.tokens.len) return error.InvalidPrompt;
 
+        return switch (self.mode) {
+            .score_dp => self.appendDecodedScoreToken(output, allocator, token_id),
+            .gpt2_bpe => self.appendDecodedGpt2Token(output, allocator, token_id),
+        };
+    }
+
+    fn appendDecodedScoreToken(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
         if (self.isByteFallbackToken(token_id)) |byte| {
             try output.append(allocator, byte);
             return;
@@ -377,6 +471,16 @@ const Tokenizer = struct {
                 try output.append(allocator, token[index]);
                 index += 1;
             }
+        }
+    }
+
+    fn appendDecodedGpt2Token(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
+        const token = self.tokens[token_id];
+        var view = try std.unicode.Utf8View.init(token);
+        var it = view.iterator();
+        while (it.nextCodepoint()) |codepoint| {
+            const byte = gpt2DecodeByte(codepoint) orelse return error.InvalidPrompt;
+            try output.append(allocator, byte);
         }
     }
 };
@@ -1481,6 +1585,11 @@ pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, promp
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
+    if (metadata.tokenizer_model) |tokenizer_model| {
+        if (std.mem.eql(u8, tokenizer_model, "gpt2")) {
+            return buildGpt2Tokenizer(allocator, metadata, token_count);
+        }
+    }
     if (metadata.tokenizer_scores.items.len != token_count) return error.MissingRequiredMetadata;
 
     const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
@@ -1504,10 +1613,94 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
     }
 
     return .{
+        .mode = .score_dp,
         .tokens = tokens,
         .scores = scores,
         .token_types = token_types,
         .byte_fallback = byte_fallback,
+        .merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator),
+        .bos_token_id = metadata.bos_token_id,
+        .eos_token_id = metadata.eos_token_id,
+        .unk_token_id = metadata.unk_token_id,
+        .pad_token_id = metadata.pad_token_id,
+        .add_bos_token = metadata.add_bos_token orelse true,
+        .add_eos_token = metadata.add_eos_token orelse false,
+    };
+}
+
+fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_count: usize) !Tokenizer {
+    if (metadata.tokenizer_merges.items.len == 0) return error.MissingRequiredMetadata;
+
+    const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
+    metadata.tokenizer_tokens = .empty;
+
+    const scores = try allocator.alloc(f32, 0);
+
+    const token_types = if (metadata.tokenizer_types.items.len == token_count)
+        try metadata.tokenizer_types.toOwnedSlice(allocator)
+    else blk: {
+        const fallback = try allocator.alloc(u32, token_count);
+        @memset(fallback, 1);
+        break :blk fallback;
+    };
+    metadata.tokenizer_types = .empty;
+
+    var token_lookup = std.StringHashMap(u32).init(allocator);
+    defer token_lookup.deinit();
+    try token_lookup.ensureTotalCapacity(std.math.cast(u32, token_count) orelse return error.Overflow);
+    for (tokens, 0..) |token, token_id| {
+        try token_lookup.put(token, @intCast(token_id));
+    }
+
+    var byte_fallback = [_]?u32{null} ** 256;
+    for (0..256) |byte_usize| {
+        const byte: u8 = @intCast(byte_usize);
+        var encoded: [4]u8 = undefined;
+        const encoded_slice = gpt2EncodeByte(&encoded, byte);
+        byte_fallback[byte] = token_lookup.get(encoded_slice);
+    }
+
+    var merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator);
+    errdefer merge_table.deinit();
+
+    var merged_buffer = std.ArrayList(u8).empty;
+    defer merged_buffer.deinit(allocator);
+
+    for (metadata.tokenizer_merges.items, 0..) |merge, rank| {
+        const split_index = std.mem.indexOfScalar(u8, merge, ' ') orelse continue;
+        if (split_index == 0 or split_index + 1 >= merge.len) continue;
+
+        const left = merge[0..split_index];
+        const right = merge[split_index + 1 ..];
+        const left_id = token_lookup.get(left) orelse continue;
+        const right_id = token_lookup.get(right) orelse continue;
+
+        merged_buffer.clearRetainingCapacity();
+        try merged_buffer.ensureTotalCapacity(allocator, left.len + right.len);
+        merged_buffer.appendSliceAssumeCapacity(left);
+        merged_buffer.appendSliceAssumeCapacity(right);
+        const merged_id = token_lookup.get(merged_buffer.items) orelse continue;
+
+        try merge_table.put(.{
+            .left = left_id,
+            .right = right_id,
+        }, .{
+            .merged = merged_id,
+            .rank = @intCast(rank),
+        });
+    }
+
+    for (metadata.tokenizer_merges.items) |merge| allocator.free(merge);
+    metadata.tokenizer_merges.deinit(allocator);
+    metadata.tokenizer_merges = .empty;
+
+    return .{
+        .mode = .gpt2_bpe,
+        .tokens = tokens,
+        .scores = scores,
+        .token_types = token_types,
+        .byte_fallback = byte_fallback,
+        .merge_table = merge_table,
         .bos_token_id = metadata.bos_token_id,
         .eos_token_id = metadata.eos_token_id,
         .unk_token_id = metadata.unk_token_id,
@@ -1582,8 +1775,16 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.tokenizer_model = try readExpectedString(allocator, parser, value_type);
         return;
     }
+    if (std.mem.eql(u8, key, "tokenizer.ggml.pre")) {
+        metadata.tokenizer_pre = try readExpectedString(allocator, parser, value_type);
+        return;
+    }
     if (std.mem.eql(u8, key, "tokenizer.ggml.tokens")) {
         try readStringArray(allocator, parser, value_type, &metadata.tokenizer_tokens);
+        return;
+    }
+    if (std.mem.eql(u8, key, "tokenizer.ggml.merges")) {
+        try readStringArray(allocator, parser, value_type, &metadata.tokenizer_merges);
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.scores")) {
@@ -2183,6 +2384,61 @@ fn softmaxInPlace(values: []f32) void {
     for (values) |*value| value.* /= sum;
 }
 
+fn gpt2ByteToCodepoint(byte: u8) u21 {
+    if ((byte >= '!' and byte <= '~') or
+        (byte >= 0xA1 and byte <= 0xAC) or
+        (byte >= 0xAE and byte <= 0xFF))
+    {
+        return byte;
+    }
+
+    var offset: u21 = 0;
+    var candidate: u16 = 0;
+    while (candidate < byte) : (candidate += 1) {
+        const b: u8 = @intCast(candidate);
+        if ((b >= '!' and b <= '~') or
+            (b >= 0xA1 and b <= 0xAC) or
+            (b >= 0xAE and b <= 0xFF))
+        {
+            continue;
+        }
+        offset += 1;
+    }
+    return 256 + offset;
+}
+
+fn gpt2DecodeByte(codepoint: u21) ?u8 {
+    if ((codepoint >= '!' and codepoint <= '~') or
+        (codepoint >= 0xA1 and codepoint <= 0xAC) or
+        (codepoint >= 0xAE and codepoint <= 0xFF))
+    {
+        return @intCast(codepoint);
+    }
+    if (codepoint < 256) return null;
+
+    const target_offset = codepoint - 256;
+    var offset: u21 = 0;
+    var candidate: u16 = 0;
+    while (candidate < 256) : (candidate += 1) {
+        const byte: u8 = @intCast(candidate);
+        if ((byte >= '!' and byte <= '~') or
+            (byte >= 0xA1 and byte <= 0xAC) or
+            (byte >= 0xAE and byte <= 0xFF))
+        {
+            continue;
+        }
+        if (offset == target_offset) return byte;
+        offset += 1;
+    }
+    return null;
+}
+
+fn gpt2EncodeByte(buffer: *[4]u8, byte: u8) []const u8 {
+    const codepoint = gpt2ByteToCodepoint(byte);
+    const len = std.unicode.utf8Encode(codepoint, buffer) catch unreachable;
+    return buffer[0..len];
+}
+
 fn parseByteFallback(token: []const u8) ?u8 {
     if (token.len != 6) return null;
     if (!std.mem.startsWith(u8, token, "<0x")) return null;
@@ -2322,6 +2578,64 @@ test "supported tokenizer model whitelist accepts llama 3 style gguf metadata" {
     try std.testing.expect(isSupportedTokenizerModel("llama"));
     try std.testing.expect(isSupportedTokenizerModel("gpt2"));
     try std.testing.expect(!isSupportedTokenizerModel("sentencepiece"));
+}
+
+test "gpt2 byte mapping round trips common bytes" {
+    try std.testing.expectEqual(@as(?u8, 'A'), gpt2DecodeByte(gpt2ByteToCodepoint('A')));
+    try std.testing.expectEqual(@as(?u8, ' '), gpt2DecodeByte(gpt2ByteToCodepoint(' ')));
+    try std.testing.expectEqual(@as(?u8, '\n'), gpt2DecodeByte(gpt2ByteToCodepoint('\n')));
+    try std.testing.expectEqual(@as(?u8, 0), gpt2DecodeByte(gpt2ByteToCodepoint(0)));
+}
+
+test "gpt2 tokenizer merges byte pieces with rank order" {
+    const allocator = std.testing.allocator;
+
+    const tokens = try allocator.alloc([]u8, 5);
+    errdefer allocator.free(tokens);
+    tokens[0] = try allocator.dupe(u8, "a");
+    tokens[1] = try allocator.dupe(u8, "b");
+    tokens[2] = try allocator.dupe(u8, "c");
+    tokens[3] = try allocator.dupe(u8, "ab");
+    tokens[4] = try allocator.dupe(u8, "abc");
+
+    const scores = try allocator.alloc(f32, 0);
+    const token_types = try allocator.alloc(u32, 5);
+    @memset(token_types, 1);
+
+    var byte_fallback = [_]?u32{null} ** 256;
+    byte_fallback['a'] = 0;
+    byte_fallback['b'] = 1;
+    byte_fallback['c'] = 2;
+
+    var merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator);
+    try merge_table.put(.{ .left = 0, .right = 1 }, .{ .merged = 3, .rank = 0 });
+    try merge_table.put(.{ .left = 3, .right = 2 }, .{ .merged = 4, .rank = 1 });
+
+    var tokenizer = Tokenizer{
+        .mode = .gpt2_bpe,
+        .tokens = tokens,
+        .scores = scores,
+        .token_types = token_types,
+        .byte_fallback = byte_fallback,
+        .merge_table = merge_table,
+        .bos_token_id = null,
+        .eos_token_id = null,
+        .unk_token_id = null,
+        .pad_token_id = null,
+        .add_bos_token = false,
+        .add_eos_token = false,
+    };
+    defer tokenizer.deinit(allocator);
+
+    var encoded: [3]u32 = undefined;
+    const count = try tokenizer.encodeInto(allocator, "abc", &encoded);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u32, 4), encoded[0]);
+
+    var decoded = std.ArrayList(u8).empty;
+    defer decoded.deinit(allocator);
+    try tokenizer.appendDecodedToken(&decoded, allocator, 4);
+    try std.testing.expectEqualStrings("abc", decoded.items);
 }
 
 test "readU32Array accepts int32 token type arrays" {
