@@ -1,3 +1,4 @@
+
 #import "bridge.h"
 
 #import <Foundation/Foundation.h>
@@ -32,6 +33,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KAdd5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> ropePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> ropeToDstPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> storeKvHalfPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> attentionFusedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
@@ -141,6 +143,27 @@ static void ziggy_dispatch_q4k_rows(
     if (threads_per_group > 256) threads_per_group = 256;
 
     MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
+}
+
+static void ziggy_dispatch_moonq_q4k_rows(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count
+) {
+    NSUInteger thread_width = pipeline.threadExecutionWidth;
+    if (thread_width == 0) thread_width = 1;
+    NSUInteger max_total_threads = pipeline.maxTotalThreadsPerThreadgroup;
+    NSUInteger threads_per_group = thread_width * 4;
+    if (threads_per_group > max_total_threads) {
+        threads_per_group = max_total_threads - (max_total_threads % thread_width);
+    }
+    if (threads_per_group == 0) threads_per_group = thread_width;
+    if (threads_per_group > 256) threads_per_group = 256;
+
+    NSUInteger grid_width = (row_count + 3) / 4; 
+    MTLSize grid_size = MTLSizeMake(grid_width, 1, 1);
     MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
     [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
 }
@@ -328,7 +351,7 @@ static int ziggy_run_rowwise_matvec(
     size_t output_offset_bytes,
     uint32_t rows,
     uint32_t cols,
-    bool q4_dispatch,
+    int dispatch_type, // 0 = std, 1 = q4, 2 = moonq_q4
     NSString *invalid_message,
     NSString *command_error_message,
     char *error_message,
@@ -363,7 +386,10 @@ static int ziggy_run_rowwise_matvec(
     [encoder setBuffer:output_buffer.buffer offset:output_offset_bytes atIndex:2];
     [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
     [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-    if (q4_dispatch) {
+
+    if (dispatch_type == 2) {
+        ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
+    } else if (dispatch_type == 1) {
         ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
     } else {
         ziggy_dispatch_rowwise(encoder, pipeline, rows);
@@ -408,8 +434,11 @@ int ziggy_metal_create_context(
             return ZIGGY_METAL_COMPILATION_FAILED;
         }
 
+        MTLCompileOptions *compile_options = [[MTLCompileOptions alloc] init];
+        compile_options.fastMathEnabled = YES;
+        
         NSError *compile_error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&compile_error];
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:compile_options error:&compile_error];
         if (library == nil) {
             ziggy_write_error(error_message, error_message_len, compile_error.localizedDescription ?: @"failed to compile Metal shaders");
             return ZIGGY_METAL_COMPILATION_FAILED;
@@ -541,6 +570,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal rope-to-dst pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> store_kv_half_pipeline = ziggy_pipeline(device, library, @"store_kv_half", &pipeline_error);
+        if (store_kv_half_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal store_kv_half pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         id<MTLComputePipelineState> attention_fused_pipeline = ziggy_pipeline(device, library, @"attention_fused_f32", &pipeline_error);
         if (attention_fused_pipeline == nil) {
@@ -607,6 +641,7 @@ int ziggy_metal_create_context(
         state.matvecMoonQ4KAdd5632Pipeline = matvec_moon_q4k_add_5632_pipeline;
         state.ropePipeline = rope_pipeline;
         state.ropeToDstPipeline = rope_to_dst_pipeline;
+        state.storeKvHalfPipeline = store_kv_half_pipeline;
         state.attentionFusedPipeline = attention_fused_pipeline;
         state.siluMulPipeline = silu_mul_pipeline;
         state.addInPlacePipeline = add_in_place_pipeline;
@@ -857,7 +892,7 @@ int ziggy_metal_run_matvec_f32_to_dst(
             output_offset_bytes,
             rows,
             cols,
-            false,
+            0,
             @"invalid Metal matvec request",
             @"Metal matvec command failed",
             error_message,
@@ -916,7 +951,7 @@ int ziggy_metal_run_matvec_q4k_f32_to_dst(
             output_offset_bytes,
             rows,
             cols,
-            true,
+            1,
             @"invalid Metal q4k matvec request",
             @"Metal command buffer failed",
             error_message,
@@ -1032,7 +1067,7 @@ int ziggy_metal_run_matvec_q6k_f32_to_dst(
             output_offset_bytes,
             rows,
             cols,
-            true,
+            1,
             @"invalid Metal q6k matvec request",
             @"Metal q6k command buffer failed",
             error_message,
@@ -1200,7 +1235,7 @@ int ziggy_metal_run_matvec_q8_0_f32_to_dst(
             output_offset_bytes,
             rows,
             cols,
-            true,
+            1,
             @"invalid Metal q8_0 matvec request",
             @"Metal q8_0 command buffer failed",
             error_message,
@@ -1316,7 +1351,7 @@ int ziggy_metal_run_matvec_moonq_q4k_f32_to_dst(
             output_offset_bytes,
             rows,
             cols,
-            true,
+            2,
             @"invalid Metal MoonQuant q4k matvec request",
             @"Metal MoonQuant command buffer failed",
             error_message,
@@ -1366,7 +1401,7 @@ int ziggy_metal_run_matvec_moonq_q4k_add_f32(
         [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
         [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
         [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+        ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
         [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
@@ -1562,6 +1597,48 @@ int ziggy_metal_apply_rope_to_dst_f32(
                 [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:5];
                 [encoder setBytes:&position length:sizeof(position) atIndex:6];
                 [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:7];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_store_kv_half(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_elements,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || src == NULL || dst == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal store_kv_half request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *src_buffer = ziggy_const_buffer(src);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+
+        if (src_buffer.length < count * sizeof(float) ||
+            dst_buffer.length < (dst_offset_elements + count) * 2) {
+            ziggy_write_error(error_message, error_message_len, @"Metal store_kv_half exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        uint32_t offset = (uint32_t)dst_offset_elements;
+        return ziggy_run_compute(
+            state,
+            state.storeKvHalfPipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:src_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&offset length:sizeof(offset) atIndex:2];
+                [encoder setBytes:&count length:sizeof(count) atIndex:3];
             },
             error_message,
             error_message_len
