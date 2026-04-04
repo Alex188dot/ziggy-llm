@@ -16,7 +16,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin = std.fs.File.stdin().reader(&stdin_buf);
-    const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend);
+    const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend, config.context_length);
     const max_tokens = effectiveChatMaxTokens(config, context_window);
 
     try writer.print("chat_ready: true\nmodel: {s}\ncontext_window: {d}\nhistory_window_messages: {d}\ncommands: /help /clear /unload /bye\n\n", .{
@@ -68,7 +68,7 @@ fn handleUserTurn(
     user_text: []const u8,
 ) !void {
     try prompt_builder.appendMessage(allocator, messages, .user, user_text);
-    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, max_tokens, messages.items);
+    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.context_length, max_tokens, messages.items);
     defer allocator.free(prompt);
 
     var stream_state = StreamState.init(allocator, writer);
@@ -87,6 +87,7 @@ fn handleUserTurn(
 fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOptions {
     return .{
         .max_tokens = max_tokens,
+        .context_length = config.context_length,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,

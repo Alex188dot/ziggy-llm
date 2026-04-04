@@ -6,6 +6,7 @@ pub const native_architecture = mod.native_architecture;
 pub const supported_architecture = mod.supported_architecture;
 pub const supported_model_family = mod.supported_model_family;
 pub const supported_quantization = mod.supported_quantization;
+pub const default_context_length = mod.default_context_length;
 pub const RuntimeError = mod.RuntimeError;
 pub const BackendPreference = mod.BackendPreference;
 pub const BackendUsed = mod.BackendUsed;

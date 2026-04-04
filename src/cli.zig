@@ -19,6 +19,7 @@ pub const Config = struct {
     prompt: ?[]const u8 = null,
     port: u16 = server.default_port,
     max_tokens: usize = 16,
+    context_length: usize = runtime.default_context_length,
     bench_runs: usize = 1,
     seed: u64 = 0,
     temperature: f32 = 0,
@@ -38,6 +39,7 @@ pub const ParseError = error{
     MissingFlagValue,
     InvalidPort,
     InvalidMaxTokens,
+    InvalidContextLength,
     InvalidSeed,
     InvalidTemperature,
     InvalidRepeatPenalty,
@@ -91,6 +93,13 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config.max_tokens = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--context-length")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.context_length = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidContextLength;
+            if (config.context_length == 0) return error.InvalidContextLength;
             continue;
         }
         if (std.mem.eql(u8, arg, "--bench-runs")) {
@@ -206,6 +215,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  -m, --model <path>    Path to a GGUF model
         \\  -p, --prompt <text>   Prompt text for one-shot generation
         \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
+        \\      --context-length  Runtime context window cap; default: {d}, capped by model metadata
         \\      --bench-runs <n>  Bench only: one cold run plus warm averages over the resident runtime path (default: {d})
         \\      --seed <n>        Seed for deterministic sampling (default: {d})
         \\      --temperature <f> Sampling temperature; 0 means argmax (default: {d:.1})
@@ -230,6 +240,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         .{
             build_options.version,
             configDefaults.max_tokens,
+            configDefaults.context_length,
             configDefaults.bench_runs,
             configDefaults.seed,
             configDefaults.temperature,
@@ -266,8 +277,9 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
+    try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
     try std.testing.expectEqual(@as(u64, 9), config.seed);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.temperature, 0.0001);

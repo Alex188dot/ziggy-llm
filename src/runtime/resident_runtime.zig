@@ -42,12 +42,12 @@ pub const ResidentRuntime = struct {
         }
     }
 
-    pub fn contextLength(self: *const ResidentRuntime) ?usize {
-        return if (self.loaded) |loaded| loaded.model.context_length else null;
+    pub fn contextLength(self: *const ResidentRuntime, context_length_limit: usize) ?usize {
+        return if (self.loaded) |loaded| @min(@min(loaded.model.context_length, loaded.context_length_limit), context_length_limit) else null;
     }
 
-    pub fn chatTemplateStyle(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference) !gguf.ChatTemplateStyle {
-        try self.ensureLoaded(model_path, backend, false);
+    pub fn chatTemplateStyle(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference, context_length_limit: usize) !gguf.ChatTemplateStyle {
+        try self.ensureLoaded(model_path, backend, context_length_limit, false);
         return self.loaded.?.chat_template_style;
     }
 
@@ -69,7 +69,7 @@ pub const ResidentRuntime = struct {
         stream_callback: ?llama_cpu.StreamCallback,
     ) !types.GenerationReport {
         self.unloadIfExpired();
-        try self.ensureLoaded(model_path, options.backend, options.metal_profile);
+        try self.ensureLoaded(model_path, options.backend, options.context_length, options.metal_profile);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
 
@@ -171,14 +171,14 @@ pub const ResidentRuntime = struct {
     }
 
     pub fn promptTokenCount(self: *ResidentRuntime, model_path: []const u8, prompt: []const u8, backend: types.BackendPreference) !usize {
-        try self.ensureLoaded(model_path, backend, false);
+        try self.ensureLoaded(model_path, backend, types.default_context_length, false);
         const loaded = &self.loaded.?;
         return llama_cpu.countPromptTokens(self.allocator, &loaded.model, prompt);
     }
 
-    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, startup_profile_enabled: bool) !void {
+    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, context_length_limit: usize, startup_profile_enabled: bool) !void {
         if (self.loaded) |loaded| {
-            if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref) return;
+            if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref and loaded.context_length_limit == context_length_limit) return;
             self.unload();
         }
 
@@ -197,6 +197,7 @@ pub const ResidentRuntime = struct {
             self.allocator,
             &model,
             execution.backend,
+            @min(model.context_length, context_length_limit),
             if (execution.dense_tensors) |*dense_tensors|
                 llama_cpu.DenseTensorLookup{
                     .ctx = dense_tensors,
@@ -217,6 +218,7 @@ pub const ResidentRuntime = struct {
         self.loaded = .{
             .model_path = owned_model_path,
             .backend_pref = backend_pref,
+            .context_length_limit = context_length_limit,
             .chat_template_style = chat_template_style,
             .model = model,
             .execution = execution,
@@ -252,6 +254,7 @@ pub const ResidentRuntime = struct {
 const LoadedModel = struct {
     model_path: []u8,
     backend_pref: types.BackendPreference,
+    context_length_limit: usize,
     chat_template_style: gguf.ChatTemplateStyle,
     model: llama_cpu.Model,
     execution: ExecutionResources,

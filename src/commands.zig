@@ -26,6 +26,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
 
     try runtime.runCommand(writer, allocator, model_path, prompt, .{
         .max_tokens = config.max_tokens,
+        .context_length = config.context_length,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,
@@ -45,6 +46,7 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
 
     try runtime.benchCommand(writer, allocator, model_path, prompt, .{
         .max_tokens = config.max_tokens,
+        .context_length = config.context_length,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,

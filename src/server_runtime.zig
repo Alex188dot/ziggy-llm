@@ -145,7 +145,7 @@ fn handleChatCompletion(
         try prompt_builder.appendMessage(allocator, &messages, role, message.content);
     }
 
-    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, payload.max_tokens orelse config.max_tokens, messages.items);
+    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.context_length, payload.max_tokens orelse config.max_tokens, messages.items);
     defer allocator.free(prompt);
     var report = try cache.generate(model_path, prompt, mergeOptions(config, payload));
     defer report.deinit(allocator);
@@ -162,6 +162,7 @@ fn handleChatCompletion(
 fn mergeOptions(config: cli.Config, payload: anytype) runtime.GenerationOptions {
     return .{
         .max_tokens = payload.max_tokens orelse config.max_tokens,
+        .context_length = config.context_length,
         .seed = payload.seed orelse config.seed,
         .temperature = payload.temperature orelse config.temperature,
         .repeat_penalty = payload.repeat_penalty orelse config.repeat_penalty,

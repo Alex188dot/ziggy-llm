@@ -38,11 +38,12 @@ pub fn buildPrompt(
     runtime_cache: *resident_runtime.ResidentRuntime,
     model_path: []const u8,
     backend: runtime.BackendPreference,
+    context_length_limit: usize,
     max_tokens: usize,
     messages: []Message,
 ) ![]u8 {
-    const template_style = try runtime_cache.chatTemplateStyle(model_path, backend);
-    const context_length = try contextWindow(runtime_cache, model_path, backend);
+    const template_style = try runtime_cache.chatTemplateStyle(model_path, backend, context_length_limit);
+    const context_length = try contextWindow(runtime_cache, model_path, backend, context_length_limit);
     const token_budget = context_length -| (max_tokens + token_safety_margin);
 
     const system_prefix_len = countLeadingSystemMessages(messages);
@@ -208,10 +209,10 @@ fn renderConversation(
     return buf.toOwnedSlice(allocator);
 }
 
-pub fn contextWindow(runtime_cache: *resident_runtime.ResidentRuntime, model_path: []const u8, backend: runtime.BackendPreference) !usize {
-    if (runtime_cache.contextLength()) |length| return length;
-    _ = try runtime_cache.chatTemplateStyle(model_path, backend);
-    return runtime_cache.contextLength().?;
+pub fn contextWindow(runtime_cache: *resident_runtime.ResidentRuntime, model_path: []const u8, backend: runtime.BackendPreference, context_length_limit: usize) !usize {
+    if (runtime_cache.contextLength(context_length_limit)) |length| return length;
+    _ = try runtime_cache.chatTemplateStyle(model_path, backend, context_length_limit);
+    return runtime_cache.contextLength(context_length_limit).?;
 }
 
 fn promptBaseTokenCount(

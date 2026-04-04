@@ -10,6 +10,7 @@ pub const native_architecture = types.native_architecture;
 pub const supported_architecture = types.supported_architecture;
 pub const supported_model_family = types.supported_model_family;
 pub const supported_quantization = types.supported_quantization;
+pub const default_context_length = types.default_context_length;
 pub const RuntimeError = types.RuntimeError;
 pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;

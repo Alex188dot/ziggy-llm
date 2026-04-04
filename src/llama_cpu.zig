@@ -539,6 +539,7 @@ pub const ReusableSession = struct {
         allocator: std.mem.Allocator,
         model: *const Model,
         backend: ?backend_api.MatVecBackend,
+        context_length: usize,
         dense_tensors: ?DenseTensorLookup,
     ) !ReusableSession {
         var session = try Session.init(
@@ -546,7 +547,8 @@ pub const ReusableSession = struct {
             model,
             backend,
             dense_tensors,
-            model.context_length,
+            context_length,
+            context_length,
             null,
             null,
         );
@@ -567,6 +569,7 @@ pub const ReusableSession = struct {
 
 const Session = struct {
     model: *const Model,
+    context_length: usize,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
     gpu_session: ?llama_gpu.Session = null,
@@ -596,12 +599,14 @@ const Session = struct {
         model: *const Model,
         backend: ?backend_api.MatVecBackend,
         dense_tensors: ?DenseTensorLookup,
+        context_length: usize,
         token_capacity: usize,
         profiler: ?*metal_profile.Profiler,
         moon_quant_calibrator: ?*moon_quant_calibration.Calibrator,
     ) !Session {
         var session = Session{
             .model = model,
+            .context_length = context_length,
             .backend = backend,
             .dense_tensors = dense_tensors,
             .token_buffer = try allocator.alloc(u32, token_capacity),
@@ -615,9 +620,9 @@ const Session = struct {
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
-            .scores = try allocator.alloc(f32, model.context_length),
-            .k_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
-            .v_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
+            .scores = try allocator.alloc(f32, context_length),
+            .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
+            .v_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
             .moon_quant_calibrator = moon_quant_calibrator,
         };
         errdefer session.deinit(allocator);
@@ -625,7 +630,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model), profiler);
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
             }
         }
 
@@ -765,7 +770,7 @@ const Session = struct {
     }
 
     fn runTokenCore(self: *Session, token_id: u32) !void {
-        if (self.position >= self.model.context_length) return error.ContextOverflow;
+        if (self.position >= self.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
         for (self.model.layers, 0..) |layer, layer_index| {
@@ -832,7 +837,7 @@ const Session = struct {
     }
 
     fn storeKv(self: *Session, layer_index: usize) void {
-        const stride = self.model.context_length * self.model.kv_dimension;
+        const stride = self.context_length * self.model.kv_dimension;
         const base = layer_index * stride + self.position * self.model.kv_dimension;
         @memcpy(self.k_cache[base .. base + self.model.kv_dimension], self.k);
         @memcpy(self.v_cache[base .. base + self.model.kv_dimension], self.v);
@@ -842,7 +847,7 @@ const Session = struct {
         @memset(self.attn_out, 0);
         const head_dim = self.model.head_dimension;
         const kv_group_size = self.model.head_count / self.model.head_count_kv;
-        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const layer_base = layer_index * self.context_length * self.model.kv_dimension;
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(head_dim)));
         const pos_plus_1 = self.position + 1;
 
@@ -950,11 +955,11 @@ fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     };
 }
 
-fn adaptModelDesc(model: *const Model) llama_gpu.ModelDesc {
+fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDesc {
     return .{
         .embedding_length = model.embedding_length,
         .block_count = model.block_count,
-        .context_length = model.context_length,
+        .context_length = context_length,
         .feed_forward_length = model.feed_forward_length,
         .rope_dimension_count = model.rope_dimension_count,
         .head_count = model.head_count,
@@ -1121,6 +1126,7 @@ pub fn generateLoadedStreaming(
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
     const random = prng.random();
+    const context_length = effectiveContextLength(model, options);
 
     const prompt_capacity = prompt.len * 4 + options.max_tokens + 8;
     const session_init_begin = std.time.nanoTimestamp();
@@ -1129,7 +1135,8 @@ pub fn generateLoadedStreaming(
         model,
         backend,
         dense_tensors,
-        @min(model.context_length, prompt_capacity),
+        context_length,
+        @min(context_length, prompt_capacity),
         if (profiler.enabled) &profiler else null,
         null,
     );
@@ -1273,8 +1280,9 @@ pub fn generateLoadedStreamingCached(
     const random = prng.random();
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
+    const context_length = effectiveContextLength(model, options);
 
-    const prompt_tokens = try allocator.alloc(u32, model.context_length);
+    const prompt_tokens = try allocator.alloc(u32, context_length);
     defer allocator.free(prompt_tokens);
 
     const prompt_begin = std.time.nanoTimestamp();
@@ -1283,6 +1291,7 @@ pub fn generateLoadedStreamingCached(
 
     var session = &reusable_session.session;
     if (session.model != model) return error.InvalidPrompt;
+    if (session.context_length != context_length) return error.InvalidPrompt;
 
     const cached_token_count = session.position;
     const reused_prompt_token_count = commonPrefixLen(
@@ -1411,6 +1420,10 @@ pub fn generateLoadedStreamingCached(
     };
 }
 
+fn effectiveContextLength(model: *const Model, options: runtime_types.GenerationOptions) usize {
+    return @min(model.context_length, options.context_length);
+}
+
 pub const CalibrationSession = struct {
     session: Session,
 
@@ -1439,6 +1452,7 @@ pub fn initCalibrationSession(
         model,
         null,
         null,
+        @min(model.context_length, token_capacity),
         token_capacity,
         null,
         calibrator,
