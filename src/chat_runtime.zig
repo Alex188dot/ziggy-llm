@@ -30,7 +30,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     }
 
     while (true) {
-        try writer.print("> ", .{});
+        try writer.print(">>> ", .{});
         try writer.flush();
 
         const line = (try stdin.interface.takeDelimiter('\n')) orelse break;
@@ -131,7 +131,7 @@ const StreamState = struct {
         var process_end = safe.len;
 
         const think_tag = "<think>";
-        const end_think_tag = "\x1b[0m";
+        const end_think_tag = "</think>";
         const stop_markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
 
         var partial_len: usize = 0;
@@ -185,7 +185,7 @@ const StreamState = struct {
 
     fn printChunk(self: *StreamState, chunk: []const u8) !void {
         const think_tag = "<think>";
-        const end_think_tag = "\x1b[0m";
+        const end_think_tag = "</think>";
         var i: usize = 0;
 
         while (i < chunk.len) {
