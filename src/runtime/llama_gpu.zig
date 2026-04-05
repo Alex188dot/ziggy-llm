@@ -289,14 +289,37 @@ pub const Session = struct {
         try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
         try self.runProjection(layer.ffn_gate, self.normed, self.gate);
         try self.runProjection(layer.ffn_up, self.normed, self.up);
-        const silu_start = std.time.nanoTimestamp();
-        try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
-        self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
-            .rows = 1,
-            .cols = self.model.feed_forward_length,
-            .depth = 2,
-        });
-        try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+
+        const tensor = layer.ffn_down;
+        var handled_fused = false;
+
+        if (tensor.tensor_type == 12) {
+            if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                const start = std.time.nanoTimestamp();
+                try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
+                self.recordCategoryWithShape(.projections, start, shape);
+                handled_fused = true;
+            } else {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                const start = std.time.nanoTimestamp();
+                try metal_backend.runMatVecQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
+                self.recordCategoryWithShape(.projections, start, shape);
+                handled_fused = true;
+            }
+        }
+
+        if (!handled_fused) {
+            const silu_start = std.time.nanoTimestamp();
+            try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+            self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
+                .rows = 1,
+                .cols = self.model.feed_forward_length,
+                .depth = 2,
+            });
+            try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+        }
     }
 
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
