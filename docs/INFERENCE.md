@@ -313,3 +313,12 @@ Current implementation note:
 | 2026-04-04 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 71 | 0.029 | 153.186 | 153.271 | 121.503 |
 | 2026-04-04 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 231.268 | 190.407 | 421.892 | 120.026 |
 | 2026-04-04 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.029 | 149.553 | 149.809 | 120.428 |
+
+## Benchmark Table — Llama 3.2 3B
+
+| Date | Mode | Machine | Backend | Model | Prompt tokens | Generated tokens | Startup ms | Prompt ms | TTFT ms | Decode TPS |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-04-05 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 3309.184 | 1718.046 | 5027.311 | 41.488 |
+| 2026-04-05 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 0.023 | 165.412 | 165.483 | 40.765 |
+| 2026-04-05 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 766.409 | 816.451 | 1583.727 | 40.079 |
+| 2026-04-05 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 0.029 | 162.808 | 163.691 | 40.353 |
