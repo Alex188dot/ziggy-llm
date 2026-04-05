@@ -71,6 +71,12 @@ fn handleUserTurn(
     const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.context_length, max_tokens, messages.items);
     defer allocator.free(prompt);
 
+    const is_qwen = std.mem.indexOf(u8, model_path, "Qwen") != null or std.mem.indexOf(u8, model_path, "qwen") != null;
+    if (!is_qwen) {
+        try writer.print("\n", .{});
+        try writer.flush();
+    }
+
     var stream_state = StreamState.init(allocator, writer);
     defer stream_state.deinit();
 
