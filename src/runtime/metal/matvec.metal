@@ -846,21 +846,20 @@ kernel void apply_rope_to_dst_f32(
     }
 }
 
-constant uint ZIGGY_MAX_ATTENTION_CONTEXT = 4096;
-
 kernel void attention_fused_f32(
     device const float *q [[buffer(0)]],
     device const half *k_cache [[buffer(1)]],
     device const half *v_cache [[buffer(2)]],
-    device float *output [[buffer(3)]],
-    constant uint &head_count [[buffer(4)]],
-    constant uint &head_count_kv [[buffer(5)]],
-    constant uint &head_dim [[buffer(6)]],
-    constant uint &kv_dim [[buffer(7)]],
-    constant uint &context_length [[buffer(8)]],
-    constant uint &position [[buffer(9)]],
-    constant uint &layer_base [[buffer(10)]],
-    constant float &scale [[buffer(11)]],
+    device float *scores_buffer [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    constant uint &head_count [[buffer(5)]],
+    constant uint &head_count_kv [[buffer(6)]],
+    constant uint &head_dim [[buffer(7)]],
+    constant uint &kv_dim [[buffer(8)]],
+    constant uint &context_length [[buffer(9)]],
+    constant uint &position [[buffer(10)]],
+    constant uint &layer_base [[buffer(11)]],
+    constant float &scale [[buffer(12)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -868,12 +867,13 @@ kernel void attention_fused_f32(
     uint threads_per_group [[threads_per_threadgroup]],
     uint threads_per_simdgroup [[threads_per_simdgroup]]
 ) {
-    if (head >= head_count || context_length > ZIGGY_MAX_ATTENTION_CONTEXT) return;
+    if (head >= head_count) return;
     const uint kv_group = head_count / head_count_kv;
     const uint kv_head = head / kv_group;
     const uint kv_offset = kv_head * head_dim;
     device const float *q_head = q + head * head_dim;
-    threadgroup float scores[ZIGGY_MAX_ATTENTION_CONTEXT];
+    device float *scores = scores_buffer + head * context_length;
+
     threadgroup float partial_values[ZIGGY_MAX_ROW_SIMDGROUPS];
     const uint token_count = position + 1;
 

@@ -735,6 +735,9 @@ test "metal fused attention matches cpu reference" {
     const v_buffer = try metal_backend.createByteScratchBuffer(backend, v_cache.len * @sizeOf(f16));
     defer metal_backend.destroyBuffer(v_buffer);
 
+    const attn_scores_buffer = try metal_backend.createScratchBuffer(backend, head_count * context_length);
+    defer metal_backend.destroyBuffer(attn_scores_buffer);
+
     const output_buffer = try metal_backend.createScratchBuffer(backend, actual.len);
     defer metal_backend.destroyBuffer(output_buffer);
 
@@ -746,6 +749,7 @@ test "metal fused attention matches cpu reference" {
         q_buffer,
         k_buffer,
         v_buffer,
+        attn_scores_buffer,
         output_buffer,
         head_count,
         head_count_kv,

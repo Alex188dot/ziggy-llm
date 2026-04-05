@@ -322,6 +322,7 @@ int ziggy_metal_attention_fused_f32(
     const ZiggyMetalBuffer *q,
     const ZiggyMetalBuffer *k_cache,
     const ZiggyMetalBuffer *v_cache,
+    ZiggyMetalBuffer *attn_scores,
     ZiggyMetalBuffer *output,
     uint32_t head_count,
     uint32_t head_count_kv,
