@@ -818,6 +818,7 @@ pub fn applyRoPE(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -830,6 +831,7 @@ pub fn applyRoPE(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -844,6 +846,7 @@ pub fn applyRoPEAtOffset(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -857,6 +860,7 @@ pub fn applyRoPEAtOffset(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -872,6 +876,7 @@ pub fn applyRoPEToDst(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -886,6 +891,7 @@ pub fn applyRoPEToDst(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -966,6 +972,25 @@ pub fn addInPlace(
     ), &error_buf);
 }
 
+pub fn addBiasF32(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    bias_weights: []const f32,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_add_bias_f32(
+        state.context,
+        dst.raw,
+        bias_weights.ptr,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn rmsNorm(
     backend: backend_api.MatVecBackend,
     input: BufferHandle,
@@ -984,6 +1009,32 @@ pub fn rmsNorm(
         weights_buffer.raw,
         output.raw,
         @intCast(count),
+        eps,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn rmsNormPerHeadF32(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    weights: []const f32,
+    output: BufferHandle,
+    head_count: usize,
+    head_dim: usize,
+    eps: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const weights_buffer = try state.matrixBuffer(weights[0..head_dim]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_rms_norm_per_head_f32(
+        state.context,
+        input.raw,
+        weights_buffer.raw,
+        output.raw,
+        @intCast(head_count),
+        @intCast(head_dim),
         eps,
         &error_buf,
         error_buf.len,

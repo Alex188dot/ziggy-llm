@@ -790,6 +790,7 @@ kernel void apply_rope_f32(
     constant uint &pair_count [[buffer(4)]],
     constant uint &position [[buffer(5)]],
     constant float &freq_base [[buffer(6)]],
+    constant uint &rope_style [[buffer(7)]],
     uint index [[thread_position_in_grid]]
 ) {
     if (pair_count == 0) return;
@@ -798,15 +799,27 @@ kernel void apply_rope_f32(
 
     const uint head = index / pair_count;
     const uint pair = index % pair_count;
-    const uint base = vector_base + head * head_dim + pair * 2;
+    const uint base = vector_base + head * head_dim;
+
     const float exponent = float(pair * 2) / float(pair_count * 2);
     const float theta = float(position) / pow(freq_base, exponent);
     const float cos_theta = cos(theta);
     const float sin_theta = sin(theta);
-    const float x0 = vector[base];
-    const float x1 = vector[base + 1];
-    vector[base] = x0 * cos_theta - x1 * sin_theta;
-    vector[base + 1] = x0 * sin_theta + x1 * cos_theta;
+
+    if (rope_style == 0) {
+        const uint idx = base + pair * 2;
+        const float x0 = vector[idx];
+        const float x1 = vector[idx + 1];
+        vector[idx] = x0 * cos_theta - x1 * sin_theta;
+        vector[idx + 1] = x0 * sin_theta + x1 * cos_theta;
+    } else {
+        const uint idx0 = base + pair;
+        const uint idx1 = base + pair + pair_count;
+        const float x0 = vector[idx0];
+        const float x1 = vector[idx1];
+        vector[idx0] = x0 * cos_theta - x1 * sin_theta;
+        vector[idx1] = x0 * sin_theta + x1 * cos_theta;
+    }
 }
 
 kernel void apply_rope_to_dst_f32(
@@ -818,6 +831,7 @@ kernel void apply_rope_to_dst_f32(
     constant uint &pair_count [[buffer(5)]],
     constant uint &position [[buffer(6)]],
     constant float &freq_base [[buffer(7)]],
+    constant uint &rope_style [[buffer(8)]],
     uint index [[thread_position_in_grid]]
 ) {
     const uint total_values = head_count * head_dim;
@@ -831,19 +845,37 @@ kernel void apply_rope_to_dst_f32(
         return;
     }
 
-    const uint pair = dim / 2;
-    const uint base = head * head_dim + pair * 2;
-    const float exponent = float(pair * 2) / float(pair_count * 2);
-    const float theta = float(position) / pow(freq_base, exponent);
-    const float cos_theta = cos(theta);
-    const float sin_theta = sin(theta);
-    const float x0 = src[base];
-    const float x1 = src[base + 1];
+    if (rope_style == 0) {
+        const uint pair = dim / 2;
+        const uint base = head * head_dim + pair * 2;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = src[base];
+        const float x1 = src[base + 1];
 
-    if ((dim & 1) == 0) {
-        dst[dst_index] = x0 * cos_theta - x1 * sin_theta;
+        if ((dim & 1) == 0) {
+            dst[dst_index] = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            dst[dst_index] = x0 * sin_theta + x1 * cos_theta;
+        }
     } else {
-        dst[dst_index] = x0 * sin_theta + x1 * cos_theta;
+        const uint pair = dim % pair_count;
+        const bool is_first_half = dim < pair_count;
+        const uint base = head * head_dim;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = src[base + pair];
+        const float x1 = src[base + pair + pair_count];
+
+        if (is_first_half) {
+            dst[dst_index] = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            dst[dst_index] = x0 * sin_theta + x1 * cos_theta;
+        }
     }
 }
 
@@ -1016,6 +1048,54 @@ kernel void rms_norm_f32(
     const float scale = partial_sums[0];
     for (uint index = lane; index < count; index += threads_per_group) {
         output[index] = input[index] * scale * weights[index];
+    }
+}
+
+kernel void rms_norm_per_head_f32(
+    device const float *input [[buffer(0)]],
+    device const float *weights [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &head_count [[buffer(3)]],
+    constant uint &head_dim [[buffer(4)]],
+    constant float &eps [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (head >= head_count) return;
+
+    device const float *h_in = input + head * head_dim;
+    device const float *h_w = weights;
+    device float *h_out = output + head * head_dim;
+
+    threadgroup float partial_sums[ZIGGY_MAX_NORM_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint i = lane; i < head_dim; i += threads_per_group) {
+        const float val = h_in[i];
+        local_sum += val * val;
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        partial_sums[0] = 1.0f / sqrt(sum / float(head_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = partial_sums[0];
+    for (uint i = lane; i < head_dim; i += threads_per_group) {
+        h_out[i] = h_in[i] * scale * h_w[i];
     }
 }
 

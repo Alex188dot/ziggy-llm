@@ -117,6 +117,11 @@ pub const TensorType = enum(u32) {
     q6_k = 14,
 };
 
+pub const RopeStyle = enum(u32) {
+    interleaved = 0,
+    neox = 1,
+};
+
 const TokenType = enum(u32) {
     unknown = 2,
     control = 3,
@@ -182,8 +187,13 @@ const ScaleMinK4 = struct {
 pub const LayerRefs = struct {
     attn_norm: TensorRef,
     attn_q: TensorRef,
+    attn_q_bias: ?TensorRef = null,
+    attn_q_norm: ?TensorRef = null,
     attn_k: TensorRef,
+    attn_k_bias: ?TensorRef = null,
+    attn_k_norm: ?TensorRef = null,
     attn_v: TensorRef,
+    attn_v_bias: ?TensorRef = null,
     attn_output: TensorRef,
     ffn_norm: TensorRef,
     ffn_gate: TensorRef,
@@ -236,6 +246,7 @@ const Tokenizer = struct {
     tokens: [][]u8,
     scores: []f32,
     token_types: []u32,
+    special_tokens: []u32,
     byte_fallback: [256]?u32,
     merge_table: std.AutoHashMap(MergeKey, MergeValue),
     bos_token_id: ?u32,
@@ -265,6 +276,7 @@ const Tokenizer = struct {
         allocator.free(self.tokens);
         allocator.free(self.scores);
         allocator.free(self.token_types);
+        allocator.free(self.special_tokens);
         self.merge_table.deinit();
         self.* = undefined;
     }
@@ -390,33 +402,34 @@ const Tokenizer = struct {
         defer pieces.deinit(allocator);
         try pieces.ensureTotalCapacity(allocator, prompt.len);
 
-        for (prompt) |byte| {
-            const token_id = self.byte_fallback[byte] orelse return error.UnknownToken;
-            pieces.appendAssumeCapacity(token_id);
-        }
+        var pos: usize = 0;
+        while (pos < prompt.len) {
+            var best_match: ?u32 = null;
+            var best_match_pos: usize = prompt.len;
+            var best_match_len: usize = 0;
 
-        while (pieces.items.len >= 2) {
-            var best_index: ?usize = null;
-            var best_rank: u32 = std.math.maxInt(u32);
-            var best_merged: u32 = undefined;
-
-            for (0..pieces.items.len - 1) |index| {
-                const key = MergeKey{
-                    .left = pieces.items[index],
-                    .right = pieces.items[index + 1],
-                };
-                if (self.merge_table.get(key)) |merge| {
-                    if (best_index == null or merge.rank < best_rank) {
-                        best_index = index;
-                        best_rank = merge.rank;
-                        best_merged = merge.merged;
+            for (self.special_tokens) |special_id| {
+                const special_str = self.tokens[special_id];
+                if (special_str.len == 0) continue;
+                if (std.mem.indexOf(u8, prompt[pos..], special_str)) |offset| {
+                    const abs_pos = pos + offset;
+                    if (abs_pos < best_match_pos or (abs_pos == best_match_pos and special_str.len > best_match_len)) {
+                        best_match_pos = abs_pos;
+                        best_match = special_id;
+                        best_match_len = special_str.len;
                     }
                 }
             }
 
-            const index = best_index orelse break;
-            pieces.items[index] = best_merged;
-            _ = pieces.orderedRemove(index + 1);
+            if (best_match_pos > pos) {
+                try self.encodeGpt2BpeChunk(allocator, prompt[pos..best_match_pos], &pieces);
+            }
+            if (best_match != null) {
+                pieces.appendAssumeCapacity(best_match.?);
+                pos = best_match_pos + best_match_len;
+            } else {
+                pos = prompt.len;
+            }
         }
 
         var count: usize = 0;
@@ -440,6 +453,44 @@ const Tokenizer = struct {
         }
 
         return count;
+    }
+
+    fn encodeGpt2BpeChunk(self: Tokenizer, allocator: std.mem.Allocator, chunk: []const u8, pieces: *std.ArrayList(u32)) !void {
+        if (chunk.len == 0) return;
+        var chunk_pieces = std.ArrayList(u32).empty;
+        defer chunk_pieces.deinit(allocator);
+        try chunk_pieces.ensureTotalCapacity(allocator, chunk.len);
+
+        for (chunk) |byte| {
+            const token_id = self.byte_fallback[byte] orelse return error.UnknownToken;
+            chunk_pieces.appendAssumeCapacity(token_id);
+        }
+
+        while (chunk_pieces.items.len >= 2) {
+            var best_index: ?usize = null;
+            var best_rank: u32 = std.math.maxInt(u32);
+            var best_merged: u32 = undefined;
+
+            for (0..chunk_pieces.items.len - 1) |index| {
+                const key = MergeKey{
+                    .left = chunk_pieces.items[index],
+                    .right = chunk_pieces.items[index + 1],
+                };
+                if (self.merge_table.get(key)) |merge| {
+                    if (best_index == null or merge.rank < best_rank) {
+                        best_index = index;
+                        best_rank = merge.rank;
+                        best_merged = merge.merged;
+                    }
+                }
+            }
+
+            const index = best_index orelse break;
+            chunk_pieces.items[index] = best_merged;
+            _ = chunk_pieces.orderedRemove(index + 1);
+        }
+
+        try pieces.appendSlice(allocator, chunk_pieces.items);
     }
 
     fn appendDecodedToken(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
@@ -500,6 +551,7 @@ pub const Model = struct {
     kv_dimension: usize,
     rms_norm_eps: f32,
     rope_freq_base: f32,
+    rope_style: RopeStyle,
     data_offset: usize,
     token_embd: TensorRef,
     output: TensorRef,
@@ -511,8 +563,13 @@ pub const Model = struct {
         for (self.layers) |layer| {
             allocator.free(layer.attn_norm.name);
             allocator.free(layer.attn_q.name);
+            if (layer.attn_q_bias) |b| allocator.free(b.name);
+            if (layer.attn_q_norm) |n| allocator.free(n.name);
             allocator.free(layer.attn_k.name);
+            if (layer.attn_k_bias) |b| allocator.free(b.name);
+            if (layer.attn_k_norm) |n| allocator.free(n.name);
             allocator.free(layer.attn_v.name);
+            if (layer.attn_v_bias) |b| allocator.free(b.name);
             allocator.free(layer.attn_output.name);
             allocator.free(layer.ffn_norm.name);
             allocator.free(layer.ffn_gate.name);
@@ -863,11 +920,20 @@ const Session = struct {
                 try self.recordCalibration(layer.attn_q, .attn_q, self.normed);
                 try self.recordCalibration(layer.attn_k, .attn_k, self.normed);
                 try self.recordCalibration(layer.attn_v, .attn_v, self.normed);
+
                 try self.matVec(self.q, layer.attn_q, self.normed);
+                if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
+                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.head_dimension);
+
                 try self.matVec(self.k, layer.attn_k, self.normed);
+                if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
+                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.head_dimension);
+
                 try self.matVec(self.v, layer.attn_v, self.normed);
-                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
-                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
+                if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
+
+                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 try self.recordCalibration(layer.attn_output, .attn_output, self.attn_out);
@@ -1002,6 +1068,49 @@ const Session = struct {
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
     }
+
+    fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
+        const bytes = try tensorBytes(self.model, bias_tensor);
+        const cols = try bias_tensor.rowLen();
+        if (out.len != cols) return error.InvalidTensorMetadata;
+
+        if (bias_tensor.tensor_type == .f32) {
+            for (0..cols) |i| out[i] += readF32(bytes[i * 4 ..][0..4]);
+        } else if (bias_tensor.tensor_type == .f16) {
+            for (0..cols) |i| out[i] += readF16AsF32(bytes[i * 2 ..][0..2]);
+        } else {
+            return error.UnsupportedTensorType;
+        }
+    }
+
+    fn rmsNormPerHead(self: *Session, out: []f32, input: []const f32, tensor: TensorRef, head_count: usize, head_dim: usize) !void {
+        const weights = try tensorBytes(self.model, tensor);
+        if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
+        if (try tensor.rowLen() != head_dim) return error.InvalidTensorMetadata;
+
+        for (0..head_count) |head| {
+            const h_in = input[head * head_dim ..][0..head_dim];
+            const h_out = out[head * head_dim ..][0..head_dim];
+
+            var mean_square: f32 = 0;
+            for (h_in) |val| mean_square += val * val;
+            mean_square /= @as(f32, @floatFromInt(head_dim));
+            const scale = @as(f32, 1.0) / @sqrt(mean_square + self.model.rms_norm_eps);
+
+            var i: usize = 0;
+            while (i + simd_lane_count <= head_dim) : (i += simd_lane_count) {
+                const input_vec = loadInputVec(h_in, i);
+                const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
+                const scale_vec: F32x = @splat(scale);
+                const result = scale_vec * input_vec * weight_vec;
+                @as(*[simd_lane_count]f32, @ptrCast(h_out[i..])).* = result;
+            }
+            while (i < head_dim) : (i += 1) {
+                const weight = readF32(weights[i * 4 ..][0..4]);
+                h_out[i] = h_in[i] * scale * weight;
+            }
+        }
+    }
 };
 
 fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
@@ -1026,8 +1135,13 @@ fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
         .attn_q = adaptTensorDesc(layer.attn_q),
+        .attn_q_bias = if (layer.attn_q_bias) |b| adaptTensorDesc(b) else null,
+        .attn_q_norm = if (layer.attn_q_norm) |n| adaptTensorDesc(n) else null,
         .attn_k = adaptTensorDesc(layer.attn_k),
+        .attn_k_bias = if (layer.attn_k_bias) |b| adaptTensorDesc(b) else null,
+        .attn_k_norm = if (layer.attn_k_norm) |n| adaptTensorDesc(n) else null,
         .attn_v = adaptTensorDesc(layer.attn_v),
+        .attn_v_bias = if (layer.attn_v_bias) |b| adaptTensorDesc(b) else null,
         .attn_output = adaptTensorDesc(layer.attn_output),
         .ffn_norm = adaptTensorDesc(layer.ffn_norm),
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
@@ -1051,6 +1165,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDes
         .vocab_size = model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
+        .rope_style = @intFromEnum(model.rope_style),
     };
 }
 
@@ -1691,9 +1806,14 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     }
 
     const architecture = metadata.architecture orelse return error.MissingRequiredMetadata;
-    if (!std.mem.eql(u8, architecture, "llama")) return error.UnsupportedArchitecture;
-    const tokenizer_model = metadata.tokenizer_model orelse return error.MissingRequiredMetadata;
-    if (!isSupportedTokenizerModel(tokenizer_model)) return error.UnsupportedTokenizer;
+    if (!std.mem.eql(u8, architecture, "llama") and !std.mem.startsWith(u8, architecture, "qwen")) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (std.mem.startsWith(u8, architecture, "qwen")) .neox else .interleaved;
+
+    if (metadata.tokenizer_model) |tm| {
+        if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
+    } else if (!std.mem.startsWith(u8, architecture, "qwen")) {
+        return error.MissingRequiredMetadata;
+    }
 
     var tensors = std.StringHashMap(TensorRef).init(allocator);
     defer tensors.deinit();
@@ -1713,8 +1833,9 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const feed_forward_length = metadata.feed_forward_length orelse return error.MissingRequiredMetadata;
     const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
     const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
-    const rope_dimension_count = metadata.rope_dimension_count orelse return error.MissingRequiredMetadata;
-    const rms_norm_eps = metadata.rms_norm_eps orelse return error.MissingRequiredMetadata;
+
+    const rope_dimension_count = metadata.rope_dimension_count orelse (embedding_length / head_count);
+    const rms_norm_eps = metadata.rms_norm_eps orelse 1e-6;
     const rope_freq_base = metadata.rope_freq_base orelse 10000;
     if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
 
@@ -1732,8 +1853,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         layers[index] = .{
             .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
             .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
             .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
             .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
             .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
             .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
             .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
@@ -1761,6 +1887,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .kv_dimension = kv_dimension,
         .rms_norm_eps = rms_norm_eps,
         .rope_freq_base = rope_freq_base,
+        .rope_style = rope_style,
         .data_offset = data_offset,
         .token_embd = token_embd,
         .output = output,
@@ -1777,7 +1904,8 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
 
 fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {
     return std.mem.eql(u8, tokenizer_model, "llama") or
-        std.mem.eql(u8, tokenizer_model, "gpt2");
+        std.mem.eql(u8, tokenizer_model, "gpt2") or
+        std.mem.startsWith(u8, tokenizer_model, "qwen");
 }
 
 pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
@@ -1787,11 +1915,18 @@ pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, promp
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
-    if (metadata.tokenizer_model) |tokenizer_model| {
-        if (std.mem.eql(u8, tokenizer_model, "gpt2")) {
-            return buildGpt2Tokenizer(allocator, metadata, token_count);
-        }
+
+    const is_bpe = if (metadata.tokenizer_model) |m|
+        std.mem.eql(u8, m, "gpt2") or std.mem.startsWith(u8, m, "qwen")
+    else if (metadata.architecture) |arch|
+        std.mem.startsWith(u8, arch, "qwen")
+    else
+        false;
+
+    if (is_bpe) {
+        return buildGpt2Tokenizer(allocator, metadata, token_count);
     }
+
     if (metadata.tokenizer_scores.items.len != token_count) return error.MissingRequiredMetadata;
 
     const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
@@ -1814,11 +1949,19 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
         if (parseByteFallback(token)) |byte| byte_fallback[byte] = @intCast(token_id);
     }
 
+    var special_tokens = std.ArrayList(u32).empty;
+    for (token_types, 0..) |t, id| {
+        if (t == @intFromEnum(TokenType.control) or t == @intFromEnum(TokenType.user_defined)) {
+            try special_tokens.append(allocator, @intCast(id));
+        }
+    }
+
     return .{
         .mode = .score_dp,
         .tokens = tokens,
         .scores = scores,
         .token_types = token_types,
+        .special_tokens = try special_tokens.toOwnedSlice(allocator),
         .byte_fallback = byte_fallback,
         .merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator),
         .bos_token_id = metadata.bos_token_id,
@@ -1896,18 +2039,26 @@ fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_c
     metadata.tokenizer_merges.deinit(allocator);
     metadata.tokenizer_merges = .empty;
 
+    var special_tokens = std.ArrayList(u32).empty;
+    for (token_types, 0..) |t, id| {
+        if (t == @intFromEnum(TokenType.control) or t == @intFromEnum(TokenType.user_defined)) {
+            try special_tokens.append(allocator, @intCast(id));
+        }
+    }
+
     return .{
         .mode = .gpt2_bpe,
         .tokens = tokens,
         .scores = scores,
         .token_types = token_types,
+        .special_tokens = try special_tokens.toOwnedSlice(allocator),
         .byte_fallback = byte_fallback,
         .merge_table = merge_table,
         .bos_token_id = metadata.bos_token_id,
         .eos_token_id = metadata.eos_token_id,
         .unk_token_id = metadata.unk_token_id,
         .pad_token_id = metadata.pad_token_id,
-        .add_bos_token = metadata.add_bos_token orelse true,
+        .add_bos_token = metadata.add_bos_token orelse false,
         .add_eos_token = metadata.add_eos_token orelse false,
     };
 }
@@ -1937,39 +2088,39 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.file_type = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.context_length")) {
+    if (std.mem.endsWith(u8, key, ".context_length")) {
         metadata.context_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.embedding_length")) {
+    if (std.mem.endsWith(u8, key, ".embedding_length")) {
         metadata.embedding_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.block_count")) {
+    if (std.mem.endsWith(u8, key, ".block_count")) {
         metadata.block_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.feed_forward_length")) {
+    if (std.mem.endsWith(u8, key, ".feed_forward_length")) {
         metadata.feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.rope.dimension_count")) {
+    if (std.mem.endsWith(u8, key, ".rope.dimension_count")) {
         metadata.rope_dimension_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.head_count")) {
+    if (std.mem.endsWith(u8, key, ".attention.head_count")) {
         metadata.head_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.head_count_kv")) {
+    if (std.mem.endsWith(u8, key, ".attention.head_count_kv")) {
         metadata.head_count_kv = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.layer_norm_rms_epsilon")) {
+    if (std.mem.endsWith(u8, key, ".attention.layer_norm_rms_epsilon") or std.mem.endsWith(u8, key, ".attention.layer_norm_epsilon")) {
         metadata.rms_norm_eps = try readExpectedFloat(parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.rope.freq_base")) {
+    if (std.mem.endsWith(u8, key, ".rope.freq_base")) {
         metadata.rope_freq_base = try readExpectedFloat(parser, value_type);
         return;
     }
@@ -2072,6 +2223,17 @@ fn takeLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(Ten
     var buffer: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
     return takeTensor(allocator, tensors, name);
+}
+
+fn takeOptionalLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(TensorRef), layer_index: usize, suffix: []const u8) !?TensorRef {
+    var buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
+    if (tensors.get(name)) |tensor| {
+        _ = allocator;
+        _ = tensors.remove(name);
+        return tensor;
+    }
+    return null;
 }
 
 pub fn tensorBytes(model: *const Model, tensor: TensorRef) ![]const u8 {
@@ -2412,21 +2574,35 @@ fn getScaleMinK4(index: usize, scale_bytes: []const u8) ScaleMinK4 {
         };
 }
 
-fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32) void {
+fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: RopeStyle) void {
     const n_rot = @min(rope_dim, head_dim);
     const pos_f32 = @as(f32, @floatFromInt(position));
     for (0..head_count) |head_index| {
         const head = values[head_index * head_dim ..][0..head_dim];
-        var pair: usize = 0;
-        while (pair + 1 < n_rot) : (pair += 2) {
-            const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
-            const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
-            const cos_theta = @cos(theta);
-            const sin_theta = @sin(theta);
-            const x0 = head[pair];
-            const x1 = head[pair + 1];
-            head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
-            head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+        if (rope_style == .interleaved) {
+            var pair: usize = 0;
+            while (pair + 1 < n_rot) : (pair += 2) {
+                const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
+                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+                const cos_theta = @cos(theta);
+                const sin_theta = @sin(theta);
+                const x0 = head[pair];
+                const x1 = head[pair + 1];
+                head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+                head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+            }
+        } else {
+            const half_rot = n_rot / 2;
+            for (0..half_rot) |i| {
+                const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(n_rot));
+                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+                const cos_theta = @cos(theta);
+                const sin_theta = @sin(theta);
+                const x0 = head[i];
+                const x1 = head[i + half_rot];
+                head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+                head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+            }
         }
     }
 }
@@ -2818,6 +2994,7 @@ test "gpt2 tokenizer merges byte pieces with rank order" {
         .tokens = tokens,
         .scores = scores,
         .token_types = token_types,
+        .special_tokens = &.{},
         .byte_fallback = byte_fallback,
         .merge_table = merge_table,
         .bos_token_id = null,

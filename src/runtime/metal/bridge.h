@@ -300,6 +300,7 @@ int ziggy_metal_apply_rope_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
@@ -313,6 +314,7 @@ int ziggy_metal_apply_rope_at_offset_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
@@ -327,6 +329,7 @@ int ziggy_metal_apply_rope_to_dst_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
@@ -396,12 +399,33 @@ int ziggy_metal_add_in_place_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_add_bias_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const void *bias_weights,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_rms_norm_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
     const ZiggyMetalBuffer *weights,
     ZiggyMetalBuffer *output,
     uint32_t count,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_rms_norm_per_head_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_dim,
     float eps,
     char *error_message,
     size_t error_message_len

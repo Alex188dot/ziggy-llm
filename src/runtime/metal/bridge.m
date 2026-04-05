@@ -38,6 +38,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPerHeadPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> argmaxPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> topKPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> sampleTopKPipeline;
@@ -640,6 +641,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal RMSNorm pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> rms_norm_per_head_pipeline = ziggy_pipeline(device, library, @"rms_norm_per_head_f32", &pipeline_error);
+        if (rms_norm_per_head_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal RMSNorm Per Head pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
         id<MTLComputePipelineState> argmax_pipeline = ziggy_pipeline(device, library, @"argmax_f32", &pipeline_error);
         if (argmax_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal argmax pipeline");
@@ -739,6 +745,7 @@ int ziggy_metal_create_context(
         state.siluMulPipeline = silu_mul_pipeline;
         state.addInPlacePipeline = add_in_place_pipeline;
         state.rmsNormPipeline = rms_norm_pipeline;
+        state.rmsNormPerHeadPipeline = rms_norm_per_head_pipeline;
         state.argmaxPipeline = argmax_pipeline;
         state.topKPipeline = topk_pipeline;
         state.sampleTopKPipeline = sample_topk_pipeline;
@@ -1658,6 +1665,7 @@ int ziggy_metal_apply_rope_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 ) {
@@ -1670,6 +1678,7 @@ int ziggy_metal_apply_rope_f32(
         rope_dim,
         position,
         freq_base,
+        rope_style,
         error_message,
         error_message_len
     );
@@ -1684,6 +1693,7 @@ int ziggy_metal_apply_rope_at_offset_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 ) {
@@ -1717,6 +1727,7 @@ int ziggy_metal_apply_rope_at_offset_f32(
                 [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:4];
                 [encoder setBytes:&position length:sizeof(position) atIndex:5];
                 [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:6];
+                [encoder setBytes:&rope_style length:sizeof(rope_style) atIndex:7];
             },
             error_message,
             error_message_len
@@ -1734,6 +1745,7 @@ int ziggy_metal_apply_rope_to_dst_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 ) {
@@ -1769,6 +1781,7 @@ int ziggy_metal_apply_rope_to_dst_f32(
                 [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:5];
                 [encoder setBytes:&position length:sizeof(position) atIndex:6];
                 [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:7];
+                [encoder setBytes:&rope_style length:sizeof(rope_style) atIndex:8];
             },
             error_message,
             error_message_len
@@ -2020,6 +2033,48 @@ int ziggy_metal_add_in_place_f32(
     }
 }
 
+int ziggy_metal_add_bias_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const void *bias_weights,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || dst == NULL || bias_weights == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal add bias request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+
+        id<MTLBuffer> bias_buffer = [state.device newBufferWithBytes:bias_weights length:count * sizeof(float) options:MTLResourceStorageModeShared];
+        if (bias_buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal bias buffer");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        ZiggyMetalBufferState *bias_buffer_state = [[ZiggyMetalBufferState alloc] init];
+        bias_buffer_state.buffer = bias_buffer;
+        bias_buffer_state.length = count * sizeof(float);
+
+        return ziggy_run_compute(
+            state,
+            state.addInPlacePipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:bias_buffer_state.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
 int ziggy_metal_rms_norm_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
@@ -2065,6 +2120,76 @@ int ziggy_metal_rms_norm_f32(
             error_message,
             error_message_len
         );
+    }
+}
+
+int ziggy_metal_rms_norm_per_head_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_dim,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || input == NULL || weights == NULL || output == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal RMSNorm Per Head request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(weights);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
+        
+        const NSUInteger thread_count = ziggy_rowwise_thread_count(state.rmsNormPerHeadPipeline);
+        if (thread_count == 0 || thread_count > 256) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm Per Head threadgroup sizing failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        const size_t req_in_bytes = (size_t)head_count * head_dim * sizeof(float);
+        const size_t req_w_bytes = (size_t)head_dim * sizeof(float);
+        if (input_buffer.length < req_in_bytes || weights_buffer.length < req_w_bytes || output_buffer.length < req_in_bytes) {
+            ziggy_write_error(error_message, error_message_len, @"Metal RMSNorm Per Head exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.rmsNormPerHeadPipeline];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+        [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+        [encoder setBytes:&eps length:sizeof(eps) atIndex:5];
+        
+        ziggy_dispatch_rowwise(encoder, state.rmsNormPerHeadPipeline, head_count);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal RMSNorm Per Head command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
     }
 }
 

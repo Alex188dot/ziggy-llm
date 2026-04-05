@@ -85,6 +85,7 @@ pub const TensorType = enum(u32) {
 pub const ChatTemplateStyle = enum {
     generic,
     chatml,
+    qwen,
 };
 
 const TypeLayout = struct {
@@ -649,6 +650,9 @@ fn optionalString(value: ?[]const u8) []const u8 {
 
 pub fn detectChatTemplateStyle(chat_template: ?[]const u8) ChatTemplateStyle {
     const template = chat_template orelse return .generic;
+    if (std.mem.indexOf(u8, template, "<|im_start|>") != null) {
+        return .qwen;
+    }
     if (std.mem.indexOf(u8, template, "<|user|>") != null and
         std.mem.indexOf(u8, template, "<|assistant|>") != null)
     {

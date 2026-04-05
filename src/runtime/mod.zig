@@ -34,7 +34,7 @@ pub fn generate(
     defer arena.deinit();
 
     const report = try gguf.inspectFile(arena.allocator(), model_path);
-    if (!std.mem.eql(u8, report.architecture, native_architecture)) return error.UnsupportedArchitecture;
+    if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
     return llama_runtime.generate(allocator, model_path, prompt, options);
 }
 

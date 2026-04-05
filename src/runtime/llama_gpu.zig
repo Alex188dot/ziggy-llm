@@ -32,8 +32,13 @@ pub const TensorDesc = struct {
 pub const LayerDesc = struct {
     attn_norm: TensorDesc,
     attn_q: TensorDesc,
+    attn_q_bias: ?TensorDesc = null,
+    attn_q_norm: ?TensorDesc = null,
     attn_k: TensorDesc,
+    attn_k_bias: ?TensorDesc = null,
+    attn_k_norm: ?TensorDesc = null,
     attn_v: TensorDesc,
+    attn_v_bias: ?TensorDesc = null,
     attn_output: TensorDesc,
     ffn_norm: TensorDesc,
     ffn_gate: TensorDesc,
@@ -55,6 +60,7 @@ pub const ModelDesc = struct {
     vocab_size: usize,
     rms_norm_eps: f32,
     token_embd_offset: u64,
+    rope_style: u32,
 };
 
 pub const ShortlistEntry = struct {
@@ -186,6 +192,8 @@ pub const Session = struct {
     ) !void {
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
         try self.runProjection(layer.attn_q, self.normed, self.q);
+        if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
+        if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
 
         const q_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
@@ -196,6 +204,7 @@ pub const Session = struct {
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
+            self.model.rope_style,
         );
         self.recordCategoryWithShape(.elementwise_ops, q_rope_start, .{
             .rows = self.model.head_count,
@@ -209,6 +218,8 @@ pub const Session = struct {
 
         const kv_k_start = std.time.nanoTimestamp();
         try self.runProjection(layer.attn_k, self.normed, self.k);
+        if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
+        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
         try metal_backend.applyRoPE(
             self.backend,
             self.k,
@@ -217,6 +228,7 @@ pub const Session = struct {
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
+            self.model.rope_style,
         );
         try metal_backend.storeKvHalf(
             self.backend,
@@ -240,6 +252,7 @@ pub const Session = struct {
 
         const kv_v_start = std.time.nanoTimestamp();
         try self.runProjection(layer.attn_v, self.normed, self.v);
+        if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
         try metal_backend.storeKvHalf(
             self.backend,
             self.v,
@@ -471,6 +484,32 @@ pub const Session = struct {
         });
     }
 
+    fn runRmsNormPerHead(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        head_count: usize,
+        head_dim: usize,
+    ) !void {
+        const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        if (tensor.cols != head_dim) return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
+        try metal_backend.rmsNormPerHeadF32(
+            self.backend,
+            input,
+            weights,
+            output,
+            head_count,
+            head_dim,
+            self.model.rms_norm_eps,
+        );
+        self.recordCategoryWithShape(.normalization, start, .{
+            .rows = head_count,
+            .cols = head_dim,
+        });
+    }
+
     fn runProjection(
         self: *Session,
         tensor: TensorDesc,
@@ -612,6 +651,16 @@ pub const Session = struct {
         }
     }
 
+    fn runBiasAdd(self: *Session, tensor: TensorDesc, target: metal_backend.BufferHandle) !void {
+        const start = std.time.nanoTimestamp();
+        const bias_weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        try metal_backend.addBiasF32(self.backend, target, bias_weights, tensor.cols);
+        self.recordCategoryWithShape(.elementwise_ops, start, .{
+            .rows = 1,
+            .cols = tensor.cols,
+        });
+    }
+
     fn recordCategoryWithShape(
         self: *Session,
         category: metal_profile.Category,
@@ -678,6 +727,7 @@ pub const Session = struct {
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
+                    self.model.rope_style,
                 );
 
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
@@ -692,6 +742,7 @@ pub const Session = struct {
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
+                    self.model.rope_style,
                 );
                 try metal_backend.storeKvHalf(
                     self.backend,

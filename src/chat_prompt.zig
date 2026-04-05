@@ -93,7 +93,7 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
         offset += line.len + 1;
     }
 
-    for ([_][]const u8{ "</s>", "</s", "</", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|", "<user|", "<assistant|", "<system|" }) |marker| {
+    for ([_][]const u8{ "</s>", "</s", "</", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|", "<user|", "<assistant|", "<system|", "<|im_end|>", "<|im_start|>" }) |marker| {
         if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
             end = @min(end, index);
         }
@@ -110,7 +110,7 @@ pub fn hasCompletedAssistantReply(reply: []const u8) bool {
         offset += line.len + 1;
     }
 
-    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|" }) |marker| {
+    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" }) |marker| {
         if (std.mem.indexOf(u8, reply, marker) != null) return true;
     }
     return false;
@@ -120,6 +120,9 @@ fn isDialogueBoundary(line: []const u8) bool {
     if (line.len == 0) return false;
 
     const explicit = [_][]const u8{
+        "<|im_start|>user",
+        "<|im_start|>assistant",
+        "<|im_start|>system",
         "<|user|>",
         "<|assistant|>",
         "<|system|>",
@@ -205,6 +208,24 @@ fn renderConversation(
             }
             try writer.print("<|assistant|>\n", .{});
         },
+        .qwen => {
+            if (include_default_system) {
+                try writer.print("<|im_start|>system\n{s}<|im_end|>\n", .{system_message});
+            } else {
+                for (system_messages) |message| {
+                    try writer.print("<|im_start|>system\n{s}<|im_end|>\n", .{message.content});
+                }
+            }
+            for (messages) |message| {
+                const tag = switch (message.role) {
+                    .system => "system",
+                    .user => "user",
+                    .assistant => "assistant",
+                };
+                try writer.print("<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, message.content });
+            }
+            try writer.print("<|im_start|>assistant\n", .{});
+        },
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -251,6 +272,14 @@ fn countRenderedMessageTokens(
             };
             break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|{s}|>\n{s}</s>\n", .{ tag, content });
         },
+        .qwen => blk: {
+            const tag = switch (role) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, content });
+        },
     };
     defer std.heap.page_allocator.free(snippet);
     return runtime_cache.promptTokenCount(model_path, snippet, backend);
@@ -260,6 +289,7 @@ fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system
     return switch (template_style) {
         .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
         .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
+        .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
     };
 }
 

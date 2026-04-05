@@ -46,8 +46,13 @@ pub const DenseTensorStore = struct {
         for (model.layers) |layer| {
             try self.addTensor(model, layer.attn_norm, moon_quant_mode, profiler);
             try self.addTensor(model, layer.attn_q, moon_quant_mode, profiler);
+            if (layer.attn_q_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
+            if (layer.attn_q_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
             try self.addTensor(model, layer.attn_k, moon_quant_mode, profiler);
+            if (layer.attn_k_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
+            if (layer.attn_k_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
             try self.addTensor(model, layer.attn_v, moon_quant_mode, profiler);
+            if (layer.attn_v_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
             try self.addTensor(model, layer.attn_output, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_norm, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
