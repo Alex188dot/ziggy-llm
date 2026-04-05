@@ -30,7 +30,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     }
 
     while (true) {
-        try writer.print(">>> ", .{});
+        try writer.print("\x1b[36m>>> \x1b[0m", .{});
         try writer.flush();
 
         const line = (try stdin.interface.takeDelimiter('\n')) orelse break;
@@ -227,20 +227,25 @@ fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
 fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationReport) !void {
     try writer.print(
         \\
-        \\chat_turn_metrics:
+        \\
+        \\{s}Chat Turn Metrics:{s}
         \\prompt_tokens: {d}
         \\reused_prompt_tokens: {d}
         \\prompt_ms: {d:.3}
         \\ttft_ms: {d:.3}
-        \\tps: {d:.3}
+        \\{s}tps: {d:.3}{s}
         \\
     ,
         .{
+            "\x1b[32m",
+            "\x1b[0m",
             report.prompt_token_count,
             report.reused_prompt_token_count,
             runtime.nsToMs(report.prompt_ns),
             runtime.nsToMs(report.ttft_ns),
+            "\x1b[95m",
             report.decodeTokensPerSecond(),
+            "\x1b[0m",
         },
     );
 
@@ -251,6 +256,7 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
         report.startup_breakdown.session_init_ns != 0)
     {
         try writer.print(
+            \\{s}Startup Metrics:{s}
             \\startup_ms: {d:.3}
             \\startup.model_load_ms: {d:.3}
             \\startup.tensor_prepare_ms: {d:.3}
@@ -260,6 +266,8 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
             \\
         ,
             .{
+                "\x1b[33m",
+                "\x1b[0m",
                 runtime.nsToMs(report.startup_ns),
                 runtime.nsToMs(report.startup_breakdown.model_load_ns),
                 runtime.nsToMs(report.startup_breakdown.tensor_prepare_ns),
