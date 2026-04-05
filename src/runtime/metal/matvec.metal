@@ -651,9 +651,9 @@ kernel void NAME( \
     const uint blocks_per_row = effective_cols / ZIGGY_Q4K_VALUES_PER_BLOCK; \
     const uint row_stride = blocks_per_row * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
     const device uchar *row_bytes0 = matrix + r0 * row_stride; \
-    const device uchar *row_bytes1 = matrix + r1 * row_stride; \
-    const device uchar *row_bytes2 = matrix + r2 * row_stride; \
-    const device uchar *row_bytes3 = matrix + r3 * row_stride; \
+    const device uchar *row_bytes1 = valid1 ? (matrix + r1 * row_stride) : row_bytes0; \
+    const device uchar *row_bytes2 = valid2 ? (matrix + r2 * row_stride) : row_bytes0; \
+    const device uchar *row_bytes3 = valid3 ? (matrix + r3 * row_stride) : row_bytes0; \
     const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
     \
     threadgroup float partial_sums0[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
@@ -691,7 +691,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum0 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid1) { \
+        { \
             const device uchar *block = row_bytes1 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
@@ -706,7 +706,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum1 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid2) { \
+        { \
             const device uchar *block = row_bytes2 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
@@ -721,7 +721,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum2 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid3) { \
+        { \
             const device uchar *block = row_bytes3 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
@@ -1784,9 +1784,9 @@ kernel void NAME( \
     const uint blocks_per_row = effective_cols / ZIGGY_Q4K_VALUES_PER_BLOCK; \
     const uint row_stride = blocks_per_row * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
     const device uchar *row_bytes0 = matrix + r0 * row_stride; \
-    const device uchar *row_bytes1 = matrix + r1 * row_stride; \
-    const device uchar *row_bytes2 = matrix + r2 * row_stride; \
-    const device uchar *row_bytes3 = matrix + r3 * row_stride; \
+    const device uchar *row_bytes1 = valid1 ? (matrix + r1 * row_stride) : row_bytes0; \
+    const device uchar *row_bytes2 = valid2 ? (matrix + r2 * row_stride) : row_bytes0; \
+    const device uchar *row_bytes3 = valid3 ? (matrix + r3 * row_stride) : row_bytes0; \
     const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
     threadgroup float partial_sums0[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
     threadgroup float partial_sums1[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
@@ -1826,7 +1826,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum0 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid1) { \
+        { \
             const device uchar *block = row_bytes1 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
@@ -1841,7 +1841,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum1 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid2) { \
+        { \
             const device uchar *block = row_bytes2 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
@@ -1856,7 +1856,7 @@ kernel void NAME( \
             const float4 high_q = float4(q_vec >> 4); \
             sum2 += dot(low_q * d1 - m1, input_low) + dot(high_q * d2 - m2, input_high); \
         } \
-        if (valid3) { \
+        { \
             const device uchar *block = row_bytes3 + block_index * ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK; \
             const float d = read_half_le(block, 0); \
             const float dmin = read_half_le(block, 2); \
