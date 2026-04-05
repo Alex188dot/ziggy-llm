@@ -136,6 +136,25 @@ static void ziggy_fill_commit_stats(
     out_stats->gpu_timestamps_valid = out_stats->gpu_elapsed_ns > 0;
 }
 
+static id<MTLCommandBuffer> ziggy_new_command_buffer(id<MTLCommandQueue> queue, char *error_message, size_t error_message_len) {
+    if (@available(macOS 11.0, *)) {
+        MTLCommandBufferDescriptor *desc = [[MTLCommandBufferDescriptor alloc] init];
+        desc.retainedReferences = NO;
+        desc.errorOptions = MTLCommandBufferErrorOptionNone;
+        id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:desc];
+        if (cb == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+        }
+        return cb;
+    } else {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        if (cb == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
+        }
+        return cb;
+    }
+}
+
 static void ziggy_dispatch_q4k_rows(
     id<MTLComputeCommandEncoder> encoder,
     id<MTLComputePipelineState> pipeline,
@@ -281,11 +300,8 @@ static int ziggy_run_compute(
 ) {
     id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
     const bool has_pending = command_buffer != nil;
-    if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-    if (command_buffer == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+    if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+    if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) {
@@ -320,11 +336,8 @@ static int ziggy_run_single_threadgroup(
 ) {
     id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
     const bool has_pending = command_buffer != nil;
-    if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-    if (command_buffer == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+    if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+    if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) {
@@ -377,11 +390,8 @@ static int ziggy_run_rowwise_matvec(
 
     id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
     const bool has_pending = command_buffer != nil;
-    if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-    if (command_buffer == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+    if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+    if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) {
@@ -894,11 +904,8 @@ int ziggy_metal_run_matvec_add_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1046,11 +1053,8 @@ int ziggy_metal_run_matvec_q4k_add_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1162,11 +1166,8 @@ int ziggy_metal_run_matvec_q6k_add_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1219,11 +1220,8 @@ int ziggy_metal_run_matvec_q6k_argmax_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output_packed);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1330,11 +1328,8 @@ int ziggy_metal_run_matvec_q8_0_add_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1446,11 +1441,8 @@ int ziggy_metal_run_matvec_moonq_q4k_add_f32(
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1517,11 +1509,8 @@ int ziggy_metal_copy_buffer_region(
             return ZIGGY_METAL_OK;
         }
 
-        id<MTLCommandBuffer> command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLCommandBuffer> command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
         if (encoder == nil) {
@@ -1743,7 +1732,7 @@ int ziggy_metal_attention_fused_f32(
         
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer =[state.queue commandBuffer];
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) {
             ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
             return ZIGGY_METAL_EXECUTION_FAILED;
@@ -1847,11 +1836,9 @@ int ziggy_metal_begin_sequence(
             ziggy_write_error(error_message, error_message_len, @"Metal sequence already active");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
-        state.pendingCommandBuffer = [state.queue commandBuffer];
-        if (state.pendingCommandBuffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        state.pendingCommandBuffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (state.pendingCommandBuffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+        
         return ZIGGY_METAL_OK;
     }
 }
@@ -2153,11 +2140,8 @@ int ziggy_metal_batch_argmax_f32(
 
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -2227,11 +2211,8 @@ int ziggy_metal_batch_matvec_add_f32(
 
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -2290,11 +2271,8 @@ int ziggy_metal_batch_matvec_q4k_add_f32(
 
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -2484,11 +2462,8 @@ int ziggy_metal_batch_matvec_q4k_f32(
 
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
-        if (command_buffer == nil) command_buffer = [state.queue commandBuffer];
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
