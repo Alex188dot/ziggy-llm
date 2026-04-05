@@ -93,7 +93,8 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
         offset += line.len + 1;
     }
 
-    for ([_][]const u8{ "</s>", "</s", "</", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|", "<user|", "<assistant|", "<system|", "<|im_end|>", "<|im_start|>" }) |marker| {
+    const markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
+    for (markers) |marker| {
         if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
             end = @min(end, index);
         }
@@ -316,14 +317,14 @@ test "trimAssistantReply stops at malformed emitted role marker" {
     try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
 }
 
-test "trimAssistantReply stops at partial stop marker" {
+test "trimAssistantReply does not stop at partial stop marker" {
     const reply = "Hello there. </s";
-    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+    try std.testing.expectEqualStrings("Hello there. </s", trimAssistantReply(reply));
 }
 
-test "trimAssistantReply stops at shortest stop prefix" {
+test "trimAssistantReply does not stop at shortest stop prefix" {
     const reply = "Hello there. </";
-    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+    try std.testing.expectEqualStrings("Hello there. </", trimAssistantReply(reply));
 }
 
 test "renderConversation uses chatml markers when GGUF template requests it" {
