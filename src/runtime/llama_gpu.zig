@@ -75,7 +75,6 @@ pub const Session = struct {
     k: metal_backend.BufferHandle,
     v: metal_backend.BufferHandle,
     attn: metal_backend.BufferHandle,
-    attn_scores: metal_backend.BufferHandle,
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
@@ -109,8 +108,6 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(v);
         const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(attn);
-        const attn_scores = try metal_backend.createScratchBuffer(backend, model.head_count * model.context_length);
-        errdefer metal_backend.destroyBuffer(attn_scores);
         const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
         errdefer metal_backend.destroyBuffer(gate);
         const up = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
@@ -142,7 +139,6 @@ pub const Session = struct {
             .k = k,
             .v = v,
             .attn = attn,
-            .attn_scores = attn_scores,
             .gate = gate,
             .up = up,
             .tmp = tmp,
@@ -164,7 +160,6 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.k);
         metal_backend.destroyBuffer(self.v);
         metal_backend.destroyBuffer(self.attn);
-        metal_backend.destroyBuffer(self.attn_scores);
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
@@ -265,7 +260,6 @@ pub const Session = struct {
             self.q,
             self.k_cache,
             self.v_cache,
-            self.attn_scores,
             self.attn,
             self.model.head_count,
             self.model.head_count_kv,
@@ -721,7 +715,6 @@ pub const Session = struct {
                     self.q,
                     self.k_cache,
                     self.v_cache,
-                    self.attn_scores,
                     self.attn,
                     self.model.head_count,
                     self.model.head_count_kv,

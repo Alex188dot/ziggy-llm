@@ -91,6 +91,7 @@ constant uint ZIGGY_Q8_0_BYTES_PER_BLOCK = 34;
 constant uint ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK = 160;
 constant uint ZIGGY_MOONQ_Q4K_SPECIAL_COLS_0 = 2048;
 constant uint ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1 = 5632;
+constant uint ZIGGY_MAX_HEAD_DIM = 256;
 
 kernel void store_kv_half(
     device const float *src [[buffer(0)]],
@@ -850,16 +851,15 @@ kernel void attention_fused_f32(
     device const float *q [[buffer(0)]],
     device const half *k_cache [[buffer(1)]],
     device const half *v_cache [[buffer(2)]],
-    device float *scores_buffer [[buffer(3)]],
-    device float *output [[buffer(4)]],
-    constant uint &head_count [[buffer(5)]],
-    constant uint &head_count_kv [[buffer(6)]],
-    constant uint &head_dim [[buffer(7)]],
-    constant uint &kv_dim [[buffer(8)]],
-    constant uint &context_length [[buffer(9)]],
-    constant uint &position [[buffer(10)]],
-    constant uint &layer_base [[buffer(11)]],
-    constant float &scale [[buffer(12)]],
+    device float *output [[buffer(3)]],
+    constant uint &head_count [[buffer(4)]],
+    constant uint &head_count_kv [[buffer(5)]],
+    constant uint &head_dim [[buffer(6)]],
+    constant uint &kv_dim [[buffer(7)]],
+    constant uint &context_length [[buffer(8)]],
+    constant uint &position [[buffer(9)]],
+    constant uint &layer_base [[buffer(10)]],
+    constant float &scale [[buffer(11)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -872,71 +872,89 @@ kernel void attention_fused_f32(
     const uint kv_head = head / kv_group;
     const uint kv_offset = kv_head * head_dim;
     device const float *q_head = q + head * head_dim;
-    device float *scores = scores_buffer + head * context_length;
 
-    threadgroup float partial_values[ZIGGY_MAX_ROW_SIMDGROUPS];
     const uint token_count = position + 1;
 
-    float local_max = -INFINITY;
+    float local_m = -INFINITY;
+    float local_l = 0.0f;
+    float local_out[ZIGGY_MAX_HEAD_DIM];
+    for (uint d = 0; d < head_dim; d++) {
+        local_out[d] = 0.0f;
+    }
+
     for (uint token = lane; token < token_count; token += threads_per_group) {
         device const half *k_head = k_cache + layer_base + token * kv_dim + kv_offset;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d += 1) {
-            dot += q_head[d] * float(k_head[d]);
+        device const half *v_head = v_cache + layer_base + token * kv_dim + kv_offset;
+
+        float s = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            s += q_head[d] * float(k_head[d]);
         }
-        const float value = dot * scale;
-        scores[token] = value;
-        local_max = max(local_max, value);
+        s *= scale;
+
+        float m_new = max(local_m, s);
+        float exp_diff = exp(local_m - m_new);
+        float p = exp(s - m_new);
+
+        local_l = local_l * exp_diff + p;
+        for (uint d = 0; d < head_dim; d++) {
+            local_out[d] = local_out[d] * exp_diff + p * float(v_head[d]);
+        }
+        local_m = m_new;
     }
 
-    float simd_max_value = simd_max(local_max);
-    if (simd_lane == 0) partial_values[simd_group] = simd_max_value;
+    threadgroup float tg_m[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float simd_m = simd_max(local_m);
+    if (simd_lane == 0) tg_m[simd_group] = simd_m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float max_value = -INFINITY;
+    float global_m = -INFINITY;
+    const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
     if (lane == 0) {
-        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
-        for (uint index = 0; index < simd_group_count; index += 1) {
-            max_value = max(max_value, partial_values[index]);
+        for (uint i = 0; i < simd_group_count; i++) {
+            global_m = max(global_m, tg_m[i]);
         }
-        partial_values[0] = max_value;
+        tg_m[0] = global_m;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    max_value = partial_values[0];
+    global_m = tg_m[0];
 
-    float local_denom = 0.0f;
-    for (uint token = lane; token < token_count; token += threads_per_group) {
-        const float shifted = exp(scores[token] - max_value);
-        scores[token] = shifted;
-        local_denom += shifted;
-    }
-
-    const float simd_denom_value = simd_sum(local_denom);
-    if (simd_lane == 0) partial_values[simd_group] = simd_denom_value;
+    float scaled_l = local_l * exp(local_m - global_m);
+    float simd_l = simd_sum(scaled_l);
+    threadgroup float tg_l[ZIGGY_MAX_ROW_SIMDGROUPS];
+    if (simd_lane == 0) tg_l[simd_group] = simd_l;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float denom = 0.0f;
+    float global_l = 0.0f;
     if (lane == 0) {
-        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
-        for (uint index = 0; index < simd_group_count; index += 1) {
-            denom += partial_values[index];
+        for (uint i = 0; i < simd_group_count; i++) {
+            global_l += tg_l[i];
         }
-        partial_values[0] = denom;
+        tg_l[0] = global_l;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    denom = partial_values[0];
+    global_l = tg_l[0];
 
-    for (uint token = lane; token < token_count; token += threads_per_group) {
-        scores[token] /= denom;
+    threadgroup float tg_out[ZIGGY_MAX_ROW_SIMDGROUPS * ZIGGY_MAX_HEAD_DIM];
+    float thread_scale = exp(local_m - global_m) / global_l;
+
+    for (uint d = 0; d < head_dim; d++) {
+        float scaled_out = local_out[d] * thread_scale;
+        float simd_out = simd_sum(scaled_out);
+        if (simd_lane == 0) {
+            tg_out[simd_group * ZIGGY_MAX_HEAD_DIM + d] = simd_out;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint dim = lane; dim < head_dim; dim += threads_per_group) {
-        float sum = 0.0f;
-        for (uint token = 0; token < token_count; token += 1) {
-            sum += scores[token] * float(v_cache[layer_base + token * kv_dim + kv_offset + dim]);
+    if (simd_group == 0) {
+        for (uint d = simd_lane; d < head_dim; d += threads_per_simdgroup) {
+            float sum = 0.0f;
+            for (uint i = 0; i < simd_group_count; i++) {
+                sum += tg_out[i * ZIGGY_MAX_HEAD_DIM + d];
+            }
+            output[head * head_dim + d] = sum;
         }
-        output[head * head_dim + dim] = sum;
     }
 }
 

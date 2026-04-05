@@ -1823,7 +1823,6 @@ int ziggy_metal_attention_fused_f32(
     const ZiggyMetalBuffer *q,
     const ZiggyMetalBuffer *k_cache,
     const ZiggyMetalBuffer *v_cache,
-    ZiggyMetalBuffer *attn_scores,
     ZiggyMetalBuffer *output,
     uint32_t head_count,
     uint32_t head_count_kv,
@@ -1836,7 +1835,7 @@ int ziggy_metal_attention_fused_f32(
     char *error_message,
     size_t error_message_len
 ) {
-    if (ctx == NULL || q == NULL || k_cache == NULL || v_cache == NULL || attn_scores == NULL || output == NULL || head_count == 0) {
+    if (ctx == NULL || q == NULL || k_cache == NULL || v_cache == NULL || output == NULL || head_count == 0) {
         ziggy_write_error(error_message, error_message_len, @"invalid Metal fused-attention request");
         return ZIGGY_METAL_EXECUTION_FAILED;
     }
@@ -1846,16 +1845,12 @@ int ziggy_metal_attention_fused_f32(
         const ZiggyMetalBufferState *q_buffer = ziggy_const_buffer(q);
         const ZiggyMetalBufferState *k_buffer = ziggy_const_buffer(k_cache);
         const ZiggyMetalBufferState *v_buffer = ziggy_const_buffer(v_cache);
-        ZiggyMetalBufferState *scores_buffer = ziggy_buffer(attn_scores);
         ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
         
         id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
         const bool has_pending = command_buffer != nil;
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
-        if (command_buffer == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to allocate Metal command buffer");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
@@ -1867,16 +1862,15 @@ int ziggy_metal_attention_fused_f32(
         [encoder setBuffer:q_buffer.buffer offset:0 atIndex:0];
         [encoder setBuffer:k_buffer.buffer offset:0 atIndex:1];
         [encoder setBuffer:v_buffer.buffer offset:0 atIndex:2];
-        [encoder setBuffer:scores_buffer.buffer offset:0 atIndex:3];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:4];
-        [encoder setBytes:&head_count length:sizeof(head_count) atIndex:5];
-        [encoder setBytes:&head_count_kv length:sizeof(head_count_kv) atIndex:6];
-        [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-        [encoder setBytes:&kv_dim length:sizeof(kv_dim) atIndex:8];
-        [encoder setBytes:&context_length length:sizeof(context_length) atIndex:9];
-        [encoder setBytes:&position length:sizeof(position) atIndex:10];
-        [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:11];
-        [encoder setBytes:&scale length:sizeof(scale) atIndex:12];
+        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:3];
+        [encoder setBytes:&head_count length:sizeof(head_count) atIndex:4];
+        [encoder setBytes:&head_count_kv length:sizeof(head_count_kv) atIndex:5];
+        [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
+        [encoder setBytes:&kv_dim length:sizeof(kv_dim) atIndex:7];
+        [encoder setBytes:&context_length length:sizeof(context_length) atIndex:8];
+        [encoder setBytes:&position length:sizeof(position) atIndex:9];
+        [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:10];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:11];
 
         NSUInteger thread_width = state.attentionFusedPipeline.threadExecutionWidth;
         if (thread_width == 0) thread_width = 1;
@@ -1895,7 +1889,6 @@ int ziggy_metal_attention_fused_f32(
 
         if (has_pending) return ZIGGY_METAL_OK;
 
-        [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
 
