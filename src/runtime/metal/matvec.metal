@@ -850,8 +850,8 @@ constant uint ZIGGY_MAX_ATTENTION_CONTEXT = 4096;
 
 kernel void attention_fused_f32(
     device const float *q [[buffer(0)]],
-    device const float *k_cache [[buffer(1)]],
-    device const float *v_cache [[buffer(2)]],
+    device const half *k_cache [[buffer(1)]],
+    device const half *v_cache [[buffer(2)]],
     device float *output [[buffer(3)]],
     constant uint &head_count [[buffer(4)]],
     constant uint &head_count_kv [[buffer(5)]],
@@ -879,10 +879,10 @@ kernel void attention_fused_f32(
 
     float local_max = -INFINITY;
     for (uint token = lane; token < token_count; token += threads_per_group) {
-        device const float *k_head = k_cache + layer_base + token * kv_dim + kv_offset;
+        device const half *k_head = k_cache + layer_base + token * kv_dim + kv_offset;
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; d += 1) {
-            dot += q_head[d] * k_head[d];
+            dot += q_head[d] * float(k_head[d]);
         }
         const float value = dot * scale;
         scores[token] = value;
@@ -934,7 +934,7 @@ kernel void attention_fused_f32(
     for (uint dim = lane; dim < head_dim; dim += threads_per_group) {
         float sum = 0.0f;
         for (uint token = 0; token < token_count; token += 1) {
-            sum += scores[token] * v_cache[layer_base + token * kv_dim + kv_offset + dim];
+            sum += scores[token] * float(v_cache[layer_base + token * kv_dim + kv_offset + dim]);
         }
         output[head * head_dim + dim] = sum;
     }

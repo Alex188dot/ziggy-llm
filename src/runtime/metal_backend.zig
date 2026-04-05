@@ -233,6 +233,33 @@ pub fn writeBufferF32(buffer: BufferHandle, values: []const f32) !void {
     try writeBuffer(buffer.raw, values);
 }
 
+pub fn writeBufferF16(buffer: BufferHandle, values: []const f16) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (values.len * @sizeOf(f16) > buffer.byte_len) return error.MetalBufferError;
+    try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
+}
+
+pub fn storeKvHalf(
+    backend: backend_api.MatVecBackend,
+    src: BufferHandle,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_store_kv_half(
+        state.context,
+        src.raw,
+        dst.raw,
+        @intCast(dst_offset_elements),
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;

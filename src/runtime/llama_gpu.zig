@@ -72,6 +72,8 @@ pub const Session = struct {
     hidden: metal_backend.BufferHandle,
     normed: metal_backend.BufferHandle,
     q: metal_backend.BufferHandle,
+    k: metal_backend.BufferHandle,
+    v: metal_backend.BufferHandle,
     attn: metal_backend.BufferHandle,
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
@@ -100,6 +102,10 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(normed);
         const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
+        const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(k);
+        const v = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(v);
         const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(attn);
         const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
@@ -114,9 +120,9 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(sampled_token_packed);
         const shortlist_entries = try metal_backend.createByteScratchBuffer(backend, max_shortlist_len * @sizeOf(metal_backend.ShortlistEntry));
         errdefer metal_backend.destroyBuffer(shortlist_entries);
-        const k_cache = try metal_backend.createScratchBuffer(backend, cache_len);
+        const k_cache = try metal_backend.createByteScratchBuffer(backend, cache_len * @sizeOf(f16));
         errdefer metal_backend.destroyBuffer(k_cache);
-        const v_cache = try metal_backend.createScratchBuffer(backend, cache_len);
+        const v_cache = try metal_backend.createByteScratchBuffer(backend, cache_len * @sizeOf(f16));
         errdefer metal_backend.destroyBuffer(v_cache);
         const batch_logits = try metal_backend.createScratchBuffer(backend, max_draft_len * model.vocab_size);
         errdefer metal_backend.destroyBuffer(batch_logits);
@@ -130,6 +136,8 @@ pub const Session = struct {
             .hidden = hidden,
             .normed = normed,
             .q = q,
+            .k = k,
+            .v = v,
             .attn = attn,
             .gate = gate,
             .up = up,
@@ -149,6 +157,8 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.hidden);
         metal_backend.destroyBuffer(self.normed);
         metal_backend.destroyBuffer(self.q);
+        metal_backend.destroyBuffer(self.k);
+        metal_backend.destroyBuffer(self.v);
         metal_backend.destroyBuffer(self.attn);
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
@@ -195,18 +205,25 @@ pub const Session = struct {
         });
 
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-        const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
+        const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+
         const kv_k_start = std.time.nanoTimestamp();
-        try self.runProjectionToDst(layer.attn_k, self.normed, self.k_cache, kv_offset);
-        try metal_backend.applyRoPEAtOffset(
+        try self.runProjection(layer.attn_k, self.normed, self.k);
+        try metal_backend.applyRoPE(
             self.backend,
-            self.k_cache,
-            kv_offset,
+            self.k,
             self.model.head_count_kv,
             self.model.head_dimension,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
+        );
+        try metal_backend.storeKvHalf(
+            self.backend,
+            self.k,
+            self.k_cache,
+            kv_offset_elements,
+            self.model.kv_dimension,
         );
         self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
@@ -220,8 +237,16 @@ pub const Session = struct {
             .depth = layer_index,
             .extra = position + 1,
         });
+
         const kv_v_start = std.time.nanoTimestamp();
-        try self.runProjectionToDst(layer.attn_v, self.normed, self.v_cache, kv_offset);
+        try self.runProjection(layer.attn_v, self.normed, self.v);
+        try metal_backend.storeKvHalf(
+            self.backend,
+            self.v,
+            self.v_cache,
+            kv_offset_elements,
+            self.model.kv_dimension,
+        );
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
             .cols = self.model.kv_dimension,
@@ -633,19 +658,34 @@ pub const Session = struct {
                 );
 
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-                const kv_offset = (layer_base + position * self.model.kv_dimension) * @sizeOf(f32);
-                try self.runProjectionToDst(layer.attn_k, self.normed, self.k_cache, kv_offset);
-                try metal_backend.applyRoPEAtOffset(
+                const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+
+                try self.runProjection(layer.attn_k, self.normed, self.k);
+                try metal_backend.applyRoPE(
                     self.backend,
-                    self.k_cache,
-                    kv_offset,
+                    self.k,
                     self.model.head_count_kv,
                     self.model.head_dimension,
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
                 );
-                try self.runProjectionToDst(layer.attn_v, self.normed, self.v_cache, kv_offset);
+                try metal_backend.storeKvHalf(
+                    self.backend,
+                    self.k,
+                    self.k_cache,
+                    kv_offset_elements,
+                    self.model.kv_dimension,
+                );
+
+                try self.runProjection(layer.attn_v, self.normed, self.v);
+                try metal_backend.storeKvHalf(
+                    self.backend,
+                    self.v,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.kv_dimension,
+                );
 
                 try metal_backend.attentionFused(
                     self.backend,

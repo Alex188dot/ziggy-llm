@@ -703,38 +703,44 @@ test "metal fused attention matches cpu reference" {
     const scale: f32 = 0.125;
 
     var q: [head_count * head_dim]f32 = undefined;
-    var k_cache: [context_length * kv_dim]f32 = undefined;
-    var v_cache: [context_length * kv_dim]f32 = undefined;
+    var k_cache: [context_length * kv_dim]f16 = undefined;
+    var v_cache: [context_length * kv_dim]f16 = undefined;
+    var k_cache_f32: [context_length * kv_dim]f32 = undefined;
+    var v_cache_f32: [context_length * kv_dim]f32 = undefined;
     var expected: [head_count * head_dim]f32 = undefined;
     var actual: [head_count * head_dim]f32 = undefined;
 
     for (&q, 0..) |*value, index| {
         value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.07) + 0.02;
     }
-    for (&k_cache, 0..) |*value, index| {
+    for (&k_cache_f32, 0..) |*value, index| {
         value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.06) - 0.01;
+        k_cache[index] = @floatCast(value.*);
     }
-    for (&v_cache, 0..) |*value, index| {
+    for (&v_cache_f32, 0..) |*value, index| {
         value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) * 0.08) + 0.03;
+        v_cache[index] = @floatCast(value.*);
     }
 
-    attentionReference(&expected, &q, &k_cache, &v_cache, head_count, head_count_kv, head_dim, kv_dim, position, layer_base, scale);
+    attentionReference(&expected, &q, &k_cache_f32, &v_cache_f32, head_count, head_count_kv, head_dim, kv_dim, position, layer_base, scale);
 
     const backend = try metal_backend.create(std.testing.allocator);
     defer backend.deinit(std.testing.allocator);
 
     const q_buffer = try metal_backend.createScratchBuffer(backend, q.len);
     defer metal_backend.destroyBuffer(q_buffer);
-    const k_buffer = try metal_backend.createScratchBuffer(backend, k_cache.len);
+
+    const k_buffer = try metal_backend.createByteScratchBuffer(backend, k_cache.len * @sizeOf(f16));
     defer metal_backend.destroyBuffer(k_buffer);
-    const v_buffer = try metal_backend.createScratchBuffer(backend, v_cache.len);
+    const v_buffer = try metal_backend.createByteScratchBuffer(backend, v_cache.len * @sizeOf(f16));
     defer metal_backend.destroyBuffer(v_buffer);
+
     const output_buffer = try metal_backend.createScratchBuffer(backend, actual.len);
     defer metal_backend.destroyBuffer(output_buffer);
 
     try metal_backend.writeBufferF32(q_buffer, &q);
-    try metal_backend.writeBufferF32(k_buffer, &k_cache);
-    try metal_backend.writeBufferF32(v_buffer, &v_cache);
+    try metal_backend.writeBufferF16(k_buffer, &k_cache);
+    try metal_backend.writeBufferF16(v_buffer, &v_cache);
     try metal_backend.attentionFused(
         backend,
         q_buffer,
@@ -753,7 +759,7 @@ test "metal fused attention matches cpu reference" {
     try metal_backend.readBufferF32(output_buffer, &actual);
 
     for (0..actual.len) |index| {
-        try std.testing.expectApproxEqAbs(expected[index], actual[index], 0.001);
+        try std.testing.expectApproxEqAbs(expected[index], actual[index], 0.005);
     }
 }
 
