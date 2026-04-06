@@ -21,10 +21,10 @@ The following table compares end-to-end decode throughput on Apple Silicon (MacB
 
 | Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
 | ------------------ | ------ | ----------------- | ------------ | ----------------- |
-| **TinyLlama 1.1B** | Q4_K_M | ~120 tok/s        | —            | 151.4 tok/s       |
+| **TinyLlama 1.1B** | Q4_K_M | ~123 tok/s        | —            | 151.4 tok/s       |
 | **Llama 3.2 3B**   | Q4_K_M | ~40 tok/s         | —            | 53.5 tok/s        |
 | **Llama 3.1 8B**   | Q4_K_M | ~18 tok/s         | ~10 tok/s    | 23.1 tok/s        |
-| **Qwen3 1.7B**     | Q4_K_M | —                 | —            | 92.0 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
 | **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
 
 Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).

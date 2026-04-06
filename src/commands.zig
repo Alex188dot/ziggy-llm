@@ -7,6 +7,7 @@ const chat_runtime = @import("chat_runtime.zig");
 const server = @import("server.zig");
 const server_runtime = @import("server_runtime.zig");
 const build_options = @import("build_options");
+const update = @import("update.zig");
 
 pub fn dispatch(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !void {
     switch (config.command) {
@@ -17,6 +18,7 @@ pub fn dispatch(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cl
         .bench => try benchModel(writer, allocator, config),
         .inspect => try printInspect(writer, config),
         .serve => try server_runtime.serve(writer, allocator, config),
+        .update => try update.runUpdateCommand(writer, allocator),
     }
 }
 

@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     const default_enable_metal = target.result.os.tag == .macos and target.result.cpu.arch == .aarch64;
     const enable_metal = b.option(bool, "metal", "Enable the Metal backend") orelse default_enable_metal;
 
-    const version = b.option([]const u8, "version", "Override the build version string") orelse "0.1.0-dev";
+    const version = b.option([]const u8, "version", "Override the build version string") orelse "0.1.0";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_metal", enable_metal);

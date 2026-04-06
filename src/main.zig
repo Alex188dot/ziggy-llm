@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
+const update = @import("update.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -11,6 +12,11 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const config = try cli.parseArgs(args);
+
+    if (config.command != .help and config.command != .version and config.command != .update) {
+        update.checkForUpdates(allocator);
+    }
+
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&stdout_buffer);
     try commands.dispatch(&stdout.interface, allocator, config);

@@ -9,6 +9,7 @@ pub const Command = enum {
     inspect,
     bench,
     serve,
+    update,
     help,
     version,
 };
@@ -190,6 +191,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "inspect")) return .inspect;
     if (std.mem.eql(u8, name, "bench")) return .bench;
     if (std.mem.eql(u8, name, "serve")) return .serve;
+    if (std.mem.eql(u8, name, "update")) return .update;
     return null;
 }
 
@@ -208,6 +210,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  inspect   Inspect GGUF metadata and support status
         \\  bench     Run benchmark routines
         \\  serve     Start the tiny HTTP server
+        \\  update    Update ziggy-llm to the latest version
         \\  help      Print this help
         \\  version   Print the build version
         \\

@@ -1,6 +1,6 @@
 # Roadmap
 
-This roadmap expands the scope defined in [PROJECT_OUTLINE.md](/Users/alessioleodori/HelloWorld/zig_/PROJECT_OUTLINE.md) into concrete milestones for the first public versions of `ziggy-llm`.
+This roadmap expands the scope defined in PROJECT_OUTLINE.md into concrete milestones for the first public versions of `ziggy-llm`.
 
 ## How To Use This File
 
