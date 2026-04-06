@@ -317,6 +317,10 @@ Current implementation note:
 | 2026-04-05 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.024 | 157.328 | 157.596 | 120.613 |
 | 2026-04-05 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 307.000 | 205.124 | 512.195 | 122.347 |
 | 2026-04-05 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.025 | 157.049 | 157.122 | 123.234 |
+| 2026-04-06 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 1303.285 | 236.624 | 1540.201 | 124.103 |
+| 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.036 | 152.272 | 152.573 | 123.440 |
+| 2026-04-06 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 326.123 | 184.923 | 511.118 | 126.740 |
+| 2026-04-06 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | 20 | 128 | 0.050 | 157.499 | 157.626 | 123.711 |
 
 ## Benchmark Table — Llama 3.2 3B
 
@@ -330,3 +334,7 @@ Current implementation note:
 | 2026-04-05 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 0.022 | 172.872 | 173.909 | 39.392 |
 | 2026-04-05 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 1460.284 | 566.545 | 2026.882 | 40.229 |
 | 2026-04-05 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 8 | 128 | 0.025 | 176.307 | 176.378 | 39.357 |
+| 2026-04-06 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 7 | 128 | 4104.183 | 937.418 | 5042.671 | 40.370 |
+| 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 7 | 128 | 0.040 | 147.928 | 148.848 | 40.317 |
+| 2026-04-06 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 7 | 128 | 1364.490 | 943.845 | 2308.407 | 40.768 |
+| 2026-04-06 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | 7 | 128 | 0.046 | 154.242 | 154.356 | 39.919 |
