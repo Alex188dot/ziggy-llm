@@ -4,9 +4,10 @@ const moon_quant = @import("../moon_quant.zig");
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "llama";
-pub const supported_architecture = "llama (native CPU + Metal)";
-pub const supported_model_family = "llama-family GGUF models through the native CPU or Metal runtime";
+pub const supported_architecture = "llama, qwen2 (native CPU + Metal)";
+pub const supported_model_family = "llama and qwen2 family GGUF models through the native CPU or Metal runtime";
 pub const supported_quantization = moon_quant.supported_quantization;
+pub const default_context_length: usize = 8192;
 
 pub const RuntimeError = error{
     InvalidMagic,
@@ -147,6 +148,7 @@ pub const ReadbackMode = enum {
 
 pub const GenerationOptions = struct {
     max_tokens: usize = 16,
+    context_length: usize = default_context_length,
     seed: u64 = 0,
     temperature: f32 = 0.0,
     repeat_penalty: f32 = 1.0,

@@ -13,7 +13,76 @@ A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal suppo
 - CLI first
 - tiny OpenAI-compatible server second
 
-The goal is to build a small, understandable, high-performance inference runner that feels native to a MacBook Pro and is easy to benchmark honestly.
+The goal is to build a small, understandable, high-performance inference engine that feels native to Apple hardware and is easy to benchmark honestly.
+
+## Performance Comparison
+
+The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown.
+
+| Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
+| ------------------ | ------ | ----------------- | ------------ | ----------------- |
+| **TinyLlama 1.1B** | Q4_K_M | ~123 tok/s        | —            | 151.4 tok/s       |
+| **Llama 3.2 3B**   | Q4_K_M | ~40 tok/s         | —            | 53.5 tok/s        |
+| **Llama 3.1 8B**   | Q4_K_M | ~18 tok/s         | ~10 tok/s    | 23.1 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
+| **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
+
+Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
+
+## Quick Start
+
+Prerequisite:
+
+- Zig 0.15.2 or newer
+
+Build:
+
+```bash
+zig build -Doptimize=ReleaseFast
+```
+
+Chat:
+
+```bash
+./zig-out/bin/ziggy-llm chat \
+  --model path/to/model.gguf \
+  --backend metal \
+  --temperature 0 \
+  --seed 42
+```
+
+Run 1 prompt:
+
+```bash
+./zig-out/bin/ziggy-llm run \
+  --model path/to/model.gguf \
+  --prompt "Write one short paragraph about Zig." \
+  --backend metal \
+  --max-tokens 128 \
+  --temperature 0.7 \
+  --seed 42
+```
+
+Benchmark:
+
+```bash
+./zig-out/bin/ziggy-llm bench \
+  --model path/to/model.gguf \
+  --prompt "Write one short paragraph about Zig." \
+  --backend metal \
+  --max-tokens 128 \
+  --temperature 0.7 \
+  --seed 42 \
+  --bench-runs 5
+```
+
+With `--bench-runs N`, the first run is cold and the remaining runs use the resident runtime path. Warm output now reports `warm.reused_prompt_tokens_avg` so prompt-prefix reuse is visible instead of being inferred from TTFT alone.
+
+Run tests:
+
+```bash
+zig build test
+```
 
 ## Product Shape
 
@@ -28,17 +97,6 @@ Planned first version:
 - narrow supported quantization matrix
 - benchmark-friendly workflow
 
-Explicit non-goals for v0:
-
-- CUDA
-- ROCm
-- Vulkan
-- distributed inference
-- multimodal support
-- support for every GGUF model family
-- broad quantization coverage from day one
-- fine-tuning or training
-
 ## Why Zig
 
 Zig is a strong fit for this project because it makes the important tradeoffs visible:
@@ -50,6 +108,17 @@ Zig is a strong fit for this project because it makes the important tradeoffs vi
 - clear systems code without heavyweight abstraction layers
 
 For local inference, hidden allocations and accidental complexity matter. Zig keeps both under pressure.
+
+## Current models and quantizations support
+
+Qwen (2 and 3) and LLama model families, in particular these have been tested:
+
+- Qwen 3
+- Llama 3.1
+- Llama 3.2
+- TinyLlama
+
+Quantization support: Q4_K_M, Q6_K, Q8_0, F16, F32.
 
 ## Planned CLI
 
@@ -68,10 +137,9 @@ Current commands:
 ```bash
 zig build run
 zig build run -- inspect -m /path/to/model.gguf
-zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend auto
-zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend cpu
-zig build moon-quant-guardrail -- --model /path/to/model.gguf
-zig build run -- serve -m /path/to/model.gguf --port 8080
+zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend auto
+zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
+zig build run -- bench -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
 ```
 
 Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
@@ -150,50 +218,13 @@ Initial implementation order:
 4. tiny HTTP server
 5. launch-quality benchmarks and demos
 
-## Quick Start
+## Want to participate? Here is a TODO list of things that need immediate attention:
 
-Prerequisite:
-
-- Zig 0.15.2 or newer
-
-Build:
-
-```bash
-zig build
-```
-
-Run the CLI scaffold:
-
-```bash
-zig build run
-```
-
-Run an implemented CPU reference command:
-
-```bash
-zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7
-```
-
-Run the implemented Metal path on Apple Silicon:
-
-```bash
-./zig-out/bin/ziggy-llm run -m /path/to/llama-model.gguf -p "Hello" --max-tokens 32 --seed 7 --backend metal
-```
-
-Benchmark CPU vs Metal on the same model:
-
-```bash
-./zig-out/bin/ziggy-llm bench -m /path/to/llama-model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend cpu
-./zig-out/bin/ziggy-llm bench -m /path/to/llama-model.gguf -p "Hello" --max-tokens 256 --seed 7 --backend metal
-```
-
-With `--bench-runs N`, the first run is cold and the remaining runs use the resident runtime path. Warm output now reports `warm.reused_prompt_tokens_avg` so prompt-prefix reuse is visible instead of being inferred from TTFT alone.
-
-Run tests:
-
-```bash
-zig build test
-```
+- [ ] Implement OpenAI compatible server
+- [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants), Gemma and Mistral model families
+- [ ] Make chat more robust
+- [ ] Test all quants (currently tested only Q4_K_M)
+- [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
 
 ## License
 

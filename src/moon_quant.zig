@@ -150,6 +150,24 @@ pub fn q4KPackedRowByteLen(row_len: usize) !usize {
     return std.math.mul(usize, block_count, q4_k_packed_block_bytes);
 }
 
+const PackContext = struct {
+    tensor_bytes: []const u8,
+    packed_bytes: []u8,
+    raw_row_size: usize,
+    packed_row_size: usize,
+    row_len: usize,
+    start_row: usize,
+    end_row: usize,
+};
+
+fn packWorker(ctx: PackContext) void {
+    for (ctx.start_row..ctx.end_row) |row_index| {
+        const raw_row = ctx.tensor_bytes[row_index * ctx.raw_row_size ..][0..ctx.raw_row_size];
+        const packed_row = ctx.packed_bytes[row_index * ctx.packed_row_size ..][0..ctx.packed_row_size];
+        packQ4KRowInto(packed_row, raw_row, ctx.row_len) catch {};
+    }
+}
+
 pub fn packQ4KTensor(
     allocator: std.mem.Allocator,
     tensor_bytes: []const u8,
@@ -163,10 +181,32 @@ pub fn packQ4KTensor(
     const packed_bytes = try allocator.alloc(u8, row_count * packed_row_size);
     errdefer allocator.free(packed_bytes);
 
-    for (0..row_count) |row_index| {
-        const raw_row = tensor_bytes[row_index * raw_row_size ..][0..raw_row_size];
-        const packed_row = packed_bytes[row_index * packed_row_size ..][0..packed_row_size];
-        try packQ4KRowInto(packed_row, raw_row, row_len);
+    const thread_count = @min(row_count, std.Thread.getCpuCount() catch 4);
+    const rows_per_thread = (row_count + thread_count - 1) / thread_count;
+
+    var threads = try allocator.alloc(std.Thread, thread_count);
+    defer allocator.free(threads);
+
+    var spawned: usize = 0;
+    for (0..thread_count) |i| {
+        const start = i * rows_per_thread;
+        if (start >= row_count) break;
+        const end = @min(start + rows_per_thread, row_count);
+
+        threads[spawned] = try std.Thread.spawn(.{}, packWorker, .{PackContext{
+            .tensor_bytes = tensor_bytes,
+            .packed_bytes = packed_bytes,
+            .raw_row_size = raw_row_size,
+            .packed_row_size = packed_row_size,
+            .row_len = row_len,
+            .start_row = start,
+            .end_row = end,
+        }});
+        spawned += 1;
+    }
+
+    for (threads[0..spawned]) |thread| {
+        thread.join();
     }
 
     return .{

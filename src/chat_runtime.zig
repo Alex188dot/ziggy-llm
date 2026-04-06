@@ -16,7 +16,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin = std.fs.File.stdin().reader(&stdin_buf);
-    const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend);
+    const context_window = try prompt_builder.contextWindow(&cache, model_path, config.backend, config.context_length);
     const max_tokens = effectiveChatMaxTokens(config, context_window);
 
     try writer.print("chat_ready: true\nmodel: {s}\ncontext_window: {d}\nhistory_window_messages: {d}\ncommands: /help /clear /unload /bye\n\n", .{
@@ -30,7 +30,7 @@ pub fn runChat(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli
     }
 
     while (true) {
-        try writer.print("> ", .{});
+        try writer.print("\x1b[36m>>> \x1b[0m", .{});
         try writer.flush();
 
         const line = (try stdin.interface.takeDelimiter('\n')) orelse break;
@@ -68,8 +68,14 @@ fn handleUserTurn(
     user_text: []const u8,
 ) !void {
     try prompt_builder.appendMessage(allocator, messages, .user, user_text);
-    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, max_tokens, messages.items);
+    const prompt = try prompt_builder.buildPrompt(allocator, cache, model_path, config.backend, config.context_length, max_tokens, messages.items);
     defer allocator.free(prompt);
+
+    const is_qwen = std.mem.indexOf(u8, model_path, "Qwen") != null or std.mem.indexOf(u8, model_path, "qwen") != null;
+    if (!is_qwen) {
+        try writer.print("\n", .{});
+        try writer.flush();
+    }
 
     var stream_state = StreamState.init(allocator, writer);
     defer stream_state.deinit();
@@ -87,6 +93,7 @@ fn handleUserTurn(
 fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOptions {
     return .{
         .max_tokens = max_tokens,
+        .context_length = config.context_length,
         .seed = config.seed,
         .temperature = config.temperature,
         .repeat_penalty = config.repeat_penalty,
@@ -102,7 +109,7 @@ fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOp
 fn effectiveChatMaxTokens(config: cli.Config, context_window: usize) usize {
     const cli_default: usize = 16;
     if (config.max_tokens != cli_default) return config.max_tokens;
-    return @min(@as(usize, 256), context_window / 4);
+    return @min(@as(usize, 2048), context_window / 2);
 }
 
 const StreamState = struct {
@@ -111,6 +118,7 @@ const StreamState = struct {
     buffer: std.ArrayList(u8) = .empty,
     emitted_len: usize = 0,
     stopped: bool = false,
+    in_think: bool = false,
 
     fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) StreamState {
         return .{
@@ -126,17 +134,89 @@ const StreamState = struct {
 
     fn flushSafePrefix(self: *StreamState) !void {
         const safe = prompt_builder.trimAssistantReply(self.buffer.items);
-        if (safe.len <= self.emitted_len) return;
-        try self.writer.print("{s}", .{safe[self.emitted_len..]});
+        var process_end = safe.len;
+
+        const think_tag = "<think>";
+        const end_think_tag = "</think>";
+        const stop_markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
+
+        var partial_len: usize = 0;
+        for (1..think_tag.len) |i| {
+            if (safe.len >= i and std.mem.endsWith(u8, safe, think_tag[0..i])) {
+                partial_len = @max(partial_len, i);
+            }
+        }
+        for (1..end_think_tag.len) |i| {
+            if (safe.len >= i and std.mem.endsWith(u8, safe, end_think_tag[0..i])) {
+                partial_len = @max(partial_len, i);
+            }
+        }
+        for (stop_markers) |marker| {
+            for (1..marker.len) |i| {
+                if (safe.len >= i and std.mem.endsWith(u8, safe, marker[0..i])) {
+                    partial_len = @max(partial_len, i);
+                }
+            }
+        }
+
+        process_end -= partial_len;
+
+        if (process_end <= self.emitted_len) return;
+
+        const chunk = safe[self.emitted_len..process_end];
+        try self.printChunk(chunk);
+
         try self.writer.flush();
-        self.emitted_len = safe.len;
+        self.emitted_len = process_end;
     }
 
     fn flushFinal(self: *StreamState, final_trimmed: []const u8) !void {
-        if (final_trimmed.len <= self.emitted_len) return;
-        try self.writer.print("{s}", .{final_trimmed[self.emitted_len..]});
+        if (final_trimmed.len <= self.emitted_len) {
+            if (self.in_think) {
+                try self.writer.print("\x1b[0m", .{});
+                try self.writer.flush();
+            }
+            return;
+        }
+
+        const chunk = final_trimmed[self.emitted_len..];
+        try self.printChunk(chunk);
+
+        if (self.in_think) {
+            try self.writer.print("\x1b[0m", .{});
+        }
         try self.writer.flush();
         self.emitted_len = final_trimmed.len;
+    }
+
+    fn printChunk(self: *StreamState, chunk: []const u8) !void {
+        const think_tag = "<think>";
+        const end_think_tag = "</think>";
+        var i: usize = 0;
+
+        while (i < chunk.len) {
+            if (!self.in_think) {
+                if (std.mem.startsWith(u8, chunk[i..], think_tag)) {
+                    self.in_think = true;
+                    try self.writer.print("\x1b[3m\x1b[90m", .{});
+                    i += think_tag.len;
+                    if (i < chunk.len and chunk[i] == '\n') i += 1;
+                } else {
+                    try self.writer.writeByte(chunk[i]);
+                    i += 1;
+                }
+            } else {
+                if (std.mem.startsWith(u8, chunk[i..], end_think_tag)) {
+                    self.in_think = false;
+                    try self.writer.print("\x1b[0m", .{});
+                    i += end_think_tag.len;
+                    if (i < chunk.len and chunk[i] == '\n') i += 1;
+                } else {
+                    try self.writer.writeByte(chunk[i]);
+                    i += 1;
+                }
+            }
+        }
     }
 };
 
@@ -153,20 +233,25 @@ fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
 fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationReport) !void {
     try writer.print(
         \\
-        \\chat_turn_metrics:
+        \\
+        \\{s}Chat Turn Metrics:{s}
         \\prompt_tokens: {d}
         \\reused_prompt_tokens: {d}
         \\prompt_ms: {d:.3}
         \\ttft_ms: {d:.3}
-        \\tps: {d:.3}
+        \\{s}tps: {d:.3}{s}
         \\
     ,
         .{
+            "\x1b[32m",
+            "\x1b[0m",
             report.prompt_token_count,
             report.reused_prompt_token_count,
             runtime.nsToMs(report.prompt_ns),
             runtime.nsToMs(report.ttft_ns),
+            "\x1b[95m",
             report.decodeTokensPerSecond(),
+            "\x1b[0m",
         },
     );
 
@@ -177,6 +262,7 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
         report.startup_breakdown.session_init_ns != 0)
     {
         try writer.print(
+            \\{s}Startup Metrics:{s}
             \\startup_ms: {d:.3}
             \\startup.model_load_ms: {d:.3}
             \\startup.tensor_prepare_ms: {d:.3}
@@ -186,6 +272,8 @@ fn printTurnTimings(writer: *std.Io.Writer, report: *const runtime.GenerationRep
             \\
         ,
             .{
+                "\x1b[33m",
+                "\x1b[0m",
                 runtime.nsToMs(report.startup_ns),
                 runtime.nsToMs(report.startup_breakdown.model_load_ns),
                 runtime.nsToMs(report.startup_breakdown.tensor_prepare_ns),

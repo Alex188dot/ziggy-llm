@@ -1,3 +1,4 @@
+
 #ifndef ZIGGY_METAL_BRIDGE_H
 #define ZIGGY_METAL_BRIDGE_H
 
@@ -256,6 +257,30 @@ int ziggy_metal_run_matvec_moonq_q4k_add_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q4k_silu_down_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_silu_down_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_copy_buffer_region(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *src,
@@ -275,6 +300,7 @@ int ziggy_metal_apply_rope_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
@@ -288,6 +314,7 @@ int ziggy_metal_apply_rope_at_offset_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
@@ -302,6 +329,17 @@ int ziggy_metal_apply_rope_to_dst_f32(
     uint32_t rope_dim,
     uint32_t position,
     float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_store_kv_half(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_elements,
+    uint32_t count,
     char *error_message,
     size_t error_message_len
 );
@@ -361,12 +399,33 @@ int ziggy_metal_add_in_place_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_add_bias_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const void *bias_weights,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_rms_norm_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
     const ZiggyMetalBuffer *weights,
     ZiggyMetalBuffer *output,
     uint32_t count,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_rms_norm_per_head_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_dim,
     float eps,
     char *error_message,
     size_t error_message_len
@@ -399,6 +458,84 @@ int ziggy_metal_sample_topk_f32(
     uint32_t top_k,
     float temperature,
     float random_uniform,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_argmax_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_tokens,
+    uint32_t vocab_size,
+    uint32_t batch_count,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_matvec_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_matvec_q4k_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_silu_mul_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    uint32_t count,
+    uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_add_in_place_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *src,
+    uint32_t count,
+    uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_rms_norm_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *weights,
+    ZiggyMetalBuffer *output,
+    uint32_t count,
+    float eps,
+    uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_batch_matvec_q4k_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t batch_idx,
     char *error_message,
     size_t error_message_len
 );

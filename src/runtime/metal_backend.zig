@@ -233,6 +233,33 @@ pub fn writeBufferF32(buffer: BufferHandle, values: []const f32) !void {
     try writeBuffer(buffer.raw, values);
 }
 
+pub fn writeBufferF16(buffer: BufferHandle, values: []const f16) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (values.len * @sizeOf(f16) > buffer.byte_len) return error.MetalBufferError;
+    try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
+}
+
+pub fn storeKvHalf(
+    backend: backend_api.MatVecBackend,
+    src: BufferHandle,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_store_kv_half(
+        state.context,
+        src.raw,
+        dst.raw,
+        @intCast(dst_offset_elements),
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
@@ -706,6 +733,60 @@ pub fn runMatVecMoonQuantQ4KAddToBuffer(
     ), &error_buf);
 }
 
+pub fn runMatVecQ4KSiluDownAddToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    gate: BufferHandle,
+    up: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < cols * @sizeOf(f32) or up.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_silu_down_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        gate.raw,
+        up.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecMoonQuantQ4KSiluDownAddToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    gate: BufferHandle,
+    up: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < cols * @sizeOf(f32) or up.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_moonq_q4k_silu_down_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        gate.raw,
+        up.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn copyBufferRegion(
     backend: backend_api.MatVecBackend,
     src: BufferHandle,
@@ -737,6 +818,7 @@ pub fn applyRoPE(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -749,6 +831,7 @@ pub fn applyRoPE(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -763,6 +846,7 @@ pub fn applyRoPEAtOffset(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -776,6 +860,7 @@ pub fn applyRoPEAtOffset(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -791,6 +876,7 @@ pub fn applyRoPEToDst(
     rope_dim: usize,
     position: usize,
     freq_base: f32,
+    rope_style: u32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -805,6 +891,7 @@ pub fn applyRoPEToDst(
         @intCast(rope_dim),
         @intCast(position),
         freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -885,6 +972,25 @@ pub fn addInPlace(
     ), &error_buf);
 }
 
+pub fn addBiasF32(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    bias_weights: []const f32,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_add_bias_f32(
+        state.context,
+        dst.raw,
+        bias_weights.ptr,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn rmsNorm(
     backend: backend_api.MatVecBackend,
     input: BufferHandle,
@@ -903,6 +1009,32 @@ pub fn rmsNorm(
         weights_buffer.raw,
         output.raw,
         @intCast(count),
+        eps,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn rmsNormPerHeadF32(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    weights: []const f32,
+    output: BufferHandle,
+    head_count: usize,
+    head_dim: usize,
+    eps: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const weights_buffer = try state.matrixBuffer(weights[0..head_dim]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_rms_norm_per_head_f32(
+        state.context,
+        input.raw,
+        weights_buffer.raw,
+        output.raw,
+        @intCast(head_count),
+        @intCast(head_dim),
         eps,
         &error_buf,
         error_buf.len,
@@ -981,6 +1113,180 @@ pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;
     try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
+}
+
+pub fn batchArgmax(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    output_tokens: BufferHandle,
+    vocab_size: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (batch_count == 0 or batch_count > 8) return error.InvalidTensorMetadata;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_argmax_f32(
+        state.context,
+        input.raw,
+        output_tokens.raw,
+        @intCast(vocab_size),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchMatvecAdd(
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < (batch_idx + 1) * cols * @sizeOf(f32) or output.byte_len < (batch_idx + 1) * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchMatvecQ4KAdd(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < (batch_idx + 1) * cols * @sizeOf(f32) or output.byte_len < (batch_idx + 1) * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_q4k_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchSiluMul(
+    backend: backend_api.MatVecBackend,
+    gate: BufferHandle,
+    up: BufferHandle,
+    count: usize,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < (batch_idx + 1) * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_silu_mul_f32(
+        state.context,
+        gate.raw,
+        up.raw,
+        @intCast(count),
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchAddInPlace(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    src: BufferHandle,
+    count: usize,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (dst.byte_len < (batch_idx + 1) * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_add_in_place_f32(
+        state.context,
+        dst.raw,
+        src.raw,
+        @intCast(count),
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchRmsNorm(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    weights: []const f32,
+    output: BufferHandle,
+    count: usize,
+    eps: f32,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < (batch_idx + 1) * count * @sizeOf(f32) or output.byte_len < (batch_idx + 1) * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const weights_buffer = try state.matrixBuffer(weights[0..count]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_rms_norm_f32(
+        state.context,
+        input.raw,
+        weights_buffer.raw,
+        output.raw,
+        @intCast(count),
+        eps,
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchMatvecQ4K(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < (batch_idx + 1) * cols * @sizeOf(f32) or output.byte_len < (batch_idx + 1) * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_q4k_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
 }
 
 fn metalMatVec(

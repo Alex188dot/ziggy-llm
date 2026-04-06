@@ -117,6 +117,11 @@ pub const TensorType = enum(u32) {
     q6_k = 14,
 };
 
+pub const RopeStyle = enum(u32) {
+    interleaved = 0,
+    neox = 1,
+};
+
 const TokenType = enum(u32) {
     unknown = 2,
     control = 3,
@@ -182,8 +187,13 @@ const ScaleMinK4 = struct {
 pub const LayerRefs = struct {
     attn_norm: TensorRef,
     attn_q: TensorRef,
+    attn_q_bias: ?TensorRef = null,
+    attn_q_norm: ?TensorRef = null,
     attn_k: TensorRef,
+    attn_k_bias: ?TensorRef = null,
+    attn_k_norm: ?TensorRef = null,
     attn_v: TensorRef,
+    attn_v_bias: ?TensorRef = null,
     attn_output: TensorRef,
     ffn_norm: TensorRef,
     ffn_gate: TensorRef,
@@ -205,7 +215,9 @@ const Metadata = struct {
     rms_norm_eps: ?f32 = null,
     rope_freq_base: ?f32 = null,
     tokenizer_model: ?[]u8 = null,
+    tokenizer_pre: ?[]u8 = null,
     tokenizer_tokens: std.ArrayList([]u8) = .empty,
+    tokenizer_merges: std.ArrayList([]u8) = .empty,
     tokenizer_scores: std.ArrayList(f32) = .empty,
     tokenizer_types: std.ArrayList(u32) = .empty,
     bos_token_id: ?u32 = null,
@@ -218,8 +230,11 @@ const Metadata = struct {
     fn deinit(self: *Metadata, allocator: std.mem.Allocator) void {
         if (self.architecture) |value| allocator.free(value);
         if (self.tokenizer_model) |value| allocator.free(value);
+        if (self.tokenizer_pre) |value| allocator.free(value);
         for (self.tokenizer_tokens.items) |token| allocator.free(token);
+        for (self.tokenizer_merges.items) |merge| allocator.free(merge);
         self.tokenizer_tokens.deinit(allocator);
+        self.tokenizer_merges.deinit(allocator);
         self.tokenizer_scores.deinit(allocator);
         self.tokenizer_types.deinit(allocator);
         self.* = undefined;
@@ -227,10 +242,13 @@ const Metadata = struct {
 };
 
 const Tokenizer = struct {
+    mode: Mode,
     tokens: [][]u8,
     scores: []f32,
     token_types: []u32,
+    special_tokens: []u32,
     byte_fallback: [256]?u32,
+    merge_table: std.AutoHashMap(MergeKey, MergeValue),
     bos_token_id: ?u32,
     eos_token_id: ?u32,
     unk_token_id: ?u32,
@@ -238,16 +256,33 @@ const Tokenizer = struct {
     add_bos_token: bool,
     add_eos_token: bool,
 
+    const Mode = enum {
+        score_dp,
+        gpt2_bpe,
+    };
+
+    const MergeKey = struct {
+        left: u32,
+        right: u32,
+    };
+
+    const MergeValue = struct {
+        merged: u32,
+        rank: u32,
+    };
+
     fn deinit(self: *Tokenizer, allocator: std.mem.Allocator) void {
         for (self.tokens) |token| allocator.free(token);
         allocator.free(self.tokens);
         allocator.free(self.scores);
         allocator.free(self.token_types);
+        allocator.free(self.special_tokens);
+        self.merge_table.deinit();
         self.* = undefined;
     }
 
     fn isByteFallbackToken(self: Tokenizer, token_id: u32) ?u8 {
-        if (token_id >= self.tokens.len) return null;
+        if (self.mode == .gpt2_bpe or token_id >= self.tokens.len) return null;
         return parseByteFallback(self.tokens[token_id]);
     }
 
@@ -259,7 +294,7 @@ const Tokenizer = struct {
         if (self.pad_token_id != null and token_id == self.pad_token_id.?) return false;
         if (self.token_types.len == self.tokens.len) {
             if (!TokenType.isEncodable(self.token_types[token_id])) return false;
-            if (self.token_types[token_id] == @intFromEnum(TokenType.byte)) return false;
+            if (self.mode == .score_dp and self.token_types[token_id] == @intFromEnum(TokenType.byte)) return false;
         }
         return self.tokens[token_id].len > 0;
     }
@@ -267,6 +302,13 @@ const Tokenizer = struct {
     fn encodeInto(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
         if (prompt.len == 0) return error.EmptyPrompt;
 
+        return switch (self.mode) {
+            .score_dp => self.encodeScoreDp(allocator, prompt, out),
+            .gpt2_bpe => self.encodeGpt2Bpe(allocator, prompt, out),
+        };
+    }
+
+    fn encodeScoreDp(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
         var normalized = std.ArrayList(u8).empty;
         defer normalized.deinit(allocator);
         try normalized.appendSlice(allocator, rope_metaspace);
@@ -355,6 +397,102 @@ const Tokenizer = struct {
         return count;
     }
 
+    fn encodeGpt2Bpe(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
+        var pieces = std.ArrayList(u32).empty;
+        defer pieces.deinit(allocator);
+        try pieces.ensureTotalCapacity(allocator, prompt.len);
+
+        var pos: usize = 0;
+        while (pos < prompt.len) {
+            var best_match: ?u32 = null;
+            var best_match_pos: usize = prompt.len;
+            var best_match_len: usize = 0;
+
+            for (self.special_tokens) |special_id| {
+                const special_str = self.tokens[special_id];
+                if (special_str.len == 0) continue;
+                if (std.mem.indexOf(u8, prompt[pos..], special_str)) |offset| {
+                    const abs_pos = pos + offset;
+                    if (abs_pos < best_match_pos or (abs_pos == best_match_pos and special_str.len > best_match_len)) {
+                        best_match_pos = abs_pos;
+                        best_match = special_id;
+                        best_match_len = special_str.len;
+                    }
+                }
+            }
+
+            if (best_match_pos > pos) {
+                try self.encodeGpt2BpeChunk(allocator, prompt[pos..best_match_pos], &pieces);
+            }
+            if (best_match != null) {
+                pieces.appendAssumeCapacity(best_match.?);
+                pos = best_match_pos + best_match_len;
+            } else {
+                pos = prompt.len;
+            }
+        }
+
+        var count: usize = 0;
+        if (self.add_bos_token) {
+            const bos = self.bos_token_id orelse return error.MissingRequiredMetadata;
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = bos;
+            count += 1;
+        }
+
+        for (pieces.items) |token_id| {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = token_id;
+            count += 1;
+        }
+
+        if (self.add_eos_token and self.eos_token_id != null) {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = self.eos_token_id.?;
+            count += 1;
+        }
+
+        return count;
+    }
+
+    fn encodeGpt2BpeChunk(self: Tokenizer, allocator: std.mem.Allocator, chunk: []const u8, pieces: *std.ArrayList(u32)) !void {
+        if (chunk.len == 0) return;
+        var chunk_pieces = std.ArrayList(u32).empty;
+        defer chunk_pieces.deinit(allocator);
+        try chunk_pieces.ensureTotalCapacity(allocator, chunk.len);
+
+        for (chunk) |byte| {
+            const token_id = self.byte_fallback[byte] orelse return error.UnknownToken;
+            chunk_pieces.appendAssumeCapacity(token_id);
+        }
+
+        while (chunk_pieces.items.len >= 2) {
+            var best_index: ?usize = null;
+            var best_rank: u32 = std.math.maxInt(u32);
+            var best_merged: u32 = undefined;
+
+            for (0..chunk_pieces.items.len - 1) |index| {
+                const key = MergeKey{
+                    .left = chunk_pieces.items[index],
+                    .right = chunk_pieces.items[index + 1],
+                };
+                if (self.merge_table.get(key)) |merge| {
+                    if (best_index == null or merge.rank < best_rank) {
+                        best_index = index;
+                        best_rank = merge.rank;
+                        best_merged = merge.merged;
+                    }
+                }
+            }
+
+            const index = best_index orelse break;
+            chunk_pieces.items[index] = best_merged;
+            _ = chunk_pieces.orderedRemove(index + 1);
+        }
+
+        try pieces.appendSlice(allocator, chunk_pieces.items);
+    }
+
     fn appendDecodedToken(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
         if (self.bos_token_id != null and token_id == self.bos_token_id.?) return;
         if (self.eos_token_id != null and token_id == self.eos_token_id.?) return;
@@ -362,6 +500,13 @@ const Tokenizer = struct {
         if (self.unk_token_id != null and token_id == self.unk_token_id.?) return;
         if (token_id >= self.tokens.len) return error.InvalidPrompt;
 
+        return switch (self.mode) {
+            .score_dp => self.appendDecodedScoreToken(output, allocator, token_id),
+            .gpt2_bpe => self.appendDecodedGpt2Token(output, allocator, token_id),
+        };
+    }
+
+    fn appendDecodedScoreToken(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
         if (self.isByteFallbackToken(token_id)) |byte| {
             try output.append(allocator, byte);
             return;
@@ -377,6 +522,16 @@ const Tokenizer = struct {
                 try output.append(allocator, token[index]);
                 index += 1;
             }
+        }
+    }
+
+    fn appendDecodedGpt2Token(self: Tokenizer, output: *std.ArrayList(u8), allocator: std.mem.Allocator, token_id: u32) !void {
+        const token = self.tokens[token_id];
+        var view = try std.unicode.Utf8View.init(token);
+        var it = view.iterator();
+        while (it.nextCodepoint()) |codepoint| {
+            const byte = gpt2DecodeByte(codepoint) orelse return error.InvalidPrompt;
+            try output.append(allocator, byte);
         }
     }
 };
@@ -396,6 +551,7 @@ pub const Model = struct {
     kv_dimension: usize,
     rms_norm_eps: f32,
     rope_freq_base: f32,
+    rope_style: RopeStyle,
     data_offset: usize,
     token_embd: TensorRef,
     output: TensorRef,
@@ -407,8 +563,13 @@ pub const Model = struct {
         for (self.layers) |layer| {
             allocator.free(layer.attn_norm.name);
             allocator.free(layer.attn_q.name);
+            if (layer.attn_q_bias) |b| allocator.free(b.name);
+            if (layer.attn_q_norm) |n| allocator.free(n.name);
             allocator.free(layer.attn_k.name);
+            if (layer.attn_k_bias) |b| allocator.free(b.name);
+            if (layer.attn_k_norm) |n| allocator.free(n.name);
             allocator.free(layer.attn_v.name);
+            if (layer.attn_v_bias) |b| allocator.free(b.name);
             allocator.free(layer.attn_output.name);
             allocator.free(layer.ffn_norm.name);
             allocator.free(layer.ffn_gate.name);
@@ -435,6 +596,7 @@ pub const ReusableSession = struct {
         allocator: std.mem.Allocator,
         model: *const Model,
         backend: ?backend_api.MatVecBackend,
+        context_length: usize,
         dense_tensors: ?DenseTensorLookup,
     ) !ReusableSession {
         var session = try Session.init(
@@ -442,7 +604,8 @@ pub const ReusableSession = struct {
             model,
             backend,
             dense_tensors,
-            model.context_length,
+            context_length,
+            context_length,
             null,
             null,
         );
@@ -463,6 +626,7 @@ pub const ReusableSession = struct {
 
 const Session = struct {
     model: *const Model,
+    context_length: usize,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
     gpu_session: ?llama_gpu.Session = null,
@@ -492,12 +656,14 @@ const Session = struct {
         model: *const Model,
         backend: ?backend_api.MatVecBackend,
         dense_tensors: ?DenseTensorLookup,
+        context_length: usize,
         token_capacity: usize,
         profiler: ?*metal_profile.Profiler,
         moon_quant_calibrator: ?*moon_quant_calibration.Calibrator,
     ) !Session {
         var session = Session{
             .model = model,
+            .context_length = context_length,
             .backend = backend,
             .dense_tensors = dense_tensors,
             .token_buffer = try allocator.alloc(u32, token_capacity),
@@ -511,9 +677,9 @@ const Session = struct {
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
-            .scores = try allocator.alloc(f32, model.context_length),
-            .k_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
-            .v_cache = try allocator.alloc(f32, model.block_count * model.context_length * model.kv_dimension),
+            .scores = try allocator.alloc(f32, context_length),
+            .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
+            .v_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
             .moon_quant_calibrator = moon_quant_calibrator,
         };
         errdefer session.deinit(allocator);
@@ -521,7 +687,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model), profiler);
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
             }
         }
 
@@ -644,6 +810,87 @@ const Session = struct {
         self.finishToken(token_id);
     }
 
+    fn findDraftTokens(self: *Session, next_token: u32, max_draft: usize) []const u32 {
+        if (self.position < 3) return &.{};
+
+        const prev_token = self.token_buffer[self.position - 1];
+        var i: usize = self.position - 3;
+        while (true) {
+            if (self.token_buffer[i] == prev_token and self.token_buffer[i + 1] == next_token) {
+                const match_end = i + 2;
+                const available = self.position - match_end;
+                const draft_len = @min(max_draft, available);
+                if (draft_len > 0) {
+                    return self.token_buffer[match_end .. match_end + draft_len];
+                }
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+        return &.{};
+    }
+
+    fn verifyDraftTokensSequential(self: *Session, current_token: u32, draft_tokens: []const u32, out_accepted: []u32) !usize {
+        var accepted_count: usize = 0;
+        var next_input = current_token;
+
+        for (draft_tokens) |draft| {
+            const predicted = try self.stepGreedy(next_input);
+            out_accepted[accepted_count] = predicted;
+            accepted_count += 1;
+
+            if (predicted != draft) {
+                return accepted_count;
+            }
+            next_input = draft;
+        }
+
+        const bonus_predicted = try self.stepGreedy(next_input);
+        out_accepted[accepted_count] = bonus_predicted;
+        accepted_count += 1;
+
+        return accepted_count;
+    }
+
+    fn verifyDraftTokensBatchGpu(self: *Session, current_token: u32, draft_tokens: []const u32, out_accepted: []u32) !usize {
+        if (self.gpu_session == null) return 0;
+        if (draft_tokens.len == 0) return 0;
+
+        const gpu_session = &self.gpu_session.?;
+        var layers: [64]llama_gpu.LayerDesc = undefined;
+        for (self.model.layers, 0..) |layer, i| {
+            layers[i] = adaptLayerDesc(layer);
+        }
+
+        var all_drafts: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        all_drafts[0] = current_token;
+        for (draft_tokens, 0..) |dt, i| {
+            all_drafts[i + 1] = dt;
+        }
+        const batch_count = draft_tokens.len + 1;
+
+        var predicted: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        const accepted_count = try gpu_session.runBatchSpeculativeDecode(
+            layers[0..self.model.layers.len],
+            all_drafts[0..batch_count],
+            self.position,
+            &predicted,
+        );
+
+        for (0..accepted_count) |i| {
+            out_accepted[i] = predicted[i];
+        }
+
+        if (accepted_count > 0) {
+            for (0..accepted_count) |i| {
+                self.token_buffer[self.position + i] = predicted[i];
+            }
+            self.position += accepted_count;
+        }
+
+        return accepted_count;
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
         try self.runTokenCore(token_id);
         self.pending_greedy_token = null;
@@ -661,7 +908,7 @@ const Session = struct {
     }
 
     fn runTokenCore(self: *Session, token_id: u32) !void {
-        if (self.position >= self.model.context_length) return error.ContextOverflow;
+        if (self.position >= self.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
         for (self.model.layers, 0..) |layer, layer_index| {
@@ -673,11 +920,20 @@ const Session = struct {
                 try self.recordCalibration(layer.attn_q, .attn_q, self.normed);
                 try self.recordCalibration(layer.attn_k, .attn_k, self.normed);
                 try self.recordCalibration(layer.attn_v, .attn_v, self.normed);
+
                 try self.matVec(self.q, layer.attn_q, self.normed);
+                if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
+                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.head_dimension);
+
                 try self.matVec(self.k, layer.attn_k, self.normed);
+                if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
+                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.head_dimension);
+
                 try self.matVec(self.v, layer.attn_v, self.normed);
-                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
-                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base);
+                if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
+
+                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 try self.recordCalibration(layer.attn_output, .attn_output, self.attn_out);
@@ -728,7 +984,7 @@ const Session = struct {
     }
 
     fn storeKv(self: *Session, layer_index: usize) void {
-        const stride = self.model.context_length * self.model.kv_dimension;
+        const stride = self.context_length * self.model.kv_dimension;
         const base = layer_index * stride + self.position * self.model.kv_dimension;
         @memcpy(self.k_cache[base .. base + self.model.kv_dimension], self.k);
         @memcpy(self.v_cache[base .. base + self.model.kv_dimension], self.v);
@@ -738,7 +994,7 @@ const Session = struct {
         @memset(self.attn_out, 0);
         const head_dim = self.model.head_dimension;
         const kv_group_size = self.model.head_count / self.model.head_count_kv;
-        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const layer_base = layer_index * self.context_length * self.model.kv_dimension;
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(head_dim)));
         const pos_plus_1 = self.position + 1;
 
@@ -812,6 +1068,49 @@ const Session = struct {
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
     }
+
+    fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
+        const bytes = try tensorBytes(self.model, bias_tensor);
+        const cols = try bias_tensor.rowLen();
+        if (out.len != cols) return error.InvalidTensorMetadata;
+
+        if (bias_tensor.tensor_type == .f32) {
+            for (0..cols) |i| out[i] += readF32(bytes[i * 4 ..][0..4]);
+        } else if (bias_tensor.tensor_type == .f16) {
+            for (0..cols) |i| out[i] += readF16AsF32(bytes[i * 2 ..][0..2]);
+        } else {
+            return error.UnsupportedTensorType;
+        }
+    }
+
+    fn rmsNormPerHead(self: *Session, out: []f32, input: []const f32, tensor: TensorRef, head_count: usize, head_dim: usize) !void {
+        const weights = try tensorBytes(self.model, tensor);
+        if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
+        if (try tensor.rowLen() != head_dim) return error.InvalidTensorMetadata;
+
+        for (0..head_count) |head| {
+            const h_in = input[head * head_dim ..][0..head_dim];
+            const h_out = out[head * head_dim ..][0..head_dim];
+
+            var mean_square: f32 = 0;
+            for (h_in) |val| mean_square += val * val;
+            mean_square /= @as(f32, @floatFromInt(head_dim));
+            const scale = @as(f32, 1.0) / @sqrt(mean_square + self.model.rms_norm_eps);
+
+            var i: usize = 0;
+            while (i + simd_lane_count <= head_dim) : (i += simd_lane_count) {
+                const input_vec = loadInputVec(h_in, i);
+                const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
+                const scale_vec: F32x = @splat(scale);
+                const result = scale_vec * input_vec * weight_vec;
+                @as(*[simd_lane_count]f32, @ptrCast(h_out[i..])).* = result;
+            }
+            while (i < head_dim) : (i += 1) {
+                const weight = readF32(weights[i * 4 ..][0..4]);
+                h_out[i] = h_in[i] * scale * weight;
+            }
+        }
+    }
 };
 
 fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
@@ -836,8 +1135,13 @@ fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
         .attn_q = adaptTensorDesc(layer.attn_q),
+        .attn_q_bias = if (layer.attn_q_bias) |b| adaptTensorDesc(b) else null,
+        .attn_q_norm = if (layer.attn_q_norm) |n| adaptTensorDesc(n) else null,
         .attn_k = adaptTensorDesc(layer.attn_k),
+        .attn_k_bias = if (layer.attn_k_bias) |b| adaptTensorDesc(b) else null,
+        .attn_k_norm = if (layer.attn_k_norm) |n| adaptTensorDesc(n) else null,
         .attn_v = adaptTensorDesc(layer.attn_v),
+        .attn_v_bias = if (layer.attn_v_bias) |b| adaptTensorDesc(b) else null,
         .attn_output = adaptTensorDesc(layer.attn_output),
         .ffn_norm = adaptTensorDesc(layer.ffn_norm),
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
@@ -846,11 +1150,11 @@ fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     };
 }
 
-fn adaptModelDesc(model: *const Model) llama_gpu.ModelDesc {
+fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDesc {
     return .{
         .embedding_length = model.embedding_length,
         .block_count = model.block_count,
-        .context_length = model.context_length,
+        .context_length = context_length,
         .feed_forward_length = model.feed_forward_length,
         .rope_dimension_count = model.rope_dimension_count,
         .head_count = model.head_count,
@@ -860,6 +1164,8 @@ fn adaptModelDesc(model: *const Model) llama_gpu.ModelDesc {
         .rope_freq_base = model.rope_freq_base,
         .vocab_size = model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
+        .token_embd_offset = model.token_embd.offset,
+        .rope_style = @intFromEnum(model.rope_style),
     };
 }
 
@@ -1017,6 +1323,7 @@ pub fn generateLoadedStreaming(
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
     const random = prng.random();
+    const context_length = effectiveContextLength(model, options);
 
     const prompt_capacity = prompt.len * 4 + options.max_tokens + 8;
     const session_init_begin = std.time.nanoTimestamp();
@@ -1025,7 +1332,8 @@ pub fn generateLoadedStreaming(
         model,
         backend,
         dense_tensors,
-        @min(model.context_length, prompt_capacity),
+        context_length,
+        @min(context_length, prompt_capacity),
         if (profiler.enabled) &profiler else null,
         null,
     );
@@ -1067,6 +1375,9 @@ pub fn generateLoadedStreaming(
     const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
+    const max_draft_len = 3;
+    var accepted_tokens: [max_draft_len + 1]u32 = undefined;
+
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
@@ -1089,10 +1400,12 @@ pub fn generateLoadedStreaming(
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
+
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
         }
+
         const chunk_start = output.items.len;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
@@ -1106,12 +1419,73 @@ pub fn generateLoadedStreaming(
                 else => return err,
             };
         }
+
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
+
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
-            greedy_next_token = try session.stepGreedy(next_token);
+            const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
+            if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else {
+                greedy_next_token = try session.stepGreedy(next_token);
+            }
         } else if (gpu_topk) {
             greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
@@ -1119,6 +1493,7 @@ pub fn generateLoadedStreaming(
         } else {
             _ = try session.step(next_token);
         }
+
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
@@ -1169,8 +1544,9 @@ pub fn generateLoadedStreamingCached(
     const random = prng.random();
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
+    const context_length = effectiveContextLength(model, options);
 
-    const prompt_tokens = try allocator.alloc(u32, model.context_length);
+    const prompt_tokens = try allocator.alloc(u32, context_length);
     defer allocator.free(prompt_tokens);
 
     const prompt_begin = std.time.nanoTimestamp();
@@ -1179,6 +1555,7 @@ pub fn generateLoadedStreamingCached(
 
     var session = &reusable_session.session;
     if (session.model != model) return error.InvalidPrompt;
+    if (session.context_length != context_length) return error.InvalidPrompt;
 
     const cached_token_count = session.position;
     const reused_prompt_token_count = commonPrefixLen(
@@ -1226,6 +1603,9 @@ pub fn generateLoadedStreamingCached(
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
     const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
+    const max_draft_len = 3;
+    var accepted_tokens: [max_draft_len + 1]u32 = undefined;
+
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
         profiler.beginDecodeToken();
@@ -1248,10 +1628,12 @@ pub fn generateLoadedStreamingCached(
             profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
+
         if (model.tokenizer.eos_token_id != null and next_token == model.tokenizer.eos_token_id.?) {
             profiler.endDecodeToken();
             break;
         }
+
         const chunk_start = output.items.len;
         try model.tokenizer.appendDecodedToken(&output, allocator, next_token);
         if (stream_callback) |callback| {
@@ -1265,12 +1647,45 @@ pub fn generateLoadedStreamingCached(
                 else => return err,
             };
         }
+
         if (generated_token_count == 0) {
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
+
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
-            greedy_next_token = try session.stepGreedy(next_token);
+            const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
+            if (draft_tokens.len > 0) {
+                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                var i: usize = 0;
+                while (i < accepted_count - 1) : (i += 1) {
+                    const t = accepted_tokens[i];
+                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    if (generated_token_count + 1 >= options.max_tokens) {
+                        greedy_next_token = t;
+                        break;
+                    }
+                    generated_token_count += 1;
+                    const inner_chunk_start = output.items.len;
+                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
+                    if (stream_callback) |inner_cb| {
+                        const chunk = output.items[inner_chunk_start..];
+                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
+                            error.StopStreaming => {
+                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
+                                break;
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+                greedy_next_token = accepted_tokens[i];
+            } else {
+                greedy_next_token = try session.stepGreedy(next_token);
+            }
         } else if (gpu_topk) {
             greedy_next_token = try session.stepGpuTopK(next_token, gpu_top_k, options.temperature, random.float(f32));
         } else if (gpu_shortlist) {
@@ -1278,6 +1693,7 @@ pub fn generateLoadedStreamingCached(
         } else {
             _ = try session.step(next_token);
         }
+
         if (generated_token_count == 0) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
@@ -1305,6 +1721,10 @@ pub fn generateLoadedStreamingCached(
         },
         .metal_profile_summary = profile_summary,
     };
+}
+
+fn effectiveContextLength(model: *const Model, options: runtime_types.GenerationOptions) usize {
+    return @min(model.context_length, options.context_length);
 }
 
 pub const CalibrationSession = struct {
@@ -1335,6 +1755,7 @@ pub fn initCalibrationSession(
         model,
         null,
         null,
+        @min(model.context_length, token_capacity),
         token_capacity,
         null,
         calibrator,
@@ -1385,9 +1806,14 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     }
 
     const architecture = metadata.architecture orelse return error.MissingRequiredMetadata;
-    if (!std.mem.eql(u8, architecture, "llama")) return error.UnsupportedArchitecture;
-    const tokenizer_model = metadata.tokenizer_model orelse return error.MissingRequiredMetadata;
-    if (!isSupportedTokenizerModel(tokenizer_model)) return error.UnsupportedTokenizer;
+    if (!std.mem.eql(u8, architecture, "llama") and !std.mem.startsWith(u8, architecture, "qwen")) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (std.mem.startsWith(u8, architecture, "qwen")) .neox else .interleaved;
+
+    if (metadata.tokenizer_model) |tm| {
+        if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
+    } else if (!std.mem.startsWith(u8, architecture, "qwen")) {
+        return error.MissingRequiredMetadata;
+    }
 
     var tensors = std.StringHashMap(TensorRef).init(allocator);
     defer tensors.deinit();
@@ -1407,8 +1833,9 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const feed_forward_length = metadata.feed_forward_length orelse return error.MissingRequiredMetadata;
     const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
     const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
-    const rope_dimension_count = metadata.rope_dimension_count orelse return error.MissingRequiredMetadata;
-    const rms_norm_eps = metadata.rms_norm_eps orelse return error.MissingRequiredMetadata;
+
+    const rope_dimension_count = metadata.rope_dimension_count orelse (embedding_length / head_count);
+    const rms_norm_eps = metadata.rms_norm_eps orelse 1e-6;
     const rope_freq_base = metadata.rope_freq_base orelse 10000;
     if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
 
@@ -1426,8 +1853,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         layers[index] = .{
             .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
             .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
             .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
             .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
             .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
             .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
             .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
@@ -1455,6 +1887,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .kv_dimension = kv_dimension,
         .rms_norm_eps = rms_norm_eps,
         .rope_freq_base = rope_freq_base,
+        .rope_style = rope_style,
         .data_offset = data_offset,
         .token_embd = token_embd,
         .output = output,
@@ -1471,7 +1904,8 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
 
 fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {
     return std.mem.eql(u8, tokenizer_model, "llama") or
-        std.mem.eql(u8, tokenizer_model, "gpt2");
+        std.mem.eql(u8, tokenizer_model, "gpt2") or
+        std.mem.startsWith(u8, tokenizer_model, "qwen");
 }
 
 pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
@@ -1481,6 +1915,18 @@ pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, promp
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
+
+    const is_bpe = if (metadata.tokenizer_model) |m|
+        std.mem.eql(u8, m, "gpt2") or std.mem.startsWith(u8, m, "qwen")
+    else if (metadata.architecture) |arch|
+        std.mem.startsWith(u8, arch, "qwen")
+    else
+        false;
+
+    if (is_bpe) {
+        return buildGpt2Tokenizer(allocator, metadata, token_count);
+    }
+
     if (metadata.tokenizer_scores.items.len != token_count) return error.MissingRequiredMetadata;
 
     const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
@@ -1503,16 +1949,116 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
         if (parseByteFallback(token)) |byte| byte_fallback[byte] = @intCast(token_id);
     }
 
+    var special_tokens = std.ArrayList(u32).empty;
+    for (token_types, 0..) |t, id| {
+        if (t == @intFromEnum(TokenType.control) or t == @intFromEnum(TokenType.user_defined)) {
+            try special_tokens.append(allocator, @intCast(id));
+        }
+    }
+
     return .{
+        .mode = .score_dp,
         .tokens = tokens,
         .scores = scores,
         .token_types = token_types,
+        .special_tokens = try special_tokens.toOwnedSlice(allocator),
         .byte_fallback = byte_fallback,
+        .merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator),
         .bos_token_id = metadata.bos_token_id,
         .eos_token_id = metadata.eos_token_id,
         .unk_token_id = metadata.unk_token_id,
         .pad_token_id = metadata.pad_token_id,
         .add_bos_token = metadata.add_bos_token orelse true,
+        .add_eos_token = metadata.add_eos_token orelse false,
+    };
+}
+
+fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_count: usize) !Tokenizer {
+    if (metadata.tokenizer_merges.items.len == 0) return error.MissingRequiredMetadata;
+
+    const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
+    metadata.tokenizer_tokens = .empty;
+
+    const scores = try allocator.alloc(f32, 0);
+
+    const token_types = if (metadata.tokenizer_types.items.len == token_count)
+        try metadata.tokenizer_types.toOwnedSlice(allocator)
+    else blk: {
+        const fallback = try allocator.alloc(u32, token_count);
+        @memset(fallback, 1);
+        break :blk fallback;
+    };
+    metadata.tokenizer_types = .empty;
+
+    var token_lookup = std.StringHashMap(u32).init(allocator);
+    defer token_lookup.deinit();
+    try token_lookup.ensureTotalCapacity(std.math.cast(u32, token_count) orelse return error.Overflow);
+    for (tokens, 0..) |token, token_id| {
+        try token_lookup.put(token, @intCast(token_id));
+    }
+
+    var byte_fallback = [_]?u32{null} ** 256;
+    for (0..256) |byte_usize| {
+        const byte: u8 = @intCast(byte_usize);
+        var encoded: [4]u8 = undefined;
+        const encoded_slice = gpt2EncodeByte(&encoded, byte);
+        byte_fallback[byte] = token_lookup.get(encoded_slice);
+    }
+
+    var merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator);
+    errdefer merge_table.deinit();
+
+    var merged_buffer = std.ArrayList(u8).empty;
+    defer merged_buffer.deinit(allocator);
+
+    for (metadata.tokenizer_merges.items, 0..) |merge, rank| {
+        const split_index = std.mem.indexOfScalar(u8, merge, ' ') orelse continue;
+        if (split_index == 0 or split_index + 1 >= merge.len) continue;
+
+        const left = merge[0..split_index];
+        const right = merge[split_index + 1 ..];
+        const left_id = token_lookup.get(left) orelse continue;
+        const right_id = token_lookup.get(right) orelse continue;
+
+        merged_buffer.clearRetainingCapacity();
+        try merged_buffer.ensureTotalCapacity(allocator, left.len + right.len);
+        merged_buffer.appendSliceAssumeCapacity(left);
+        merged_buffer.appendSliceAssumeCapacity(right);
+        const merged_id = token_lookup.get(merged_buffer.items) orelse continue;
+
+        try merge_table.put(.{
+            .left = left_id,
+            .right = right_id,
+        }, .{
+            .merged = merged_id,
+            .rank = @intCast(rank),
+        });
+    }
+
+    for (metadata.tokenizer_merges.items) |merge| allocator.free(merge);
+    metadata.tokenizer_merges.deinit(allocator);
+    metadata.tokenizer_merges = .empty;
+
+    var special_tokens = std.ArrayList(u32).empty;
+    for (token_types, 0..) |t, id| {
+        if (t == @intFromEnum(TokenType.control) or t == @intFromEnum(TokenType.user_defined)) {
+            try special_tokens.append(allocator, @intCast(id));
+        }
+    }
+
+    return .{
+        .mode = .gpt2_bpe,
+        .tokens = tokens,
+        .scores = scores,
+        .token_types = token_types,
+        .special_tokens = try special_tokens.toOwnedSlice(allocator),
+        .byte_fallback = byte_fallback,
+        .merge_table = merge_table,
+        .bos_token_id = metadata.bos_token_id,
+        .eos_token_id = metadata.eos_token_id,
+        .unk_token_id = metadata.unk_token_id,
+        .pad_token_id = metadata.pad_token_id,
+        .add_bos_token = metadata.add_bos_token orelse false,
         .add_eos_token = metadata.add_eos_token orelse false,
     };
 }
@@ -1542,39 +2088,39 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.file_type = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.context_length")) {
+    if (std.mem.endsWith(u8, key, ".context_length")) {
         metadata.context_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.embedding_length")) {
+    if (std.mem.endsWith(u8, key, ".embedding_length")) {
         metadata.embedding_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.block_count")) {
+    if (std.mem.endsWith(u8, key, ".block_count")) {
         metadata.block_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.feed_forward_length")) {
+    if (std.mem.endsWith(u8, key, ".feed_forward_length")) {
         metadata.feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.rope.dimension_count")) {
+    if (std.mem.endsWith(u8, key, ".rope.dimension_count")) {
         metadata.rope_dimension_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.head_count")) {
+    if (std.mem.endsWith(u8, key, ".attention.head_count")) {
         metadata.head_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.head_count_kv")) {
+    if (std.mem.endsWith(u8, key, ".attention.head_count_kv")) {
         metadata.head_count_kv = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.attention.layer_norm_rms_epsilon")) {
+    if (std.mem.endsWith(u8, key, ".attention.layer_norm_rms_epsilon") or std.mem.endsWith(u8, key, ".attention.layer_norm_epsilon")) {
         metadata.rms_norm_eps = try readExpectedFloat(parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "llama.rope.freq_base")) {
+    if (std.mem.endsWith(u8, key, ".rope.freq_base")) {
         metadata.rope_freq_base = try readExpectedFloat(parser, value_type);
         return;
     }
@@ -1582,8 +2128,16 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.tokenizer_model = try readExpectedString(allocator, parser, value_type);
         return;
     }
+    if (std.mem.eql(u8, key, "tokenizer.ggml.pre")) {
+        metadata.tokenizer_pre = try readExpectedString(allocator, parser, value_type);
+        return;
+    }
     if (std.mem.eql(u8, key, "tokenizer.ggml.tokens")) {
         try readStringArray(allocator, parser, value_type, &metadata.tokenizer_tokens);
+        return;
+    }
+    if (std.mem.eql(u8, key, "tokenizer.ggml.merges")) {
+        try readStringArray(allocator, parser, value_type, &metadata.tokenizer_merges);
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.scores")) {
@@ -1669,6 +2223,17 @@ fn takeLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(Ten
     var buffer: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
     return takeTensor(allocator, tensors, name);
+}
+
+fn takeOptionalLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(TensorRef), layer_index: usize, suffix: []const u8) !?TensorRef {
+    var buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
+    if (tensors.get(name)) |tensor| {
+        _ = allocator;
+        _ = tensors.remove(name);
+        return tensor;
+    }
+    return null;
 }
 
 pub fn tensorBytes(model: *const Model, tensor: TensorRef) ![]const u8 {
@@ -2009,21 +2574,35 @@ fn getScaleMinK4(index: usize, scale_bytes: []const u8) ScaleMinK4 {
         };
 }
 
-fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32) void {
+fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: RopeStyle) void {
     const n_rot = @min(rope_dim, head_dim);
     const pos_f32 = @as(f32, @floatFromInt(position));
     for (0..head_count) |head_index| {
         const head = values[head_index * head_dim ..][0..head_dim];
-        var pair: usize = 0;
-        while (pair + 1 < n_rot) : (pair += 2) {
-            const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
-            const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
-            const cos_theta = @cos(theta);
-            const sin_theta = @sin(theta);
-            const x0 = head[pair];
-            const x1 = head[pair + 1];
-            head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
-            head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+        if (rope_style == .interleaved) {
+            var pair: usize = 0;
+            while (pair + 1 < n_rot) : (pair += 2) {
+                const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
+                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+                const cos_theta = @cos(theta);
+                const sin_theta = @sin(theta);
+                const x0 = head[pair];
+                const x1 = head[pair + 1];
+                head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+                head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+            }
+        } else {
+            const half_rot = n_rot / 2;
+            for (0..half_rot) |i| {
+                const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(n_rot));
+                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+                const cos_theta = @cos(theta);
+                const sin_theta = @sin(theta);
+                const x0 = head[i];
+                const x1 = head[i + half_rot];
+                head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+                head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+            }
         }
     }
 }
@@ -2183,6 +2762,61 @@ fn softmaxInPlace(values: []f32) void {
     for (values) |*value| value.* /= sum;
 }
 
+fn gpt2ByteToCodepoint(byte: u8) u21 {
+    if ((byte >= '!' and byte <= '~') or
+        (byte >= 0xA1 and byte <= 0xAC) or
+        (byte >= 0xAE and byte <= 0xFF))
+    {
+        return byte;
+    }
+
+    var offset: u21 = 0;
+    var candidate: u16 = 0;
+    while (candidate < byte) : (candidate += 1) {
+        const b: u8 = @intCast(candidate);
+        if ((b >= '!' and b <= '~') or
+            (b >= 0xA1 and b <= 0xAC) or
+            (b >= 0xAE and b <= 0xFF))
+        {
+            continue;
+        }
+        offset += 1;
+    }
+    return 256 + offset;
+}
+
+fn gpt2DecodeByte(codepoint: u21) ?u8 {
+    if ((codepoint >= '!' and codepoint <= '~') or
+        (codepoint >= 0xA1 and codepoint <= 0xAC) or
+        (codepoint >= 0xAE and codepoint <= 0xFF))
+    {
+        return @intCast(codepoint);
+    }
+    if (codepoint < 256) return null;
+
+    const target_offset = codepoint - 256;
+    var offset: u21 = 0;
+    var candidate: u16 = 0;
+    while (candidate < 256) : (candidate += 1) {
+        const byte: u8 = @intCast(candidate);
+        if ((byte >= '!' and byte <= '~') or
+            (byte >= 0xA1 and byte <= 0xAC) or
+            (byte >= 0xAE and byte <= 0xFF))
+        {
+            continue;
+        }
+        if (offset == target_offset) return byte;
+        offset += 1;
+    }
+    return null;
+}
+
+fn gpt2EncodeByte(buffer: *[4]u8, byte: u8) []const u8 {
+    const codepoint = gpt2ByteToCodepoint(byte);
+    const len = std.unicode.utf8Encode(codepoint, buffer) catch unreachable;
+    return buffer[0..len];
+}
+
 fn parseByteFallback(token: []const u8) ?u8 {
     if (token.len != 6) return null;
     if (!std.mem.startsWith(u8, token, "<0x")) return null;
@@ -2322,6 +2956,65 @@ test "supported tokenizer model whitelist accepts llama 3 style gguf metadata" {
     try std.testing.expect(isSupportedTokenizerModel("llama"));
     try std.testing.expect(isSupportedTokenizerModel("gpt2"));
     try std.testing.expect(!isSupportedTokenizerModel("sentencepiece"));
+}
+
+test "gpt2 byte mapping round trips common bytes" {
+    try std.testing.expectEqual(@as(?u8, 'A'), gpt2DecodeByte(gpt2ByteToCodepoint('A')));
+    try std.testing.expectEqual(@as(?u8, ' '), gpt2DecodeByte(gpt2ByteToCodepoint(' ')));
+    try std.testing.expectEqual(@as(?u8, '\n'), gpt2DecodeByte(gpt2ByteToCodepoint('\n')));
+    try std.testing.expectEqual(@as(?u8, 0), gpt2DecodeByte(gpt2ByteToCodepoint(0)));
+}
+
+test "gpt2 tokenizer merges byte pieces with rank order" {
+    const allocator = std.testing.allocator;
+
+    const tokens = try allocator.alloc([]u8, 5);
+    errdefer allocator.free(tokens);
+    tokens[0] = try allocator.dupe(u8, "a");
+    tokens[1] = try allocator.dupe(u8, "b");
+    tokens[2] = try allocator.dupe(u8, "c");
+    tokens[3] = try allocator.dupe(u8, "ab");
+    tokens[4] = try allocator.dupe(u8, "abc");
+
+    const scores = try allocator.alloc(f32, 0);
+    const token_types = try allocator.alloc(u32, 5);
+    @memset(token_types, 1);
+
+    var byte_fallback = [_]?u32{null} ** 256;
+    byte_fallback['a'] = 0;
+    byte_fallback['b'] = 1;
+    byte_fallback['c'] = 2;
+
+    var merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator);
+    try merge_table.put(.{ .left = 0, .right = 1 }, .{ .merged = 3, .rank = 0 });
+    try merge_table.put(.{ .left = 3, .right = 2 }, .{ .merged = 4, .rank = 1 });
+
+    var tokenizer = Tokenizer{
+        .mode = .gpt2_bpe,
+        .tokens = tokens,
+        .scores = scores,
+        .token_types = token_types,
+        .special_tokens = &.{},
+        .byte_fallback = byte_fallback,
+        .merge_table = merge_table,
+        .bos_token_id = null,
+        .eos_token_id = null,
+        .unk_token_id = null,
+        .pad_token_id = null,
+        .add_bos_token = false,
+        .add_eos_token = false,
+    };
+    defer tokenizer.deinit(allocator);
+
+    var encoded: [3]u32 = undefined;
+    const count = try tokenizer.encodeInto(allocator, "abc", &encoded);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u32, 4), encoded[0]);
+
+    var decoded = std.ArrayList(u8).empty;
+    defer decoded.deinit(allocator);
+    try tokenizer.appendDecodedToken(&decoded, allocator, 4);
+    try std.testing.expectEqualStrings("abc", decoded.items);
 }
 
 test "readU32Array accepts int32 token type arrays" {
