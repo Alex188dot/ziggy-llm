@@ -35,6 +35,13 @@ Prerequisite:
 
 - Zig 0.15.2 or newer
 
+Clone:
+
+```bash
+git clone https://github.com/Alex188dot/ziggy-llm.git
+cd ziggy-llm
+```
+
 Build:
 
 ```bash
@@ -82,6 +89,12 @@ Run tests:
 
 ```bash
 zig build test
+```
+
+Update:
+
+```bash
+./zig-out/bin/ziggy-llm update
 ```
 
 ## Product Shape
@@ -217,6 +230,8 @@ Initial implementation order:
 3. Metal decode path
 4. tiny HTTP server
 5. launch-quality benchmarks and demos
+
+Please note ziggy-llm is still in active development, things may change, could break or be unstable.
 
 ## Want to participate? Here is a TODO list of things that need immediate attention:
 
