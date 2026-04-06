@@ -28,17 +28,6 @@ Planned first version:
 - narrow supported quantization matrix
 - benchmark-friendly workflow
 
-Explicit non-goals for v0:
-
-- CUDA
-- ROCm
-- Vulkan
-- distributed inference
-- multimodal support
-- support for every GGUF model family
-- broad quantization coverage from day one
-- fine-tuning or training
-
 ## Why Zig
 
 Zig is a strong fit for this project because it makes the important tradeoffs visible:
@@ -50,6 +39,20 @@ Zig is a strong fit for this project because it makes the important tradeoffs vi
 - clear systems code without heavyweight abstraction layers
 
 For local inference, hidden allocations and accidental complexity matter. Zig keeps both under pressure.
+
+## Performance Comparison
+
+The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown.
+
+| Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
+| ------------------ | ------ | ----------------- | ------------ | ----------------- |
+| **TinyLlama 1.1B** | Q4_K_M | ~120 tok/s        | —            | 151.4 tok/s       |
+| **Llama 3.2 3B**   | Q4_K_M | ~40 tok/s         | —            | 53.5 tok/s        |
+| **Llama 3.1 8B**   | Q4_K_M | ~18 tok/s         | ~10 tok/s    | 23.1 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | —                 | —            | 92.0 tok/s        |
+| **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
+
+Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
 
 ## Planned CLI
 
@@ -68,10 +71,9 @@ Current commands:
 ```bash
 zig build run
 zig build run -- inspect -m /path/to/model.gguf
-zig build run -- run -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend auto
-zig build run -- bench -m /path/to/model.gguf -p "abc" --max-tokens 8 --seed 7 --backend cpu
-zig build moon-quant-guardrail -- --model /path/to/model.gguf
-zig build run -- serve -m /path/to/model.gguf --port 8080
+zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend auto
+zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
+zig build run -- bench -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
 ```
 
 Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
@@ -194,6 +196,14 @@ Run tests:
 ```bash
 zig build test
 ```
+
+## Want to participate? Here is a TODO list of things that need immediate attention:
+
+- [ ] Implement OpenAI compatible server
+- [ ] Add support for Gemma and Mistral model families
+- [ ] Make chat more robust
+- [ ] Test all quants (currently tested only Q4_K_M)
+- [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
 
 ## License
 
