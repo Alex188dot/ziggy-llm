@@ -5,6 +5,7 @@ const llama_fixture = @import("llama_fixture.zig");
 const llama_metal = @import("llama_metal.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
+const ziggy_format = @import("../ziggy_format.zig");
 
 const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
@@ -84,6 +85,112 @@ pub fn generate(
         .readback_mode = llama_report.readback_mode,
         .startup_breakdown = llama_report.startup_breakdown,
         .metal_profile_summary = combined_profile_summary,
+    };
+}
+
+pub fn generateZiggy(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    prompt: []const u8,
+    options: types.GenerationOptions,
+) !types.GenerationReport {
+    const model_load_begin = std.time.nanoTimestamp();
+    var ziggy_model = try ziggy_format.loadCompiledModel(allocator, model_path);
+    const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
+    defer ziggy_model.deinit();
+
+    var execution = try selectZiggyExecution(allocator, &ziggy_model, options.backend, options.metal_profile);
+    defer execution.deinit(allocator);
+
+    const lookup = if (execution.dense_tensors) |*dense_tensors|
+        llama_cpu.DenseTensorLookup{
+            .ctx = dense_tensors,
+            .get_fn = lookupDenseTensor,
+            .get_by_offset_fn = lookupDenseTensorByOffset,
+            .get_raw_by_offset_fn = lookupRawTensorByOffset,
+            .get_moon_quant_by_offset_fn = lookupMoonQuantTensorByOffset,
+        }
+    else
+        null;
+
+    _ = prompt;
+    _ = lookup;
+    // TODO: Full ZIGY inference not yet implemented - uses stub return
+
+    const tensor_prepare_ns = execution.startup_breakdown.tensor_prepare_ns;
+    const backend_init_ns = execution.startup_breakdown.backend_init_ns;
+    const metal_prewarm_ns = execution.startup_breakdown.metal_prewarm_ns;
+
+    return .{
+        .generated_text = try allocator.dupe(u8, ""),
+        .prompt_token_count = 0,
+        .generated_token_count = 0,
+        .startup_ns = model_load_ns + tensor_prepare_ns + backend_init_ns + metal_prewarm_ns,
+        .prompt_ns = 0,
+        .ttft_ns = model_load_ns + tensor_prepare_ns + backend_init_ns + metal_prewarm_ns,
+        .decode_ns = 0,
+        .seed = options.seed,
+        .temperature = options.temperature,
+        .backend = if (execution.backend != null) .metal else .cpu,
+        .sampling_strategy = options.sampling_strategy,
+        .sampling_path = .cpu_logits,
+        .readback_mode = .none,
+        .startup_breakdown = .{
+            .model_load_ns = model_load_ns,
+            .tensor_prepare_ns = tensor_prepare_ns,
+            .backend_init_ns = backend_init_ns,
+            .metal_prewarm_ns = metal_prewarm_ns,
+        },
+        .metal_profile_summary = execution.startup_profile_summary,
+    };
+}
+
+fn selectZiggyExecution(
+    allocator: std.mem.Allocator,
+    model: *const ziggy_format.CompiledModel,
+    preference: types.BackendPreference,
+    startup_profile_enabled: bool,
+) !ExecutionResources {
+    _ = model;
+    return switch (preference) {
+        .cpu => .{},
+        .metal => try createZiggyMetalExecution(allocator, startup_profile_enabled),
+        .auto => createZiggyMetalExecution(allocator, startup_profile_enabled) catch |err| {
+            if (isRecoverableMetalError(err)) return .{};
+            return err;
+        },
+    };
+}
+
+fn createZiggyMetalExecution(
+    allocator: std.mem.Allocator,
+    startup_profile_enabled: bool,
+) !ExecutionResources {
+    var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
+    errdefer dense_tensors.deinit();
+    var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
+    const tensor_prepare_begin = std.time.nanoTimestamp();
+    _ = tensor_prepare_begin;
+    const tensor_prepare_ns = 0;
+
+    const backend_init_begin = std.time.nanoTimestamp();
+    const backend = try metal_backend.create(allocator);
+    const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
+    errdefer backend.deinit(allocator);
+    const metal_prewarm_begin = std.time.nanoTimestamp();
+    try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
+    const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    const startup_profile_summary = if (startup_profiler.enabled) try startup_profiler.renderSummary(allocator) else null;
+
+    return .{
+        .backend = backend,
+        .dense_tensors = dense_tensors,
+        .startup_breakdown = .{
+            .tensor_prepare_ns = tensor_prepare_ns,
+            .backend_init_ns = backend_init_ns,
+            .metal_prewarm_ns = metal_prewarm_ns,
+        },
+        .startup_profile_summary = startup_profile_summary,
     };
 }
 

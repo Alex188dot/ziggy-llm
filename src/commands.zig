@@ -3,6 +3,7 @@ const cli = @import("cli.zig");
 const runtime = @import("runtime.zig");
 const gguf = @import("gguf.zig");
 const moon_quant = @import("moon_quant.zig");
+const ziggy_format = @import("ziggy_format.zig");
 const chat_runtime = @import("chat_runtime.zig");
 const server = @import("server.zig");
 const server_runtime = @import("server_runtime.zig");
@@ -15,6 +16,7 @@ pub fn dispatch(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cl
         .version => try writer.print("ziggy-llm {s}\n", .{build_options.version}),
         .run => try runModel(writer, allocator, config),
         .chat => try chat_runtime.runChat(writer, allocator, config),
+        .compile => try compileModel(writer, allocator, config),
         .bench => try benchModel(writer, allocator, config),
         .inspect => try printInspect(writer, config),
         .serve => try server_runtime.serve(writer, allocator, config),
@@ -62,13 +64,29 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
     }, config.bench_runs);
 }
 
+fn compileModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !void {
+    _ = writer;
+    const model_path = config.model_path orelse return error.MissingModelPath;
+    const output_path = config.output_path orelse return error.MissingOutputPath;
+
+    try ziggy_format.compileFromGGUF(allocator, model_path, output_path, .{
+        .repack_q4_k = true,
+        .keep_raw_for_all = false,
+    });
+}
+
 fn printInspect(writer: *std.Io.Writer, config: cli.Config) !void {
     const model_path = config.model_path orelse return error.MissingModelPath;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    const report = try gguf.inspectFile(arena.allocator(), model_path);
-    try gguf.printInspectReport(writer, model_path, report);
-    try moon_quant.printInspectSummary(writer, report);
+    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
+        const report = try ziggy_format.inspectFile(arena.allocator(), model_path);
+        try ziggy_format.printInspectReport(writer, report);
+    } else {
+        const report = try gguf.inspectFile(arena.allocator(), model_path);
+        try gguf.printInspectReport(writer, model_path, report);
+        try moon_quant.printInspectSummary(writer, report);
+    }
 }

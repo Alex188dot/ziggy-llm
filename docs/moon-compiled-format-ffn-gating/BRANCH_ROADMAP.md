@@ -10,39 +10,39 @@ Make MoonQuant a real Apple-first compiled execution format, then add one experi
 
 ### Goal
 
-Treat GGUF as the import format and `.moon` / `.ziggy` as the execution format.
+Treat GGUF as the import format and `.ziggy` as the execution format.
 
 ### Deliverables
 
-- [ ] Define compiled container format (`.moon` or `.ziggy`)
-- [ ] Add manifest/header for:
-  - [ ] architecture
-  - [ ] quantization version
-  - [ ] tensor count
-  - [ ] compiled tensor records
-  - [ ] alignment
-  - [ ] runtime compatibility version
-- [ ] Add tensor record entries for:
-  - [ ] tensor name
-  - [ ] original GGUF type
-  - [ ] compiled layout kind
-  - [ ] rows / cols
-  - [ ] byte offset
-  - [ ] byte length
-  - [ ] row stride / tile stride
-- [ ] Implement `GGUF -> compiled` offline conversion
-- [ ] Reuse existing MoonQuant Q4_K repacking path
-- [ ] Add compiled-path loader
-- [ ] Keep GGUF loader as fallback/reference path
-- [ ] Add inspect command for compiled files
-- [ ] Add tests for round-trip metadata + tensor lookup
+- [x] Define compiled container format (`.ziggy`)
+- [x] Add manifest/header for:
+  - [x] architecture
+  - [x] quantization version
+  - [x] tensor count
+  - [x] compiled tensor records
+  - [x] alignment
+  - [x] runtime compatibility version
+- [x] Add tensor record entries for:
+  - [x] tensor name
+  - [x] original GGUF type
+  - [x] compiled layout kind
+  - [x] rows / cols
+  - [x] byte offset
+  - [x] byte length
+  - [x] row stride / tile stride
+- [x] Implement `GGUF -> compiled` offline conversion
+- [x] Reuse existing MoonQuant Q4_K repacking path
+- [x] Add compiled-path loader
+- [x] Keep GGUF loader as fallback/reference path
+- [x] Add inspect command for compiled files
+- [x] Add tests for round-trip metadata + tensor lookup
 
 ### Success criteria
 
-- [ ] Can load compiled Q4_K_M path without GGUF runtime repacking
-- [ ] Same outputs as current reference path within expected tolerance
-- [ ] Lower runtime pointer/layout work in Metal path
-- [ ] Foundation is ready for more aggressive kernel-specific formats
+- [x] Can load compiled Q4_K_M path without GGUF runtime repacking
+- [x] Same outputs as current reference path within expected tolerance
+- [x] Lower runtime pointer/layout work in Metal path
+- [x] Foundation is ready for more aggressive kernel-specific formats
 
 ---
 

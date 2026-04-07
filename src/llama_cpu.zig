@@ -205,6 +205,7 @@ const Metadata = struct {
     architecture: ?[]u8 = null,
     alignment: u32 = default_alignment,
     file_type: ?u32 = null,
+    quantization_version: ?u32 = null,
     context_length: ?u32 = null,
     embedding_length: ?u32 = null,
     block_count: ?u32 = null,
@@ -540,6 +541,7 @@ pub const Model = struct {
     bytes: []const u8,
     mapped_bytes: ?[]align(std.heap.page_size_min) const u8,
     tokenizer: Tokenizer,
+    architecture: []const u8,
     context_length: usize,
     embedding_length: usize,
     block_count: usize,
@@ -552,6 +554,7 @@ pub const Model = struct {
     rms_norm_eps: f32,
     rope_freq_base: f32,
     rope_style: RopeStyle,
+    quantization_version: u32,
     data_offset: usize,
     token_embd: TensorRef,
     output: TensorRef,
@@ -560,6 +563,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
         self.tokenizer.deinit(allocator);
+        allocator.free(self.architecture);
         for (self.layers) |layer| {
             allocator.free(layer.attn_norm.name);
             allocator.free(layer.attn_q.name);
@@ -1876,6 +1880,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .bytes = mapped_bytes,
         .mapped_bytes = mapped_bytes,
         .tokenizer = tokenizer,
+        .architecture = try allocator.dupe(u8, architecture),
         .context_length = context_length,
         .embedding_length = embedding_length,
         .block_count = block_count,
@@ -1888,6 +1893,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .rms_norm_eps = rms_norm_eps,
         .rope_freq_base = rope_freq_base,
         .rope_style = rope_style,
+        .quantization_version = metadata.quantization_version orelse 0,
         .data_offset = data_offset,
         .token_embd = token_embd,
         .output = output,
@@ -2086,6 +2092,10 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.eql(u8, key, "general.file_type")) {
         metadata.file_type = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "general.quantization_version")) {
+        metadata.quantization_version = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
     if (std.mem.endsWith(u8, key, ".context_length")) {

@@ -7,6 +7,7 @@ pub const Command = enum {
     run,
     chat,
     inspect,
+    compile,
     bench,
     serve,
     update,
@@ -17,6 +18,7 @@ pub const Command = enum {
 pub const Config = struct {
     command: Command = .help,
     model_path: ?[]const u8 = null,
+    output_path: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     port: u16 = server.default_port,
     max_tokens: usize = 16,
@@ -170,6 +172,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.sampling_strategy = runtime.SamplingStrategy.parse(args[i]) orelse return error.InvalidSamplingStrategy;
             continue;
         }
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.output_path = args[i];
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -189,6 +197,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "run")) return .run;
     if (std.mem.eql(u8, name, "chat")) return .chat;
     if (std.mem.eql(u8, name, "inspect")) return .inspect;
+    if (std.mem.eql(u8, name, "compile")) return .compile;
     if (std.mem.eql(u8, name, "bench")) return .bench;
     if (std.mem.eql(u8, name, "serve")) return .serve;
     if (std.mem.eql(u8, name, "update")) return .update;
@@ -207,7 +216,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\Commands:
         \\  run       Execute a single prompt against a model
         \\  chat      Start an interactive chat session
-        \\  inspect   Inspect GGUF metadata and support status
+        \\  inspect   Inspect GGUF/ZIGY metadata and support status
+        \\  compile   Compile GGUF to ZIGY format (pre-packed for faster loading)
         \\  bench     Run benchmark routines
         \\  serve     Start the tiny HTTP server
         \\  update    Update ziggy-llm to the latest version
@@ -215,7 +225,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  version   Print the build version
         \\
         \\Options:
-        \\  -m, --model <path>    Path to a GGUF model
+        \\  -m, --model <path>    Path to a GGUF/ZIGY model
+        \\  -o, --output <path>   Output path for compile command
         \\  -p, --prompt <text>   Prompt text for one-shot generation
         \\      --max-tokens <n>  Maximum generated tokens for run/bench (default: {d})
         \\      --context-length  Runtime context window cap; default: {d}, capped by model metadata
@@ -237,6 +248,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\
         \\Status:
         \\  LLaMA-family GGUF execution supports the native CPU runtime and Metal on Apple Silicon.
+        \\  ZIGY compiled format provides faster loading by pre-packing Q4_K tensors.
         \\  Metal acceleration is focused on the implemented llama-family runtime.
         \\
     ,
