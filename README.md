@@ -15,9 +15,11 @@ A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal suppo
 
 The goal is to build a small, understandable, high-performance inference engine that feels native to Apple hardware and is easy to benchmark honestly.
 
+ziggy-llm is currently the fastest Zig GGUF inference engine on Apple Silicon.
+
 ## Performance Comparison
 
-The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown.
+The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC, another Zig GGUF inference engine (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown.
 
 | Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
 | ------------------ | ------ | ----------------- | ------------ | ----------------- |
@@ -83,7 +85,7 @@ Benchmark:
   --bench-runs 5
 ```
 
-With `--bench-runs N`, the first run is cold and the remaining runs use the resident runtime path. Warm output now reports `warm.reused_prompt_tokens_avg` so prompt-prefix reuse is visible instead of being inferred from TTFT alone.
+With `--bench-runs N`, the first run is cold and the remaining runs use the resident runtime path.
 
 Run tests:
 
@@ -110,18 +112,6 @@ Planned first version:
 - narrow supported quantization matrix
 - benchmark-friendly workflow
 
-## Why Zig
-
-Zig is a strong fit for this project because it makes the important tradeoffs visible:
-
-- explicit allocators
-- direct control over memory layout
-- low-overhead C interop where needed
-- straightforward single-binary distribution
-- clear systems code without heavyweight abstraction layers
-
-For local inference, hidden allocations and accidental complexity matter. Zig keeps both under pressure.
-
 ## Current models and quantizations support
 
 Qwen (2 and 3) and LLama model families, in particular these have been tested:
@@ -133,17 +123,7 @@ Qwen (2 and 3) and LLama model families, in particular these have been tested:
 
 Quantization support: Q4_K_M, Q6_K, Q8_0, F16, F32.
 
-## Planned CLI
-
-Target command surface:
-
-```bash
-ziggy-llm run -m /path/to/model.gguf -p "Write a haiku about compilers"
-ziggy-llm chat -m /path/to/model.gguf
-ziggy-llm inspect -m /path/to/model.gguf
-ziggy-llm bench -m /path/to/model.gguf
-ziggy-llm serve -m /path/to/model.gguf --port 8080
-```
+## CLI
 
 Current commands:
 
@@ -163,14 +143,6 @@ Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve`
 
 `ziggy-llm inspect` currently supports:
 
-- GGUF `v2` and `v3`
-- `general.type=model` artifacts
-- required `general.architecture` metadata
-- standard inspection fields from `general.*` and `tokenizer.ggml.*`
-- tensor-table validation for name, dimension count, dimension sizes, tensor type, alignment, and data extents
-
-The current inspect output reports:
-
 - architecture
 - tensor count
 - metadata count
@@ -179,14 +151,6 @@ The current inspect output reports:
 - dominant tensor type across the tensor table
 - tokenizer model and pre-tokenizer metadata when present
 - tokenizer token count and common special-token ids when present
-
-Unsupported or rejected today:
-
-- GGUF versions other than `v2` and `v3`
-- big-endian GGUF files
-- non-model artifacts such as adapters or auxiliary blobs
-- malformed tensor metadata
-- truncated metadata or tensor payloads
 
 ## Planned HTTP API
 
@@ -240,6 +204,10 @@ Please note ziggy-llm is still in active development, things may change, could b
 - [ ] Make chat more robust
 - [ ] Test all quants (currently tested only Q4_K_M)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
+
+## Support
+
+Found the repo interesting? Star it ⭐️, it will help us grow! 🌱
 
 ## License
 
