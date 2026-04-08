@@ -10,16 +10,24 @@ const ziggy_format = @import("../ziggy_format.zig");
 const gguf = @import("../gguf.zig");
 
 pub fn loadModelWithDispatch(allocator: std.mem.Allocator, path: []const u8) !llama_cpu.Model {
-    // Prefer .ziggy (execution format) if it exists
-    const ziggy_path = try ziggy_format.deriveCompiledPath(allocator, path);
-    defer allocator.free(ziggy_path);
+    if (std.mem.endsWith(u8, path, ".ziggy")) {
+        return loadRuntimeModelForZiggy(allocator, path);
+    }
 
-    if (std.fs.accessAbsolute(ziggy_path, .{})) {
-        std.debug.print("→ using compiled MoonQuant format: {s}\n", .{ziggy_path});
-        return try ziggy_format.loadExecutionModel(allocator, ziggy_path);
+    std.debug.print("→ GGUF fallback (consider running conversion for best speed)\n", .{});
+    return try llama_cpu.loadModel(allocator, path);
+}
+
+fn loadRuntimeModelForZiggy(allocator: std.mem.Allocator, ziggy_path: []const u8) !llama_cpu.Model {
+    const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, ziggy_path);
+    defer allocator.free(gguf_path);
+
+    if (std.fs.accessAbsolute(gguf_path, .{})) {
+        std.debug.print("→ using GGUF metadata/runtime source alongside compiled MoonQuant tensors: {s}\n", .{gguf_path});
+        return try llama_cpu.loadModel(allocator, gguf_path);
     } else |_| {
-        std.debug.print("→ GGUF fallback (consider running conversion for best speed)\n", .{});
-        return try llama_cpu.loadModel(allocator, path);
+        std.debug.print("→ using compiled MoonQuant format without GGUF sibling: {s}\n", .{ziggy_path});
+        return try ziggy_format.loadExecutionModel(allocator, ziggy_path);
     }
 }
 
@@ -135,7 +143,7 @@ pub fn generateZiggy(
     defer compiled_model.deinit();
 
     const model_load_begin = std.time.nanoTimestamp();
-    var model = try ziggy_format.loadExecutionModel(allocator, model_path);
+    var model = try loadRuntimeModelForZiggy(allocator, model_path);
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
@@ -268,7 +276,7 @@ fn promptPerplexityZiggy(
 ) !f64 {
     var compiled_model = try ziggy_format.loadCompiledModel(allocator, model_path);
     defer compiled_model.deinit();
-    var model = try ziggy_format.loadExecutionModel(allocator, model_path);
+    var model = try loadRuntimeModelForZiggy(allocator, model_path);
     defer model.deinit(allocator);
 
     var execution = try selectExecution(

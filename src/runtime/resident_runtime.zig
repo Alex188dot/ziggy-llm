@@ -55,6 +55,21 @@ fn loadZiggyFile(
     return try initResidentRuntimeGguf(allocator, model_path, backend, context_length_limit);
 }
 
+fn loadRuntimeModelForPath(allocator: std.mem.Allocator, model_path: []const u8) !llama_cpu.Model {
+    if (!std.mem.endsWith(u8, model_path, ".ziggy")) {
+        return try llama_cpu.loadModel(allocator, model_path);
+    }
+
+    const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
+    defer allocator.free(gguf_path);
+
+    if (std.fs.accessAbsolute(gguf_path, .{})) {
+        return try llama_cpu.loadModel(allocator, gguf_path);
+    } else |_| {
+        return try ziggy_format.loadExecutionModel(allocator, model_path);
+    }
+}
+
 // GGUF-only initialization path
 fn initResidentRuntimeGguf(
     allocator: std.mem.Allocator,
@@ -274,10 +289,7 @@ pub const ResidentRuntime = struct {
         var compiled_model: ?ziggy_format.CompiledModel = null;
         errdefer if (compiled_model) |*compiled| compiled.deinit();
         const model_load_begin = std.time.nanoTimestamp();
-        var model = if (std.mem.endsWith(u8, actual_model_path, ".ziggy"))
-            try ziggy_format.loadExecutionModel(self.allocator, actual_model_path)
-        else
-            try llama_cpu.loadModel(self.allocator, actual_model_path);
+        var model = try loadRuntimeModelForPath(self.allocator, actual_model_path);
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 

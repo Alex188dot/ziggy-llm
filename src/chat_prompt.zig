@@ -94,7 +94,7 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
     }
 
     // Check for EOS markers and cut at first occurrence
-    const eos_markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa", "<|im_start|>" };
+    const eos_markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
     for (eos_markers) |marker| {
         if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
             end = @min(end, index);
@@ -102,7 +102,7 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
     }
 
     // FIXED: stronger end-of-reply detection
-    if (std.mem.indexOf(u8, reply[0..end], "\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa") != null or
+    if (std.mem.indexOf(u8, reply[0..end], "<|im_end|>") != null or
         std.mem.indexOf(u8, reply[0..end], "</s>") != null or
         std.mem.indexOf(u8, reply[0..end], "<|assistant|>") != null) {
         // Already handled by the loop above, but ensures we detect these early
@@ -120,7 +120,7 @@ pub fn hasCompletedAssistantReply(reply: []const u8) bool {
         offset += line.len + 1;
     }
 
-    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa", "<|im_start|>" }) |marker| {
+    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" }) |marker| {
         if (std.mem.indexOf(u8, reply, marker) != null) return true;
     }
     return false;
@@ -220,10 +220,10 @@ fn renderConversation(
         },
         .qwen => {
             if (include_default_system) {
-                try writer.print("<|im_start|>system\n{s}\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa\n", .{system_message});
+                try writer.print("<|im_start|>system\n{s}<|im_end|>\n", .{system_message});
             } else {
                 for (system_messages) |message| {
-                    try writer.print("<|im_start|>system\n{s}\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa\n", .{message.content});
+                    try writer.print("<|im_start|>system\n{s}<|im_end|>\n", .{message.content});
                 }
             }
             for (messages) |message| {
@@ -232,7 +232,7 @@ fn renderConversation(
                     .user => "user",
                     .assistant => "assistant",
                 };
-                try writer.print("<|im_start|>{s}\n{s}\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa\n", .{ tag, message.content });
+                try writer.print("<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, message.content });
             }
             try writer.print("<|im_start|>assistant\n", .{});
         },
@@ -288,7 +288,7 @@ fn countRenderedMessageTokens(
                 .user => "user",
                 .assistant => "assistant",
             };
-            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|im_start|>{s}\n{s}\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa\n", .{ tag, content });
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, content });
         },
     };
     defer std.heap.page_allocator.free(snippet);
@@ -299,7 +299,7 @@ fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system
     return switch (template_style) {
         .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
         .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
-        .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "\xe0\xb8\xad\xe0\xb9\x87\xe0\xb8\xad\xe0\xb8\xaa\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
+        .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
     };
 }
 
@@ -326,6 +326,11 @@ test "trimAssistantReply stops at malformed emitted role marker" {
     try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
 }
 
+test "trimAssistantReply stops at qwen im_end marker" {
+    const reply = "Hello there.<|im_end|>\n<|im_start|>user\nquestion";
+    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+}
+
 test "trimAssistantReply does not stop at partial stop marker" {
     const reply = "Hello there. </s";
     try std.testing.expectEqualStrings("Hello there. </s", trimAssistantReply(reply));
@@ -345,6 +350,20 @@ test "renderConversation uses chatml markers when GGUF template requests it" {
 
     try std.testing.expectEqualStrings(
         "<|user|>\nmy name is alessio</s>\n<|assistant|>\n",
+        rendered,
+    );
+}
+
+test "renderConversation uses qwen im_start and im_end markers" {
+    const messages = [_]Message{
+        .{ .role = .user, .content = @constCast("hi") },
+    };
+
+    const rendered = try renderConversation(std.testing.allocator, .qwen, &.{}, &messages, false);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expectEqualStrings(
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
         rendered,
     );
 }

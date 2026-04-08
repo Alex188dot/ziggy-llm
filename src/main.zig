@@ -34,6 +34,7 @@ test {
     std.testing.refAllDecls(@import("moon_quant_calibration.zig"));
     std.testing.refAllDecls(@import("moon_quant_runtime.zig"));
     std.testing.refAllDecls(@import("runtime/moon_quant_bench.zig"));
+    std.testing.refAllDecls(@import("runtime/compiled_runtime_regression_test.zig"));
     std.testing.refAllDecls(@import("server.zig"));
     std.testing.refAllDecls(@import("terminal.zig"));
 }
