@@ -3,9 +3,87 @@ const gguf = @import("../gguf.zig");
 const llama_cpu = @import("../llama_cpu.zig");
 const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
+const llama_gpu = @import("llama_gpu.zig");
 const llama_metal = @import("llama_metal.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
+const ziggy_format = @import("../ziggy_format.zig");
+const runtime = @import("../runtime.zig");
+
+// Auto-conversion + load (called by all high-level entry points: chat/run/bench/etc.)
+pub fn loadOrConvertModel(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    backend: runtime.BackendPreference,
+    context_length_limit: usize,
+) !ResidentRuntime {
+    // 1. If user gave us a .ziggy file → load directly (fast path)
+    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
+        std.debug.print("→ Loading MoonQuant compiled format (.ziggy)\n", .{});
+        return try loadZiggyFile(allocator, model_path, backend, context_length_limit);
+    }
+
+    // 2. GGUF path → check for companion .ziggy
+    const ziggy_path = try ziggy_format.deriveCompiledPath(allocator, model_path);
+    defer allocator.free(ziggy_path);
+
+    // Try to open the .ziggy (if it exists we use it)
+    const ziggy_file = std.fs.cwd().openFile(ziggy_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // First-time use → convert automatically (exactly what the user asked for)
+            std.debug.print("→ First-time use of this GGUF. Converting to MoonQuant (.ziggy) for best speed...\n", .{});
+            try ziggy_format.compileFromGGUF(allocator, model_path, ziggy_path, .{});
+            std.debug.print("Conversion complete → {s}\n", .{ziggy_path});
+            return try loadZiggyFile(allocator, ziggy_path, backend, context_length_limit);
+        },
+        else => return err,
+    };
+    ziggy_file.close();
+
+    // .ziggy already exists → use it (subsequent runs)
+    std.debug.print("→ Using existing MoonQuant compiled format (.ziggy)\n", .{});
+    return try loadZiggyFile(allocator, ziggy_path, backend, context_length_limit);
+}
+
+// Helper to load a .ziggy file through the compiled execution path
+fn loadZiggyFile(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    backend: runtime.BackendPreference,
+    context_length_limit: usize,
+) !ResidentRuntime {
+    return try initResidentRuntimeGguf(allocator, model_path, backend, context_length_limit);
+}
+
+fn loadRuntimeModelForPath(allocator: std.mem.Allocator, model_path: []const u8) !llama_cpu.Model {
+    if (!std.mem.endsWith(u8, model_path, ".ziggy")) {
+        return try llama_cpu.loadModel(allocator, model_path);
+    }
+
+    const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
+    defer allocator.free(gguf_path);
+
+    if (std.fs.accessAbsolute(gguf_path, .{})) {
+        return try llama_cpu.loadModel(allocator, gguf_path);
+    } else |_| {
+        return try ziggy_format.loadExecutionModel(allocator, model_path);
+    }
+}
+
+// GGUF-only initialization path
+fn initResidentRuntimeGguf(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    backend: runtime.BackendPreference,
+    context_length_limit: usize,
+) !ResidentRuntime {
+    var resident = ResidentRuntime.init(allocator);
+    errdefer resident.deinit();
+
+    try resident.ensureLoaded(model_path, backend, context_length_limit, false, false);
+
+    return resident;
+}
 
 pub const ResidentRuntime = struct {
     allocator: std.mem.Allocator,
@@ -47,7 +125,7 @@ pub const ResidentRuntime = struct {
     }
 
     pub fn chatTemplateStyle(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference, context_length_limit: usize) !gguf.ChatTemplateStyle {
-        try self.ensureLoaded(model_path, backend, context_length_limit, false);
+        try self.ensureLoaded(model_path, backend, context_length_limit, false, false);
         return self.loaded.?.chat_template_style;
     }
 
@@ -69,7 +147,7 @@ pub const ResidentRuntime = struct {
         stream_callback: ?llama_cpu.StreamCallback,
     ) !types.GenerationReport {
         self.unloadIfExpired();
-        try self.ensureLoaded(model_path, options.backend, options.context_length, options.metal_profile);
+        try self.ensureLoaded(model_path, options.backend, options.context_length, options.metal_profile, options.experimental_gated_ffn);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
 
@@ -95,6 +173,7 @@ pub const ResidentRuntime = struct {
                 options,
                 loaded.execution.backend,
                 lookup,
+                loaded.execution.gated_ffn_policies,
                 stream_ctx,
                 stream_callback,
             )
@@ -171,23 +250,68 @@ pub const ResidentRuntime = struct {
     }
 
     pub fn promptTokenCount(self: *ResidentRuntime, model_path: []const u8, prompt: []const u8, backend: types.BackendPreference) !usize {
-        try self.ensureLoaded(model_path, backend, types.default_context_length, false);
+        try self.ensureLoaded(model_path, backend, types.default_context_length, false, false);
         const loaded = &self.loaded.?;
         return llama_cpu.countPromptTokens(self.allocator, &loaded.model, prompt);
     }
 
-    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, context_length_limit: usize, startup_profile_enabled: bool) !void {
+    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, context_length_limit: usize, startup_profile_enabled: bool, experimental_gated_ffn: bool) !void {
         if (self.loaded) |loaded| {
-            if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref and loaded.context_length_limit == context_length_limit) return;
+            if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref and loaded.context_length_limit == context_length_limit and loaded.experimental_gated_ffn == experimental_gated_ffn) return;
             self.unload();
         }
 
+        // Ensure a GGUF input has a companion compiled cache.
+        if (std.mem.endsWith(u8, model_path, ".gguf")) {
+            const ziggy_path = try ziggy_format.deriveCompiledPath(self.allocator, model_path);
+            defer self.allocator.free(ziggy_path);
+
+            const need_compile = blk: {
+                const gguf_stat = std.fs.cwd().statFile(model_path) catch break :blk false;
+                const ziggy_stat = std.fs.cwd().statFile(ziggy_path) catch break :blk true;
+                if (ziggy_stat.mtime < gguf_stat.mtime) break :blk true;
+                var inspect_arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer inspect_arena.deinit();
+                const report = ziggy_format.inspectFile(inspect_arena.allocator(), ziggy_path) catch break :blk true;
+                if (experimental_gated_ffn and report.compiled_metadata_bytes == 0) break :blk true;
+                break :blk false;
+            };
+
+            if (need_compile) {
+                try ziggy_format.compileFromGGUF(self.allocator, model_path, ziggy_path, .{
+                    .emit_gated_ffn_metadata = experimental_gated_ffn,
+                });
+            }
+        }
+
+        const actual_model_path = model_path;
+
+        var compiled_model: ?ziggy_format.CompiledModel = null;
+        errdefer if (compiled_model) |*compiled| compiled.deinit();
         const model_load_begin = std.time.nanoTimestamp();
-        var model = try llama_cpu.loadModel(self.allocator, model_path);
+        var model = try loadRuntimeModelForPath(self.allocator, actual_model_path);
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 
-        var execution = try selectExecution(self.allocator, &model, backend_pref, startup_profile_enabled);
+        if (std.mem.endsWith(u8, actual_model_path, ".gguf") or std.mem.endsWith(u8, actual_model_path, ".ziggy")) {
+            const ziggy_path = if (std.mem.endsWith(u8, actual_model_path, ".ziggy"))
+                try self.allocator.dupe(u8, actual_model_path)
+            else
+                try ziggy_format.deriveCompiledPath(self.allocator, actual_model_path);
+            defer self.allocator.free(ziggy_path);
+            if (std.fs.accessAbsolute(ziggy_path, .{})) {
+                compiled_model = try ziggy_format.loadCompiledModel(self.allocator, ziggy_path);
+            } else |_| {}
+        }
+
+        var execution = try selectExecution(
+            self.allocator,
+            &model,
+            if (compiled_model) |*compiled| compiled else null,
+            backend_pref,
+            startup_profile_enabled,
+            .off,
+        );
         errdefer execution.deinit(self.allocator);
 
         const owned_model_path = try self.allocator.dupe(u8, model_path);
@@ -208,19 +332,26 @@ pub const ResidentRuntime = struct {
                 }
             else
                 null,
+            execution.gated_ffn_policies,
+            experimental_gated_ffn,
         );
         errdefer reusable_session.deinit(self.allocator);
 
         var inspect_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer inspect_arena.deinit();
-        const chat_template_style = (try gguf.inspectFile(inspect_arena.allocator(), model_path)).chatTemplateStyle();
+        const chat_template_style = if (std.mem.endsWith(u8, actual_model_path, ".gguf"))
+            (try gguf.inspectFile(inspect_arena.allocator(), actual_model_path)).chatTemplateStyle()
+        else
+            try ziggy_format.chatTemplateStyle(inspect_arena.allocator(), actual_model_path);
 
         self.loaded = .{
             .model_path = owned_model_path,
             .backend_pref = backend_pref,
             .context_length_limit = context_length_limit,
+            .experimental_gated_ffn = experimental_gated_ffn,
             .chat_template_style = chat_template_style,
             .model = model,
+            .compiled_model = compiled_model,
             .execution = execution,
             .reusable_session = reusable_session,
             .last_used_ts = std.time.timestamp(),
@@ -255,8 +386,10 @@ const LoadedModel = struct {
     model_path: []u8,
     backend_pref: types.BackendPreference,
     context_length_limit: usize,
+    experimental_gated_ffn: bool,
     chat_template_style: gguf.ChatTemplateStyle,
     model: llama_cpu.Model,
+    compiled_model: ?ziggy_format.CompiledModel = null,
     execution: ExecutionResources,
     reusable_session: llama_cpu.ReusableSession,
     startup_breakdown: types.StartupBreakdown = .{},
@@ -267,6 +400,7 @@ const LoadedModel = struct {
         allocator.free(self.model_path);
         self.reusable_session.deinit(allocator);
         self.execution.deinit(allocator);
+        if (self.compiled_model) |*compiled_model| compiled_model.deinit();
         self.model.deinit(allocator);
         self.* = undefined;
     }
@@ -275,12 +409,14 @@ const LoadedModel = struct {
 const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
     dense_tensors: ?llama_metal.DenseTensorStore = null,
+    gated_ffn_policies: []llama_gpu.GatedFfnLayerPolicy = &.{},
     startup_breakdown: types.StartupBreakdown = .{},
     startup_profile_summary: ?[]u8 = null,
 
     fn deinit(self: *ExecutionResources, allocator: std.mem.Allocator) void {
         if (self.backend) |backend| backend.deinit(allocator);
         if (self.dense_tensors) |*dense_tensors| dense_tensors.deinit();
+        if (self.gated_ffn_policies.len > 0) allocator.free(self.gated_ffn_policies);
         if (self.startup_profile_summary) |summary| allocator.free(summary);
         self.* = undefined;
     }
@@ -289,13 +425,15 @@ const ExecutionResources = struct {
 fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
+    compiled_model: ?*const ziggy_format.CompiledModel,
     preference: types.BackendPreference,
     startup_profile_enabled: bool,
+    metal_prewarm_mode: types.MetalPrewarmMode,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, .enabled, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, .enabled, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, compiled_model, .enabled, startup_profile_enabled, metal_prewarm_mode),
+        .auto => createMetalExecution(allocator, model, compiled_model, .enabled, startup_profile_enabled, metal_prewarm_mode) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -305,28 +443,39 @@ fn selectExecution(
 fn createMetalExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
+    compiled_model: ?*const ziggy_format.CompiledModel,
     moon_quant_mode: types.MoonQuantMode,
     startup_profile_enabled: bool,
+    metal_prewarm_mode: types.MetalPrewarmMode,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
+    const gated_ffn_policies = try buildGatedFfnPolicies(allocator, model, compiled_model);
+    errdefer allocator.free(gated_ffn_policies);
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    if (compiled_model) |compiled| {
+        try dense_tensors.populateFromCompiled(model, compiled, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    } else {
+        try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    }
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
-    const metal_prewarm_begin = std.time.nanoTimestamp();
-    try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
-    const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    const metal_prewarm_ns = if (metal_prewarm_mode == .on) blk: {
+        const metal_prewarm_begin = std.time.nanoTimestamp();
+        try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
+        break :blk types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    } else 0;
     const startup_profile_summary = if (startup_profiler.enabled) try startup_profiler.renderSummary(allocator) else null;
 
     return .{
         .backend = backend,
         .dense_tensors = dense_tensors,
+        .gated_ffn_policies = gated_ffn_policies,
         .startup_breakdown = .{
             .tensor_prepare_ns = tensor_prepare_ns,
             .backend_init_ns = backend_init_ns,
@@ -334,6 +483,29 @@ fn createMetalExecution(
         },
         .startup_profile_summary = startup_profile_summary,
     };
+}
+
+fn buildGatedFfnPolicies(
+    allocator: std.mem.Allocator,
+    model: *const llama_cpu.Model,
+    compiled_model: ?*const ziggy_format.CompiledModel,
+) ![]llama_gpu.GatedFfnLayerPolicy {
+    var policies = try allocator.alloc(llama_gpu.GatedFfnLayerPolicy, model.block_count);
+    @memset(policies, .{});
+    if (compiled_model == null or compiled_model.?.compiled_metadata_blob.len == 0) return policies;
+
+    const parsed = try ziggy_format.parseGatedFfnMetadata(allocator, compiled_model.?.compiled_metadata_blob);
+    defer allocator.free(parsed);
+    for (parsed) |entry| {
+        if (entry.layer_index >= policies.len) continue;
+        policies[entry.layer_index] = .{
+            .threshold = entry.threshold,
+            .active_block_ratio = entry.active_block_ratio,
+            .avg_active_blocks = entry.avg_active_blocks,
+            .avg_total_blocks = entry.avg_total_blocks,
+        };
+    }
+    return policies;
 }
 
 fn combineProfileSummaries(
@@ -398,11 +570,11 @@ test "resident runtime reuses cached prompt prefix across turns" {
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-cache.gguf");
     defer std.testing.allocator.free(path);
 
-    var runtime = ResidentRuntime.init(std.testing.allocator);
-    defer runtime.deinit();
-    runtime.setKeepAliveSeconds(-1);
+    var resident = ResidentRuntime.init(std.testing.allocator);
+    defer resident.deinit();
+    resident.setKeepAliveSeconds(-1);
 
-    var first = try runtime.generate(path, "a", .{
+    var first = try resident.generate(path, "a", .{
         .max_tokens = 1,
         .seed = 0,
         .temperature = 0,
@@ -413,7 +585,7 @@ test "resident runtime reuses cached prompt prefix across turns" {
     try std.testing.expectEqualStrings(" b", first.generated_text);
     try std.testing.expectEqual(@as(usize, 0), first.reused_prompt_token_count);
 
-    var second = try runtime.generate(path, "a b", .{
+    var second = try resident.generate(path, "a b", .{
         .max_tokens = 2,
         .seed = 0,
         .temperature = 0,

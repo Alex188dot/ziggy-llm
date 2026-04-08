@@ -22,6 +22,11 @@ typedef struct {
     bool gpu_timestamps_valid;
 } ZiggyMetalCommitStats;
 
+typedef struct {
+    uint32_t active_blocks;
+    uint32_t total_blocks;
+} ZiggyMetalGateMaskStats;
+
 enum {
     ZIGGY_METAL_OK = 0,
     ZIGGY_METAL_UNAVAILABLE = 1,
@@ -269,11 +274,49 @@ int ziggy_metal_run_matvec_q4k_silu_down_add_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_build_ffn_gate_block_mask_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    ZiggyMetalBuffer *mask,
+    ZiggyMetalBuffer *stats,
+    uint32_t cols,
+    float threshold,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_q4k_gated_silu_down_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    const ZiggyMetalBuffer *mask,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_moonq_q4k_silu_down_add_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
     const ZiggyMetalBuffer *gate,
     const ZiggyMetalBuffer *up,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_gated_silu_down_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    const ZiggyMetalBuffer *mask,
     ZiggyMetalBuffer *output,
     uint32_t rows,
     uint32_t cols,

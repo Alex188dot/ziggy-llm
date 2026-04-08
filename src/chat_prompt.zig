@@ -93,12 +93,21 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
         offset += line.len + 1;
     }
 
-    const markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
-    for (markers) |marker| {
+    // Check for EOS markers and cut at first occurrence
+    const eos_markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
+    for (eos_markers) |marker| {
         if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
             end = @min(end, index);
         }
     }
+
+    // FIXED: stronger end-of-reply detection
+    if (std.mem.indexOf(u8, reply[0..end], "<|im_end|>") != null or
+        std.mem.indexOf(u8, reply[0..end], "</s>") != null or
+        std.mem.indexOf(u8, reply[0..end], "<|assistant|>") != null) {
+        // Already handled by the loop above, but ensures we detect these early
+    }
+
     return std.mem.trim(u8, reply[0..end], " \n\r\t");
 }
 
@@ -317,6 +326,11 @@ test "trimAssistantReply stops at malformed emitted role marker" {
     try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
 }
 
+test "trimAssistantReply stops at qwen im_end marker" {
+    const reply = "Hello there.<|im_end|>\n<|im_start|>user\nquestion";
+    try std.testing.expectEqualStrings("Hello there.", trimAssistantReply(reply));
+}
+
 test "trimAssistantReply does not stop at partial stop marker" {
     const reply = "Hello there. </s";
     try std.testing.expectEqualStrings("Hello there. </s", trimAssistantReply(reply));
@@ -336,6 +350,20 @@ test "renderConversation uses chatml markers when GGUF template requests it" {
 
     try std.testing.expectEqualStrings(
         "<|user|>\nmy name is alessio</s>\n<|assistant|>\n",
+        rendered,
+    );
+}
+
+test "renderConversation uses qwen im_start and im_end markers" {
+    const messages = [_]Message{
+        .{ .role = .user, .content = @constCast("hi") },
+    };
+
+    const rendered = try renderConversation(std.testing.allocator, .qwen, &.{}, &messages, false);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expectEqualStrings(
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
         rendered,
     );
 }

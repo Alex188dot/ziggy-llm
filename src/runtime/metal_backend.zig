@@ -31,6 +31,11 @@ pub const CommitStats = struct {
     gpu_timestamps_valid: bool = false,
 };
 
+pub const GateMaskStats = struct {
+    active_blocks: u32,
+    total_blocks: u32,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -760,6 +765,66 @@ pub fn runMatVecQ4KSiluDownAddToBuffer(
     ), &error_buf);
 }
 
+pub fn buildFfnGateBlockMask(
+    backend: backend_api.MatVecBackend,
+    gate: BufferHandle,
+    up: BufferHandle,
+    mask: BufferHandle,
+    stats: BufferHandle,
+    cols: usize,
+    threshold: f32,
+) !GateMaskStats {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_build_ffn_gate_block_mask_f32(
+        state.context,
+        gate.raw,
+        up.raw,
+        mask.raw,
+        stats.raw,
+        @intCast(cols),
+        threshold,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+    var host_stats: [2]u32 = .{ 0, 0 };
+    try readBufferU32(stats, &host_stats);
+    return .{
+        .active_blocks = host_stats[0],
+        .total_blocks = host_stats[1],
+    };
+}
+
+pub fn runMatVecQ4KGatedSiluDownAddToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    gate: BufferHandle,
+    up: BufferHandle,
+    mask: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < cols * @sizeOf(f32) or up.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_gated_silu_down_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        gate.raw,
+        up.raw,
+        mask.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn runMatVecMoonQuantQ4KSiluDownAddToBuffer(
     backend: backend_api.MatVecBackend,
     matrix_bytes: []const u8,
@@ -779,6 +844,35 @@ pub fn runMatVecMoonQuantQ4KSiluDownAddToBuffer(
         matrix_buffer.raw,
         gate.raw,
         up.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecMoonQuantQ4KGatedSiluDownAddToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    gate: BufferHandle,
+    up: BufferHandle,
+    mask: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < cols * @sizeOf(f32) or up.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_moonq_q4k_gated_silu_down_add_f32(
+        state.context,
+        matrix_buffer.raw,
+        gate.raw,
+        up.raw,
+        mask.raw,
         output.raw,
         @intCast(rows),
         @intCast(cols),

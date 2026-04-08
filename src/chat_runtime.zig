@@ -101,6 +101,7 @@ fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOp
         .top_p = config.top_p,
         .min_p = config.min_p,
         .backend = config.backend,
+        .experimental_gated_ffn = config.experimental_gated_ffn,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
     };
