@@ -6,7 +6,7 @@ const calibration = @import("moon_quant_calibration.zig");
 const llama_fixture = @import("runtime/llama_fixture.zig");
 
 pub const magic = "ZIGY";
-pub const current_version: u32 = 1;
+pub const current_version: u32 = 2;
 pub const current_runtime_version: u32 = 1;
 pub const default_alignment: u32 = 32;
 
@@ -139,9 +139,10 @@ pub const ZiggyHeader = extern struct {
     architecture_len: u32,
     tensor_count: u64,
     metadata_count: u64,
+    metadata_blob_len: u64,
     alignment: u32,
     quantization_version: u32,
-    reserved: [16]u8,
+    reserved: [8]u8,
 
     pub fn init() ZiggyHeader {
         return .{
@@ -151,9 +152,10 @@ pub const ZiggyHeader = extern struct {
             .architecture_len = 0,
             .tensor_count = 0,
             .metadata_count = 0,
+            .metadata_blob_len = 0,
             .alignment = default_alignment,
             .quantization_version = 0,
-            .reserved = .{0} ** 16,
+            .reserved = .{0} ** 8,
         };
     }
 
@@ -224,6 +226,7 @@ pub const CompiledModel = struct {
     allocator: std.mem.Allocator,
     header: ZiggyHeader,
     architecture: []const u8,
+    metadata_blob: []const u8,
     tensors: std.StringHashMap(TensorInfo),
     data_offset: u64,
     bytes: []align(16384) const u8,
@@ -234,6 +237,7 @@ pub const CompiledModel = struct {
             .allocator = allocator,
             .header = undefined,
             .architecture = &.{},
+            .metadata_blob = &.{},
             .tensors = std.StringHashMap(TensorInfo).init(allocator),
             .data_offset = 0,
             .bytes = &.{},
@@ -312,6 +316,8 @@ pub fn compileFromGGUF(
     const arena_allocator = arena.allocator();
 
     const gguf_model = try llama.loadModel(arena_allocator, gguf_path);
+    var metadata_blob = try llama.extractMetadataBlob(arena_allocator, gguf_path);
+    defer metadata_blob.deinit(arena_allocator);
 
     var tensor_sources = std.ArrayList(TensorSource).empty;
     defer tensor_sources.deinit(arena_allocator);
@@ -367,13 +373,15 @@ pub fn compileFromGGUF(
     var header = ZiggyHeader.init();
     header.architecture_len = @intCast(gguf_model.architecture.len);
     header.tensor_count = @intCast(tensor_sources.items.len);
-    header.metadata_count = 0;
+    header.metadata_count = metadata_blob.count;
+    header.metadata_blob_len = metadata_blob.bytes.len;
     header.quantization_version = gguf_model.quantization_version;
     header.alignment = default_alignment;
 
     var builder = CompiledFileBuilder.init(arena_allocator);
     try builder.writeHeader(header);
     try builder.writeArchitecture(gguf_model.architecture);
+    try builder.buffer.appendSlice(arena_allocator, metadata_blob.bytes);
     try builder.padTo(alignForward(builder.currentPos(), header.alignment));
     try builder.buffer.appendSlice(arena_allocator, metadata.items);
     try builder.padTo(alignForward(builder.currentPos(), header.alignment));
@@ -668,6 +676,14 @@ fn extractLayerIndex(name: []const u8) ?u32 {
 }
 
 fn detectLayoutKind(tensor_type: llama.TensorType, name: []const u8, options: CompileOptions) CompiledLayoutKind {
+    if (std.mem.eql(u8, name, "token_embd.weight")) {
+        return switch (tensor_type) {
+            .f16 => .f16_raw,
+            .f32 => .f32_raw,
+            else => .generic_quant_raw,
+        };
+    }
+
     // If calibration-based layout policy is enabled, try to use the calibration plan
     if (options.use_calibration_plan) {
         if (options.calibration_plan) |plan| {
@@ -731,6 +747,9 @@ pub fn loadCompiledModel(allocator: std.mem.Allocator, path: []const u8) !Compil
     if (pos + model.header.architecture_len > mapped_bytes.len) return error.TruncatedFile;
     model.architecture = try allocator.dupe(u8, mapped_bytes[pos..][0..model.header.architecture_len]);
     pos += model.header.architecture_len;
+    if (pos + model.header.metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
+    model.metadata_blob = mapped_bytes[pos .. pos + model.header.metadata_blob_len];
+    pos += model.header.metadata_blob_len;
 
     pos = alignForward(pos, model.header.alignment);
 
@@ -752,6 +771,90 @@ pub fn loadCompiledModel(allocator: std.mem.Allocator, path: []const u8) !Compil
 
     model.data_offset = alignForward(pos, model.header.alignment);
 
+    return model;
+}
+
+pub fn chatTemplateStyle(allocator: std.mem.Allocator, path: []const u8) !gguf.ChatTemplateStyle {
+    var model = try loadCompiledModel(allocator, path);
+    defer model.deinit();
+    return llama.detectChatTemplateStyleInMetadataBlob(allocator, model.header.metadata_count, model.metadata_blob);
+}
+
+pub fn loadExecutionModel(allocator: std.mem.Allocator, path: []const u8) !llama.Model {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    const size = std.math.cast(usize, stat.size) orelse return error.Overflow;
+
+    const mapped_bytes = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    errdefer std.posix.munmap(mapped_bytes);
+
+    var pos: usize = 0;
+    if (mapped_bytes.len < @sizeOf(ZiggyHeader)) return error.TruncatedFile;
+    const header = std.mem.bytesToValue(ZiggyHeader, mapped_bytes[0..@sizeOf(ZiggyHeader)]);
+    try header.validate();
+    pos = @sizeOf(ZiggyHeader);
+
+    if (pos + header.architecture_len > mapped_bytes.len) return error.TruncatedFile;
+    pos += header.architecture_len;
+
+    if (pos + header.metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
+    const metadata_bytes = mapped_bytes[pos .. pos + header.metadata_blob_len];
+    pos += header.metadata_blob_len;
+    pos = @intCast(alignForward(pos, header.alignment));
+
+    var tensor_refs = try allocator.alloc(llama.ExternalTensorRef, @intCast(header.tensor_count));
+    errdefer allocator.free(tensor_refs);
+
+    var tensor_index: usize = 0;
+    while (tensor_index < tensor_refs.len) : (tensor_index += 1) {
+        if (pos + @sizeOf(TensorRecord) > mapped_bytes.len) return error.TruncatedFile;
+        const record = std.mem.bytesToValue(TensorRecord, mapped_bytes[pos..][0..@sizeOf(TensorRecord)]);
+        pos += @sizeOf(TensorRecord);
+
+        if (pos + record.name_len > mapped_bytes.len) return error.TruncatedFile;
+        const name_bytes = mapped_bytes[pos..][0..record.name_len];
+        pos += record.name_len;
+
+        var dims = [_]u64{ 1, 1, 1, 1 };
+        dims[0] = record.cols;
+        dims[1] = record.rows;
+        tensor_refs[tensor_index] = .{
+            .name = try allocator.dupe(u8, name_bytes),
+            .dims = dims,
+            .n_dims = 2,
+            .tensor_type = @enumFromInt(record.original_gguf_type),
+            .offset = record.byte_offset,
+        };
+
+        pos = @intCast(alignForward(pos, 8));
+    }
+
+    const data_offset: usize = @intCast(alignForward(pos, header.alignment));
+    errdefer {
+        for (tensor_refs) |tensor_ref| allocator.free(tensor_ref.name);
+        allocator.free(tensor_refs);
+    }
+
+    const model = try llama.loadModelFromMetadataAndTensors(
+        allocator,
+        @alignCast(mapped_bytes),
+        header.metadata_count,
+        metadata_bytes,
+        data_offset,
+        tensor_refs,
+    );
+
+    for (tensor_refs) |tensor_ref| allocator.free(tensor_ref.name);
+    allocator.free(tensor_refs);
     return model;
 }
 
@@ -859,8 +962,8 @@ test "ZIGY header round-trip" {
     const report = try inspectFile(std.testing.allocator, path);
     defer std.testing.allocator.free(report.architecture);
 
-    try std.testing.expectEqual(@as(u32, 1), report.version);
-    try std.testing.expectEqual(@as(u32, 1), report.runtime_version);
+    try std.testing.expectEqual(current_version, report.version);
+    try std.testing.expectEqual(current_runtime_version, report.runtime_version);
     try std.testing.expectEqualStrings(test_architecture, report.architecture);
     try std.testing.expectEqual(@as(u32, 2), report.quantization_version);
 }

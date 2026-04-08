@@ -28,26 +28,13 @@ pub fn dispatch(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cl
 
 fn configWithPreparedModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Config) !cli.Config {
     const model_path = config.model_path orelse return config;
-    var modified_config = config;
 
     if (std.mem.endsWith(u8, model_path, ".gguf")) {
         try ensureZiggyCache(writer, allocator, model_path);
-        return modified_config;
+        return config;
     }
 
-    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
-        const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
-        errdefer allocator.free(gguf_path);
-
-        if (std.fs.accessAbsolute(gguf_path, .{})) {
-            modified_config.model_path = gguf_path;
-        } else |_| {
-            allocator.free(gguf_path);
-        }
-        return modified_config;
-    }
-
-    return modified_config;
+    return config;
 }
 
 fn ensureZiggyCache(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_path: []const u8) !void {

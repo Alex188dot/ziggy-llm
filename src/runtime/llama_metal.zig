@@ -72,6 +72,7 @@ pub const DenseTensorStore = struct {
         moon_quant_mode: types.MoonQuantMode,
         profiler: ?*StartupProfiler,
     ) !void {
+        try self.addNamedTensorFromCompiled(model, compiled, "token_embd.weight", model.token_embd, .disabled, profiler);
         try self.addNamedTensorFromCompiled(model, compiled, "output.weight", model.output, moon_quant_mode, profiler);
         try self.addNamedTensorFromCompiled(model, compiled, "output_norm.weight", model.output_norm, moon_quant_mode, profiler);
         for (model.layers, 0..) |layer, index| {

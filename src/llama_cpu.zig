@@ -1,4 +1,5 @@
 const std = @import("std");
+const gguf = @import("gguf.zig");
 const terminal = @import("terminal.zig");
 const backend_api = @import("runtime/backend.zig");
 const llama_gpu = @import("runtime/llama_gpu.zig");
@@ -240,6 +241,24 @@ const Metadata = struct {
         self.tokenizer_types.deinit(allocator);
         self.* = undefined;
     }
+};
+
+pub const MetadataBlob = struct {
+    count: u64,
+    bytes: []u8,
+
+    pub fn deinit(self: *MetadataBlob, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+pub const ExternalTensorRef = struct {
+    name: []const u8,
+    dims: [max_tensor_dims]u64,
+    n_dims: usize,
+    tensor_type: TensorType,
+    offset: u64,
 };
 
 const Tokenizer = struct {
@@ -1902,6 +1921,182 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     };
 }
 
+pub fn extractMetadataBlob(allocator: std.mem.Allocator, model_path: []const u8) !MetadataBlob {
+    const file = try std.fs.cwd().openFile(model_path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    const size = std.math.cast(usize, stat.size) orelse return error.Overflow;
+    const mapped_bytes = try std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    defer std.posix.munmap(mapped_bytes);
+
+    var parser = Parser{ .bytes = mapped_bytes };
+    const magic = try parser.readBytes(4);
+    if (!std.mem.eql(u8, magic, gguf_magic)) return error.InvalidMagic;
+
+    const version = try parser.readInt(u32);
+    if (version != 2 and version != 3) return error.UnsupportedVersion;
+
+    _ = try parser.readInt(u64);
+    const metadata_count = try parser.readInt(u64);
+    const metadata_start = parser.pos;
+
+    var kv_index: u64 = 0;
+    while (kv_index < metadata_count) : (kv_index += 1) {
+        try skipMetadataEntry(&parser);
+    }
+
+    return .{
+        .count = metadata_count,
+        .bytes = try allocator.dupe(u8, mapped_bytes[metadata_start..parser.pos]),
+    };
+}
+
+pub fn loadModelFromMetadataAndTensors(
+    allocator: std.mem.Allocator,
+    mapped_bytes: []align(std.heap.page_size_min) const u8,
+    metadata_count: u64,
+    metadata_bytes: []const u8,
+    data_offset: usize,
+    tensor_refs: []const ExternalTensorRef,
+) !Model {
+    var parser = Parser{ .bytes = metadata_bytes };
+    var metadata = Metadata{};
+    defer metadata.deinit(allocator);
+
+    var kv_index: u64 = 0;
+    while (kv_index < metadata_count) : (kv_index += 1) {
+        try parseMetadataEntry(allocator, &parser, &metadata);
+    }
+
+    const architecture = metadata.architecture orelse return error.MissingRequiredMetadata;
+    if (!std.mem.eql(u8, architecture, "llama") and !std.mem.startsWith(u8, architecture, "qwen")) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (std.mem.startsWith(u8, architecture, "qwen")) .neox else .interleaved;
+
+    if (metadata.tokenizer_model) |tm| {
+        if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
+    } else if (!std.mem.startsWith(u8, architecture, "qwen")) {
+        return error.MissingRequiredMetadata;
+    }
+
+    var tensors = std.StringHashMap(TensorRef).init(allocator);
+    defer tensors.deinit();
+    try tensors.ensureTotalCapacity(@intCast(tensor_refs.len));
+    for (tensor_refs) |tensor_ref| {
+        const name = try allocator.dupe(u8, tensor_ref.name);
+        try tensors.put(name, .{
+            .name = name,
+            .dims = tensor_ref.dims,
+            .n_dims = tensor_ref.n_dims,
+            .tensor_type = tensor_ref.tensor_type,
+            .offset = tensor_ref.offset,
+        });
+    }
+
+    const block_count = metadata.block_count orelse return error.MissingRequiredMetadata;
+    const embedding_length = metadata.embedding_length orelse return error.MissingRequiredMetadata;
+    const context_length = metadata.context_length orelse return error.MissingRequiredMetadata;
+    const feed_forward_length = metadata.feed_forward_length orelse return error.MissingRequiredMetadata;
+    const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
+    const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
+
+    const rope_dimension_count = metadata.rope_dimension_count orelse (embedding_length / head_count);
+    const rms_norm_eps = metadata.rms_norm_eps orelse 1e-6;
+    const rope_freq_base = metadata.rope_freq_base orelse 10000;
+    if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
+
+    const token_embd = try takeTensor(allocator, &tensors, "token_embd.weight");
+    const output = takeTensor(allocator, &tensors, "output.weight") catch |err| switch (err) {
+        error.MissingRequiredTensor => try cloneTensorRef(allocator, token_embd),
+        else => return err,
+    };
+    const output_norm = try takeTensor(allocator, &tensors, "output_norm.weight");
+
+    const layers = try allocator.alloc(LayerRefs, block_count);
+    errdefer allocator.free(layers);
+    for (0..block_count) |index| {
+        layers[index] = .{
+            .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
+            .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
+            .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
+            .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
+            .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
+            .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
+            .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+            .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+            .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+        };
+    }
+
+    const tokenizer = try buildTokenizer(allocator, &metadata);
+    const head_dimension = embedding_length / head_count;
+    const kv_dimension = head_dimension * head_count_kv;
+
+    return .{
+        .bytes = mapped_bytes,
+        .mapped_bytes = mapped_bytes,
+        .tokenizer = tokenizer,
+        .architecture = try allocator.dupe(u8, architecture),
+        .context_length = context_length,
+        .embedding_length = embedding_length,
+        .block_count = block_count,
+        .feed_forward_length = feed_forward_length,
+        .rope_dimension_count = rope_dimension_count,
+        .head_count = head_count,
+        .head_count_kv = head_count_kv,
+        .head_dimension = head_dimension,
+        .kv_dimension = kv_dimension,
+        .rms_norm_eps = rms_norm_eps,
+        .rope_freq_base = rope_freq_base,
+        .rope_style = rope_style,
+        .quantization_version = metadata.quantization_version orelse 0,
+        .data_offset = data_offset,
+        .token_embd = token_embd,
+        .output = output,
+        .output_norm = output_norm,
+        .layers = layers,
+    };
+}
+
+pub fn detectChatTemplateStyleInMetadataBlob(
+    allocator: std.mem.Allocator,
+    metadata_count: u64,
+    metadata_bytes: []const u8,
+) !gguf.ChatTemplateStyle {
+    var parser = Parser{ .bytes = metadata_bytes };
+
+    var kv_index: u64 = 0;
+    while (kv_index < metadata_count) : (kv_index += 1) {
+        const key = try readOwnedString(allocator, &parser);
+        defer allocator.free(key);
+
+        const raw_value_type = try parser.readInt(u32);
+        const value_type = std.meta.intToEnum(ValueType, raw_value_type) catch return error.InvalidMetadataType;
+
+        if (std.mem.eql(u8, key, "tokenizer.chat_template")) {
+            const template = try readExpectedString(allocator, &parser, value_type);
+            defer allocator.free(template);
+            return gguf.detectChatTemplateStyle(template);
+        }
+
+        try skipValue(&parser, value_type);
+    }
+
+    return .generic;
+}
+
 pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8) !usize {
     const token_buf = try allocator.alloc(u32, model.context_length);
     defer allocator.free(token_buf);
@@ -2941,6 +3136,14 @@ fn skipValue(parser: *Parser, value_type: ValueType) !void {
             for (0..count) |_| try skipValue(parser, element_type);
         },
     }
+}
+
+fn skipMetadataEntry(parser: *Parser) !void {
+    const key_len = try parser.readInt(u64);
+    try parser.skipBytes(std.math.cast(usize, key_len) orelse return error.Overflow);
+    const raw_value_type = try parser.readInt(u32);
+    const value_type = std.meta.intToEnum(ValueType, raw_value_type) catch return error.InvalidMetadataType;
+    try skipValue(parser, value_type);
 }
 
 fn readF32(bytes: []const u8) f32 {

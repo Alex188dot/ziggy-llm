@@ -37,13 +37,7 @@ pub fn generate(
     if (std.mem.endsWith(u8, model_path, ".ziggy")) {
         const report = try ziggy_format.inspectFile(arena.allocator(), model_path);
         if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
-
-        const gguf_path = try ziggy_format.deriveSourceGgufPath(arena.allocator(), model_path);
-        if (std.fs.accessAbsolute(gguf_path, .{})) {
-            return llama_runtime.generate(allocator, gguf_path, prompt, options);
-        } else |_| {
-            return llama_runtime.generateZiggy(allocator, model_path, prompt, options);
-        }
+        return llama_runtime.generateZiggy(allocator, model_path, prompt, options);
     } else {
         const report = try gguf.inspectFile(arena.allocator(), model_path);
         if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;

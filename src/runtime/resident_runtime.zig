@@ -284,15 +284,21 @@ pub const ResidentRuntime = struct {
             }
         } else model_path;
 
+        var compiled_model: ?ziggy_format.CompiledModel = null;
+        errdefer if (compiled_model) |*compiled| compiled.deinit();
         const model_load_begin = std.time.nanoTimestamp();
-        var model = try llama_cpu.loadModel(self.allocator, actual_model_path);
+        var model = if (std.mem.endsWith(u8, actual_model_path, ".ziggy"))
+            try ziggy_format.loadExecutionModel(self.allocator, actual_model_path)
+        else
+            try llama_cpu.loadModel(self.allocator, actual_model_path);
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 
-        var compiled_model: ?ziggy_format.CompiledModel = null;
-        errdefer if (compiled_model) |*compiled| compiled.deinit();
-        if (std.mem.endsWith(u8, actual_model_path, ".gguf")) {
-            const ziggy_path = try ziggy_format.deriveCompiledPath(self.allocator, actual_model_path);
+        if (std.mem.endsWith(u8, actual_model_path, ".gguf") or std.mem.endsWith(u8, actual_model_path, ".ziggy")) {
+            const ziggy_path = if (std.mem.endsWith(u8, actual_model_path, ".ziggy"))
+                try self.allocator.dupe(u8, actual_model_path)
+            else
+                try ziggy_format.deriveCompiledPath(self.allocator, actual_model_path);
             defer self.allocator.free(ziggy_path);
             if (std.fs.accessAbsolute(ziggy_path, .{})) {
                 compiled_model = try ziggy_format.loadCompiledModel(self.allocator, ziggy_path);
@@ -325,7 +331,10 @@ pub const ResidentRuntime = struct {
 
         var inspect_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer inspect_arena.deinit();
-        const chat_template_style = (try gguf.inspectFile(inspect_arena.allocator(), actual_model_path)).chatTemplateStyle();
+        const chat_template_style = if (std.mem.endsWith(u8, actual_model_path, ".gguf"))
+            (try gguf.inspectFile(inspect_arena.allocator(), actual_model_path)).chatTemplateStyle()
+        else
+            try ziggy_format.chatTemplateStyle(inspect_arena.allocator(), actual_model_path);
 
         self.loaded = .{
             .model_path = owned_model_path,
