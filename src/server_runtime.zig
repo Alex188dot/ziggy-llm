@@ -170,6 +170,7 @@ fn mergeOptions(config: cli.Config, payload: anytype) runtime.GenerationOptions 
         .top_p = payload.top_p orelse config.top_p,
         .min_p = payload.min_p orelse config.min_p,
         .backend = config.backend,
+        .experimental_gated_ffn = config.experimental_gated_ffn,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
     };

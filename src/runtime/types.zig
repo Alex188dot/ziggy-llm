@@ -157,6 +157,7 @@ pub const GenerationOptions = struct {
     min_p: f32 = 0.0,
     backend: BackendPreference = .auto,
     moon_quant: MoonQuantMode = .enabled,
+    experimental_gated_ffn: bool = false,
     metal_profile: bool = false,
     sampling_strategy: SamplingStrategy = .auto,
 };

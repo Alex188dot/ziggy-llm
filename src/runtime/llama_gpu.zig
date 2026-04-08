@@ -63,6 +63,17 @@ pub const ModelDesc = struct {
     rope_style: u32,
 };
 
+pub const GatedFfnLayerPolicy = struct {
+    threshold: f32 = 0,
+    active_block_ratio: f32 = 1.0,
+    avg_active_blocks: f32 = 0,
+    avg_total_blocks: f32 = 0,
+
+    pub fn enabled(self: GatedFfnLayerPolicy) bool {
+        return self.threshold > 0;
+    }
+};
+
 pub const ShortlistEntry = struct {
     token_id: u32,
     logit: f32,
@@ -91,12 +102,20 @@ pub const Session = struct {
     v_cache: metal_backend.BufferHandle,
     batch_logits: metal_backend.BufferHandle,
     batch_tokens: metal_backend.BufferHandle,
+    ffn_block_mask: metal_backend.BufferHandle,
+    ffn_gate_stats: metal_backend.BufferHandle,
+    gated_ffn_policies: []const GatedFfnLayerPolicy,
+    gated_ffn_enabled: bool,
+    gated_ffn_total_blocks: u64 = 0,
+    gated_ffn_active_blocks: u64 = 0,
     profiler: ?*metal_profile.Profiler = null,
 
     pub fn init(
         backend: backend_api.MatVecBackend,
         dense_lookup: DenseLookup,
         model: ModelDesc,
+        gated_ffn_policies: []const GatedFfnLayerPolicy,
+        gated_ffn_enabled: bool,
         profiler: ?*metal_profile.Profiler,
     ) !Session {
         const max_input = @max(model.embedding_length, model.feed_forward_length);
@@ -134,6 +153,11 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(batch_logits);
         const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(batch_tokens);
+        const ffn_block_count = std.math.divCeil(usize, model.feed_forward_length, 256) catch unreachable;
+        const ffn_block_mask = try metal_backend.createByteScratchBuffer(backend, ffn_block_count * @sizeOf(u32));
+        errdefer metal_backend.destroyBuffer(ffn_block_mask);
+        const ffn_gate_stats = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+        errdefer metal_backend.destroyBuffer(ffn_gate_stats);
 
         return .{
             .backend = backend,
@@ -155,6 +179,10 @@ pub const Session = struct {
             .v_cache = v_cache,
             .batch_logits = batch_logits,
             .batch_tokens = batch_tokens,
+            .ffn_block_mask = ffn_block_mask,
+            .ffn_gate_stats = ffn_gate_stats,
+            .gated_ffn_policies = gated_ffn_policies,
+            .gated_ffn_enabled = gated_ffn_enabled,
             .profiler = profiler,
         };
     }
@@ -176,6 +204,8 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.v_cache);
         metal_backend.destroyBuffer(self.batch_logits);
         metal_backend.destroyBuffer(self.batch_tokens);
+        metal_backend.destroyBuffer(self.ffn_block_mask);
+        metal_backend.destroyBuffer(self.ffn_gate_stats);
         self.* = undefined;
     }
 
@@ -292,25 +322,43 @@ pub const Session = struct {
         try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
     }
 
-    pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
+    pub fn runFfnBlock(self: *Session, layer: LayerDesc, layer_index: usize) !void {
         try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
         try self.runProjection(layer.ffn_gate, self.normed, self.gate);
         try self.runProjection(layer.ffn_up, self.normed, self.up);
 
         const tensor = layer.ffn_down;
         var handled_fused = false;
+        const gated_policy = if (self.gated_ffn_enabled and layer_index < self.gated_ffn_policies.len)
+            self.gated_ffn_policies[layer_index]
+        else
+            GatedFfnLayerPolicy{};
 
         if (tensor.tensor_type == 12) {
             if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                 const start = std.time.nanoTimestamp();
-                try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                if (gated_policy.enabled()) {
+                    const stats = try metal_backend.buildFfnGateBlockMask(self.backend, self.gate, self.up, self.ffn_block_mask, self.ffn_gate_stats, tensor.cols, gated_policy.threshold);
+                    self.gated_ffn_total_blocks += stats.total_blocks;
+                    self.gated_ffn_active_blocks += stats.active_blocks;
+                    try metal_backend.runMatVecMoonQuantQ4KGatedSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.ffn_block_mask, self.hidden, tensor.rows, tensor.cols);
+                } else {
+                    try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                }
                 const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
                 self.recordCategoryWithShape(.projections, start, shape);
                 handled_fused = true;
             } else {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                 const start = std.time.nanoTimestamp();
-                try metal_backend.runMatVecQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                if (gated_policy.enabled()) {
+                    const stats = try metal_backend.buildFfnGateBlockMask(self.backend, self.gate, self.up, self.ffn_block_mask, self.ffn_gate_stats, tensor.cols, gated_policy.threshold);
+                    self.gated_ffn_total_blocks += stats.total_blocks;
+                    self.gated_ffn_active_blocks += stats.active_blocks;
+                    try metal_backend.runMatVecQ4KGatedSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.ffn_block_mask, self.hidden, tensor.rows, tensor.cols);
+                } else {
+                    try metal_backend.runMatVecQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
+                }
                 const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
                 self.recordCategoryWithShape(.projections, start, shape);
                 handled_fused = true;
@@ -344,6 +392,22 @@ pub const Session = struct {
 
     pub fn commitToken(self: *Session) !void {
         try metal_backend.commitSequence(self.backend);
+    }
+
+    pub fn renderGatedFfnSummary(self: *const Session, allocator: std.mem.Allocator) !?[]u8 {
+        if (!self.gated_ffn_enabled or self.gated_ffn_total_blocks == 0) return null;
+        const active_ratio = @as(f64, @floatFromInt(self.gated_ffn_active_blocks)) /
+            @as(f64, @floatFromInt(self.gated_ffn_total_blocks));
+        return try std.fmt.allocPrint(
+            allocator,
+            "gated_ffn.profile.active_blocks={d}\ngated_ffn.profile.total_blocks={d}\ngated_ffn.profile.active_block_ratio={d:.6}\ngated_ffn.profile.estimated_weight_skip_pct={d:.3}\n",
+            .{
+                self.gated_ffn_active_blocks,
+                self.gated_ffn_total_blocks,
+                active_ratio,
+                (1.0 - active_ratio) * 100.0,
+            },
+        );
     }
 
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {

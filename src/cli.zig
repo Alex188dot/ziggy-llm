@@ -33,6 +33,7 @@ pub const Config = struct {
     min_p: f32 = 0.0,
     backend: runtime.BackendPreference = .auto,
     moon_quant: runtime.MoonQuantMode = .enabled,
+    experimental_gated_ffn: bool = false,
     metal_profile: bool = false,
     sampling_strategy: runtime.SamplingStrategy = .auto,
 };
@@ -163,6 +164,10 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.moon_quant = runtime.MoonQuantMode.parse(args[i]) orelse return error.InvalidMoonQuant;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--experimental-gated-ffn")) {
+            config.experimental_gated_ffn = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--metal-profile")) {
             config.metal_profile = true;
             continue;
@@ -242,6 +247,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --min-p <f>       Sampling filter: drop tokens below min_p * top token prob (default: {d:.1})
         \\      --backend <name>  Backend preference: auto, cpu, metal (default: {s})
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
+        \\      --experimental-gated-ffn
+        \\                      Experimental: use calibrated block-skipping for selected FFN down layers when compiled metadata is available
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
         \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-topk-sample, gpu-shortlist, cpu-full-logits (default: {s})
         \\      --port <port>     Port for server mode (default: {d})
@@ -295,7 +302,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--experimental-gated-ffn", "--metal-profile", "--sampling-path", "gpu-shortlist" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
@@ -307,6 +314,7 @@ test "runtime flags parse correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), config.min_p, 0.0001);
     try std.testing.expectEqual(runtime.BackendPreference.metal, config.backend);
     try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
+    try std.testing.expect(config.experimental_gated_ffn);
     try std.testing.expect(config.metal_profile);
     try std.testing.expectEqual(runtime.SamplingStrategy.gpu_shortlist, config.sampling_strategy);
 }

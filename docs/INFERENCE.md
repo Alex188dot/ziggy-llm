@@ -289,6 +289,8 @@ user@machine ziggy-llm %
 Current implementation note:
 
 - `ziggy-llm run ... --backend metal --metal-profile` and `ziggy-llm bench ... --backend metal --metal-profile` now emit aggregated per-op timing, top bottleneck lines, dominant shape entries, and per-token decode timing breakdowns for measured runs.
+- Benchmark note: if a companion compiled cache exists, benchmark runs execute through the `.ziggy` path even when the CLI input is a `.gguf` model path. Keep the model column as the user-facing source model name, and call out `.ziggy` explicitly in the mode/notes only when it matters for interpretation.
+- `*` marks benchmark rows that executed through the compiled `.ziggy` cache.
 
 ## Benchmark Table - Tiny Llama 1.1B
 
@@ -321,10 +323,15 @@ Current implementation note:
 | 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.036 |   152.272 |  152.573 |    123.440 |
 | 2026-04-06 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |    326.123 |   184.923 |  511.118 |    126.740 |
 | 2026-04-06 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.050 |   157.499 |  157.626 |    123.711 |
-| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits       | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |    558.738 |   233.343 |  793.449 |    122.783 |
-| 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    125.010 |
-| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     48.951 |   373.827 |  422.834 |    126.056 |
-| 2026-04-08 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.025 |   152.389 |  152.463 |    127.346 |
+| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits*      | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |    558.738 |   233.343 |  793.449 |    122.783 |
+| 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits*       | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    125.010 |
+| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax* | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     48.951 |   373.827 |  422.834 |    126.056 |
+| 2026-04-08 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax*  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.025 |   152.389 |  152.463 |    127.346 |
+| 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits, experimental gated FFN via `.ziggy`* | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    129.461 |
+
+Experimental gated FFN note:
+
+- The current gated-FFN prototype produced a modest warm decode gain on TinyLlama (`129.461 TPS` vs `128.130 TPS`, about `+1.04%`), but the same run showed a large prompt perplexity regression (`+44.9%`) and changed output bytes early in generation. Treat it as a speed experiment, not a production-quality benchmark winner.
 
 ## Benchmark Table — Llama 3.2 3B
 

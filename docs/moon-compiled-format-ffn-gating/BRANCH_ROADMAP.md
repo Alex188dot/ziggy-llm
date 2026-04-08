@@ -92,23 +92,23 @@ Only:
 
 ### Deliverables
 
-- [ ] Add calibration output for FFN gate sparsity stats
-- [ ] Define threshold policy per layer
-- [ ] Emit optional compiled metadata for gated FFN path
-- [ ] Implement Metal kernel variant for gated `ffn_down`
+- [x] Add calibration output for FFN gate sparsity stats
+- [x] Define threshold policy per layer
+- [x] Emit optional compiled metadata for gated FFN path
+- [x] Implement Metal kernel variant for gated `ffn_down`
 - [ ] Add runtime flag:
-  - [ ] `--experimental-gated-ffn`
+  - [x] `--experimental-gated-ffn`
 - [ ] Add validation harness:
-  - [ ] perplexity delta
-  - [ ] token output diff
-  - [ ] throughput change
-  - [ ] memory bandwidth / occupancy observations
+  - [x] perplexity delta
+  - [x] token output diff
+  - [x] throughput change
+  - [x] memory bandwidth / occupancy observations
 
 ### Success criteria
 
 - [ ] Throughput win on at least some prompts/models
 - [ ] Quality delta remains acceptable
-- [ ] Easy to disable if regressions appear
+- [x] Easy to disable if regressions appear
 
 ---
 
@@ -130,14 +130,14 @@ These are later-stage research ideas, not next-branch priorities.
 2. [x] Build offline compiler from GGUF
 3. [x] Load compiled format directly in runtime
 4. [x] Expand compiled layouts across tensor families
-5. [ ] Add calibration hooks for FFN gating
-6. [ ] Implement gated FFN experimental kernel
-7. [ ] Benchmark correctness + speed
+5. [x] Add calibration hooks for FFN gating
+6. [x] Implement gated FFN experimental kernel
+7. [x] Benchmark correctness + speed
 
 ---
 
 ## Definition of done
 
-- [ ] MoonQuant is a true compiled execution pipeline
-- [ ] GGUF is treated as source format, not final runtime format
-- [ ] At least one experimental gated FFN optimization is benchmarkable behind a flag
+- [x] MoonQuant is a true compiled execution pipeline
+- [x] GGUF is treated as source format, not final runtime format
+- [x] At least one experimental gated FFN optimization is benchmarkable behind a flag

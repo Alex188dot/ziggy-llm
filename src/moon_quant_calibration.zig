@@ -21,6 +21,23 @@ pub const Observation = struct {
     values: []const f32,
 };
 
+pub const gated_ffn_threshold_candidates = [_]f32{ 0.015, 0.025, 0.04, 0.06 };
+
+pub const GatedFfnPolicy = struct {
+    layer_index: u32,
+    tensor_name: []u8,
+    threshold: f32,
+    active_block_ratio: f32,
+    avg_active_blocks: f32,
+    avg_total_blocks: f32,
+    selected: bool,
+
+    pub fn deinit(self: *GatedFfnPolicy, allocator: std.mem.Allocator) void {
+        allocator.free(self.tensor_name);
+        self.* = undefined;
+    }
+};
+
 const Accumulator = struct {
     name: []u8,
     role: Role,
@@ -30,6 +47,9 @@ const Accumulator = struct {
     samples: usize = 0,
     total_mean_square: f64 = 0,
     peak_abs: f32 = 0,
+    gate_total_blocks: u64 = 0,
+    gate_active_blocks_by_threshold: [gated_ffn_threshold_candidates.len]u64 = .{0} ** gated_ffn_threshold_candidates.len,
+    gate_peak_active_ratio_by_threshold: [gated_ffn_threshold_candidates.len]f32 = .{0} ** gated_ffn_threshold_candidates.len,
 
     fn meanSquare(self: Accumulator) f64 {
         if (self.samples == 0) return 0;
@@ -57,6 +77,7 @@ pub const Entry = struct {
 
 pub const Plan = struct {
     entries: []Entry,
+    gated_ffn_policies: []GatedFfnPolicy = &.{},
     q4_k_m_count: usize = 0,
     q5_k_m_count: usize = 0,
     q6_k_count: usize = 0,
@@ -65,6 +86,8 @@ pub const Plan = struct {
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         for (self.entries) |*entry| entry.deinit(allocator);
         allocator.free(self.entries);
+        for (self.gated_ffn_policies) |*policy| policy.deinit(allocator);
+        allocator.free(self.gated_ffn_policies);
         self.* = undefined;
     }
 };
@@ -101,6 +124,9 @@ pub const Calibrator = struct {
         accumulator.samples += 1;
         accumulator.total_mean_square += sum_sq / @as(f64, @floatFromInt(observation.values.len));
         accumulator.peak_abs = peak_abs;
+        if (observation.role == .ffn_down) {
+            observeGatedFfnBlocks(accumulator, observation.values);
+        }
     }
 
     pub fn buildPlan(self: *Calibrator, allocator: std.mem.Allocator) !Plan {
@@ -113,6 +139,8 @@ pub const Calibrator = struct {
         var q5_k_m_count: usize = 0;
         var q6_k_count: usize = 0;
         var q8_0_count: usize = 0;
+        var gated_ffn_policy_list = std.ArrayList(GatedFfnPolicy).empty;
+        defer gated_ffn_policy_list.deinit(allocator);
 
         while (iterator.next()) |accumulator| : (index += 1) {
             const importance_score = scoreImportance(accumulator.*);
@@ -136,6 +164,9 @@ pub const Calibrator = struct {
                 .q8_0 => q8_0_count += 1,
                 else => {},
             }
+            if (try buildGatedFfnPolicy(allocator, accumulator.*)) |policy| {
+                try gated_ffn_policy_list.append(allocator, policy);
+            }
         }
 
         std.mem.sort(Entry, entries, {}, struct {
@@ -146,6 +177,7 @@ pub const Calibrator = struct {
 
         return .{
             .entries = entries,
+            .gated_ffn_policies = try gated_ffn_policy_list.toOwnedSlice(allocator),
             .q4_k_m_count = q4_k_m_count,
             .q5_k_m_count = q5_k_m_count,
             .q6_k_count = q6_k_count,
@@ -168,6 +200,90 @@ pub const Calibrator = struct {
         return result.value_ptr;
     }
 };
+
+fn observeGatedFfnBlocks(accumulator: *Accumulator, values: []const f32) void {
+    const block_size = moon_quant.q4_k_block_values;
+    if (values.len == 0 or values.len % block_size != 0) return;
+
+    const block_count = values.len / block_size;
+    accumulator.gate_total_blocks += block_count;
+    for (gated_ffn_threshold_candidates, 0..) |threshold, threshold_index| {
+        var active_blocks: u64 = 0;
+        for (0..block_count) |block_index| {
+            const start = block_index * block_size;
+            const block = values[start .. start + block_size];
+            if (blockHasActivationAboveThreshold(block, threshold)) active_blocks += 1;
+        }
+        accumulator.gate_active_blocks_by_threshold[threshold_index] += active_blocks;
+        const active_ratio = if (block_count == 0)
+            1.0
+        else
+            @as(f32, @floatFromInt(active_blocks)) / @as(f32, @floatFromInt(block_count));
+        accumulator.gate_peak_active_ratio_by_threshold[threshold_index] =
+            @max(accumulator.gate_peak_active_ratio_by_threshold[threshold_index], active_ratio);
+    }
+}
+
+fn blockHasActivationAboveThreshold(block: []const f32, threshold: f32) bool {
+    for (block) |value| {
+        if (@abs(value) > threshold) return true;
+    }
+    return false;
+}
+
+fn buildGatedFfnPolicy(allocator: std.mem.Allocator, accumulator: Accumulator) !?GatedFfnPolicy {
+    if (accumulator.role != .ffn_down) return null;
+    const layer_index = extractLayerIndex(accumulator.name) orelse return null;
+    if (accumulator.gate_total_blocks == 0 or accumulator.samples == 0) return null;
+
+    var best_index: ?usize = null;
+    var best_skip_ratio: f32 = 0;
+    for (gated_ffn_threshold_candidates, 0..) |threshold, threshold_index| {
+        _ = threshold;
+        const active_ratio = @as(f32, @floatFromInt(accumulator.gate_active_blocks_by_threshold[threshold_index])) /
+            @as(f32, @floatFromInt(accumulator.gate_total_blocks));
+        const skip_ratio = 1.0 - active_ratio;
+        const peak_ratio = accumulator.gate_peak_active_ratio_by_threshold[threshold_index];
+        if (skip_ratio < 0.12) continue;
+        if (peak_ratio > 0.94) continue;
+        if (best_index == null or skip_ratio > best_skip_ratio) {
+            best_index = threshold_index;
+            best_skip_ratio = skip_ratio;
+        }
+    }
+
+    if (best_index == null) return null;
+    const chosen_index = best_index.?;
+    const avg_total_blocks = @as(f32, @floatFromInt(accumulator.gate_total_blocks)) /
+        @as(f32, @floatFromInt(accumulator.samples));
+    const avg_active_blocks = @as(f32, @floatFromInt(accumulator.gate_active_blocks_by_threshold[chosen_index])) /
+        @as(f32, @floatFromInt(accumulator.samples));
+    const active_block_ratio = @as(f32, @floatFromInt(accumulator.gate_active_blocks_by_threshold[chosen_index])) /
+        @as(f32, @floatFromInt(accumulator.gate_total_blocks));
+
+    return .{
+        .layer_index = layer_index,
+        .tensor_name = try allocator.dupe(u8, accumulator.name),
+        .threshold = gated_ffn_threshold_candidates[chosen_index],
+        .active_block_ratio = active_block_ratio,
+        .avg_active_blocks = avg_active_blocks,
+        .avg_total_blocks = avg_total_blocks,
+        .selected = true,
+    };
+}
+
+fn extractLayerIndex(name: []const u8) ?u32 {
+    const prefix = "blk.";
+    if (std.mem.indexOf(u8, name, prefix)) |start| {
+        const num_start = start + prefix.len;
+        var end = num_start;
+        while (end < name.len and std.ascii.isDigit(name[end])) : (end += 1) {}
+        if (end > num_start) {
+            return std.fmt.parseInt(u32, name[num_start..end], 10) catch null;
+        }
+    }
+    return null;
+}
 
 fn scoreImportance(accumulator: Accumulator) f64 {
     const mean_square = accumulator.meanSquare();

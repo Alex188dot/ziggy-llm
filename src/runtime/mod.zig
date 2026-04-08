@@ -122,6 +122,55 @@ pub fn benchCommand(
     options: GenerationOptions,
     bench_runs: usize,
 ) !void {
+    if (options.experimental_gated_ffn and bench_runs > 1) {
+        var baseline_options = options;
+        baseline_options.experimental_gated_ffn = false;
+        var baseline = try bench_runner.runWarmBench(allocator, model_path, prompt, baseline_options, bench_runs);
+        defer baseline.deinit(allocator);
+
+        var gated = try bench_runner.runWarmBench(allocator, model_path, prompt, options, bench_runs);
+        defer gated.deinit(allocator);
+
+        const baseline_ppl = try llama_runtime.promptPerplexity(allocator, model_path, prompt, baseline_options);
+        const gated_ppl = try llama_runtime.promptPerplexity(allocator, model_path, prompt, options);
+        const throughput_change_pct = percentDelta(baseline.warmDecodeTokensPerSecond(), gated.warmDecodeTokensPerSecond());
+        const perplexity_delta_pct = percentDelta(baseline_ppl, gated_ppl);
+        const baseline_skip_pct = parseMetricF64(baseline.warm_metal_profile_summary, "gated_ffn.profile.estimated_weight_skip_pct=");
+        const gated_skip_pct = parseMetricF64(gated.warm_metal_profile_summary, "gated_ffn.profile.estimated_weight_skip_pct=");
+        const diff_index = firstMismatchIndex(baseline.cold.generated_text, gated.cold.generated_text);
+
+        try writer.print(
+            \\experimental_gated_ffn=true
+            \\baseline.warm.decode_tok_s={d:.3}
+            \\gated.warm.decode_tok_s={d:.3}
+            \\gated.validation.throughput_change_pct={d:.3}
+            \\baseline.prompt_perplexity={d:.6}
+            \\gated.prompt_perplexity={d:.6}
+            \\gated.validation.perplexity_delta_pct={d:.3}
+            \\gated.validation.output_changed={s}
+            \\gated.validation.output_first_diff_byte={d}
+            \\baseline.gated_ffn.estimated_weight_skip_pct={d:.3}
+            \\gated.gated_ffn.estimated_weight_skip_pct={d:.3}
+            \\gated.validation.memory_skip_delta_pct={d:.3}
+            \\
+        ,
+            .{
+                baseline.warmDecodeTokensPerSecond(),
+                gated.warmDecodeTokensPerSecond(),
+                throughput_change_pct,
+                baseline_ppl,
+                gated_ppl,
+                perplexity_delta_pct,
+                if (diff_index == std.math.maxInt(usize)) "false" else "true",
+                if (diff_index == std.math.maxInt(usize)) 0 else diff_index,
+                baseline_skip_pct,
+                gated_skip_pct,
+                gated_skip_pct - baseline_skip_pct,
+            },
+        );
+        return;
+    }
+
     if (bench_runs > 1) {
         var summary = try bench_runner.runWarmBench(allocator, model_path, prompt, options, bench_runs);
         defer summary.deinit(allocator);
@@ -268,4 +317,27 @@ pub fn benchCommand(
     if (report.metal_profile_summary) |summary| {
         try writer.print("{s}", .{summary});
     }
+}
+
+fn percentDelta(baseline: f64, candidate: f64) f64 {
+    if (baseline == 0) return 0;
+    return ((candidate - baseline) / baseline) * 100.0;
+}
+
+fn parseMetricF64(summary: ?[]const u8, key: []const u8) f64 {
+    const text = summary orelse return 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        return std.fmt.parseFloat(f64, line[key.len..]) catch 0;
+    }
+    return 0;
+}
+
+fn firstMismatchIndex(lhs: []const u8, rhs: []const u8) usize {
+    const max_len = @min(lhs.len, rhs.len);
+    for (0..max_len) |index| {
+        if (lhs[index] != rhs[index]) return index;
+    }
+    return if (lhs.len == rhs.len) std.math.maxInt(usize) else max_len;
 }

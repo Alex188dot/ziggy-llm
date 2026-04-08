@@ -632,6 +632,8 @@ pub const ReusableSession = struct {
         backend: ?backend_api.MatVecBackend,
         context_length: usize,
         dense_tensors: ?DenseTensorLookup,
+        gated_ffn_policies: []const llama_gpu.GatedFfnLayerPolicy,
+        experimental_gated_ffn: bool,
     ) !ReusableSession {
         var session = try Session.init(
             allocator,
@@ -640,6 +642,8 @@ pub const ReusableSession = struct {
             dense_tensors,
             context_length,
             context_length,
+            gated_ffn_policies,
+            experimental_gated_ffn,
             null,
             null,
         );
@@ -692,6 +696,8 @@ const Session = struct {
         dense_tensors: ?DenseTensorLookup,
         context_length: usize,
         token_capacity: usize,
+        gated_ffn_policies: []const llama_gpu.GatedFfnLayerPolicy,
+        experimental_gated_ffn: bool,
         profiler: ?*metal_profile.Profiler,
         moon_quant_calibrator: ?*moon_quant_calibration.Calibrator,
     ) !Session {
@@ -721,7 +727,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
             }
         }
 
@@ -976,7 +982,7 @@ const Session = struct {
             }
 
             if (self.gpu_session) |*gpu_session| {
-                try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+                try gpu_session.runFfnBlock(adaptLayerDesc(layer), layer_index);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
                 try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
@@ -1335,8 +1341,46 @@ pub fn generateLoaded(
     options: runtime_types.GenerationOptions,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
+    gated_ffn_policies: []const llama_gpu.GatedFfnLayerPolicy,
 ) !GenerateReport {
-    return generateLoadedStreaming(allocator, model, prompt, options, backend, dense_tensors, null, null);
+    return generateLoadedStreaming(allocator, model, prompt, options, backend, dense_tensors, gated_ffn_policies, null, null);
+}
+
+pub fn measurePromptPerplexity(
+    allocator: std.mem.Allocator,
+    model: *const Model,
+    prompt: []const u8,
+    options: runtime_types.GenerationOptions,
+    backend: ?backend_api.MatVecBackend,
+    dense_tensors: ?DenseTensorLookup,
+    gated_ffn_policies: []const llama_gpu.GatedFfnLayerPolicy,
+) !f64 {
+    const context_length = effectiveContextLength(model, options);
+    const token_buf = try allocator.alloc(u32, context_length);
+    defer allocator.free(token_buf);
+    const token_count = try model.tokenizer.encodeInto(allocator, prompt, token_buf);
+    if (token_count <= 1) return 1.0;
+
+    var session = try Session.init(
+        allocator,
+        model,
+        backend,
+        dense_tensors,
+        context_length,
+        context_length,
+        gated_ffn_policies,
+        options.experimental_gated_ffn,
+        null,
+        null,
+    );
+    defer session.deinit(allocator);
+
+    var total_nll: f64 = 0;
+    for (0..token_count - 1) |index| {
+        const logits = try session.step(token_buf[index]);
+        total_nll += negativeLogProb(logits, token_buf[index + 1]);
+    }
+    return @exp(total_nll / @as(f64, @floatFromInt(token_count - 1)));
 }
 
 pub fn generateLoadedStreaming(
@@ -1346,6 +1390,7 @@ pub fn generateLoadedStreaming(
     options: runtime_types.GenerationOptions,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
+    gated_ffn_policies: []const llama_gpu.GatedFfnLayerPolicy,
     stream_ctx: ?*anyopaque,
     stream_callback: ?StreamCallback,
 ) !GenerateReport {
@@ -1368,6 +1413,8 @@ pub fn generateLoadedStreaming(
         dense_tensors,
         context_length,
         @min(context_length, prompt_capacity),
+        gated_ffn_policies,
+        options.experimental_gated_ffn,
         if (profiler.enabled) &profiler else null,
         null,
     );
@@ -1534,7 +1581,11 @@ pub fn generateLoadedStreaming(
         profiler.endDecodeToken();
     }
     const decode_end = std.time.nanoTimestamp();
-    const profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
+    const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
+    const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
+    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    if (base_profile_summary) |summary| allocator.free(summary);
+    if (gated_ffn_summary) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -1734,7 +1785,11 @@ pub fn generateLoadedStreamingCached(
         profiler.endDecodeToken();
     }
     const decode_end = std.time.nanoTimestamp();
-    const profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
+    const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
+    const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
+    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    if (base_profile_summary) |summary| allocator.free(summary);
+    if (gated_ffn_summary) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -1791,6 +1846,8 @@ pub fn initCalibrationSession(
         null,
         @min(model.context_length, token_capacity),
         token_capacity,
+        &.{},
+        false,
         null,
         calibrator,
     );
@@ -1803,6 +1860,32 @@ fn commonPrefixLen(lhs: []const u32, rhs: []const u32) usize {
     var index: usize = 0;
     while (index < max_len and lhs[index] == rhs[index]) : (index += 1) {}
     return index;
+}
+
+fn combineOptionalSummaries(allocator: std.mem.Allocator, lhs: ?[]const u8, rhs: ?[]const u8) !?[]u8 {
+    const left = lhs orelse "";
+    const right = rhs orelse "";
+    if (left.len == 0 and right.len == 0) return null;
+
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    if (left.len > 0) try buffer.appendSlice(allocator, left);
+    if (left.len > 0 and right.len > 0 and left[left.len - 1] != '\n') try buffer.append(allocator, '\n');
+    if (right.len > 0) try buffer.appendSlice(allocator, right);
+    return try buffer.toOwnedSlice(allocator);
+}
+
+fn negativeLogProb(logits: []const f32, target_token: u32) f64 {
+    if (target_token >= logits.len) return 0;
+    var max_logit = -std.math.inf(f32);
+    for (logits) |value| max_logit = @max(max_logit, value);
+
+    var sum: f64 = 0;
+    for (logits) |value| {
+        sum += @exp(@as(f64, value - max_logit));
+    }
+    const target = @as(f64, logits[target_token]);
+    return -((target - @as(f64, max_logit)) - @log(sum));
 }
 
 pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
@@ -2112,6 +2195,47 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
     const token_buf = try allocator.alloc(u32, model.context_length);
     defer allocator.free(token_buf);
     return model.tokenizer.encodeInto(allocator, prompt, token_buf);
+}
+
+pub fn buildGatedFfnCalibrationPlan(allocator: std.mem.Allocator, model: *const Model) !moon_quant_calibration.Plan {
+    const prompts = [_][]const u8{
+        "Summarize why Apple Silicon inference benefits from lower FFN memory traffic.",
+        "List three concise optimizations that can improve decode throughput without changing model weights too much.",
+        "User: Explain how compiled tensor layouts help Metal kernels stay fast.\nAssistant:",
+    };
+
+    var calibrator = moon_quant_calibration.Calibrator.init(allocator);
+    defer calibrator.deinit();
+
+    var session = try Session.init(
+        allocator,
+        model,
+        null,
+        null,
+        model.context_length,
+        model.context_length,
+        &.{},
+        false,
+        null,
+        &calibrator,
+    );
+    defer session.deinit(allocator);
+
+    const token_buf = try allocator.alloc(u32, model.context_length);
+    defer allocator.free(token_buf);
+
+    for (prompts) |prompt| {
+        session.position = 0;
+        session.pending_greedy_token = null;
+        const token_count = try model.tokenizer.encodeInto(allocator, prompt, token_buf);
+        if (token_count == 0) continue;
+        for (token_buf[0..token_count]) |token_id| {
+            try session.stepNoOutput(token_id);
+        }
+        session.position = 0;
+    }
+
+    return calibrator.buildPlan(allocator);
 }
 
 fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {

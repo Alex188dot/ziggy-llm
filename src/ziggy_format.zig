@@ -6,7 +6,7 @@ const calibration = @import("moon_quant_calibration.zig");
 const llama_fixture = @import("runtime/llama_fixture.zig");
 
 pub const magic = "ZIGY";
-pub const current_version: u32 = 2;
+pub const current_version: u32 = 3;
 pub const current_runtime_version: u32 = 1;
 pub const default_alignment: u32 = 32;
 
@@ -144,6 +144,14 @@ pub const ZiggyHeader = extern struct {
     quantization_version: u32,
     reserved: [8]u8,
 
+    pub fn compiledMetadataBlobLen(self: ZiggyHeader) u64 {
+        return std.mem.bytesToValue(u64, &self.reserved);
+    }
+
+    pub fn setCompiledMetadataBlobLen(self: *ZiggyHeader, len: u64) void {
+        self.reserved = std.mem.toBytes(len);
+    }
+
     pub fn init() ZiggyHeader {
         return .{
             .magic = magic.*,
@@ -227,6 +235,7 @@ pub const CompiledModel = struct {
     header: ZiggyHeader,
     architecture: []const u8,
     metadata_blob: []const u8,
+    compiled_metadata_blob: []const u8,
     tensors: std.StringHashMap(TensorInfo),
     data_offset: u64,
     bytes: []align(16384) const u8,
@@ -238,6 +247,7 @@ pub const CompiledModel = struct {
             .header = undefined,
             .architecture = &.{},
             .metadata_blob = &.{},
+            .compiled_metadata_blob = &.{},
             .tensors = std.StringHashMap(TensorInfo).init(allocator),
             .data_offset = 0,
             .bytes = &.{},
@@ -278,6 +288,7 @@ pub const CompileOptions = struct {
     keep_raw_for_all: bool = false,
     use_calibration_plan: bool = false,
     calibration_plan: ?*const calibration.Plan = null,
+    emit_gated_ffn_metadata: bool = false,
 };
 
 pub const LayoutPolicy = enum {
@@ -318,6 +329,18 @@ pub fn compileFromGGUF(
     const gguf_model = try llama.loadModel(arena_allocator, gguf_path);
     var metadata_blob = try llama.extractMetadataBlob(arena_allocator, gguf_path);
     defer metadata_blob.deinit(arena_allocator);
+    var owned_calibration_plan: ?calibration.Plan = null;
+    defer if (owned_calibration_plan) |*plan| plan.deinit(allocator);
+    const gating_plan = blk: {
+        if (!options.emit_gated_ffn_metadata) break :blk null;
+        if (options.calibration_plan) |plan| break :blk plan;
+        owned_calibration_plan = try llama.buildGatedFfnCalibrationPlan(allocator, &gguf_model);
+        break :blk &owned_calibration_plan.?;
+    };
+    const compiled_metadata_blob = if (gating_plan) |plan|
+        try buildCompiledMetadataBlob(arena_allocator, plan)
+    else
+        &.{};
 
     var tensor_sources = std.ArrayList(TensorSource).empty;
     defer tensor_sources.deinit(arena_allocator);
@@ -375,6 +398,7 @@ pub fn compileFromGGUF(
     header.tensor_count = @intCast(tensor_sources.items.len);
     header.metadata_count = metadata_blob.count;
     header.metadata_blob_len = metadata_blob.bytes.len;
+    header.setCompiledMetadataBlobLen(compiled_metadata_blob.len);
     header.quantization_version = gguf_model.quantization_version;
     header.alignment = default_alignment;
 
@@ -382,6 +406,7 @@ pub fn compileFromGGUF(
     try builder.writeHeader(header);
     try builder.writeArchitecture(gguf_model.architecture);
     try builder.buffer.appendSlice(arena_allocator, metadata_blob.bytes);
+    try builder.buffer.appendSlice(arena_allocator, compiled_metadata_blob);
     try builder.padTo(alignForward(builder.currentPos(), header.alignment));
     try builder.buffer.appendSlice(arena_allocator, metadata.items);
     try builder.padTo(alignForward(builder.currentPos(), header.alignment));
@@ -750,6 +775,10 @@ pub fn loadCompiledModel(allocator: std.mem.Allocator, path: []const u8) !Compil
     if (pos + model.header.metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
     model.metadata_blob = mapped_bytes[pos .. pos + model.header.metadata_blob_len];
     pos += model.header.metadata_blob_len;
+    const compiled_metadata_blob_len: usize = @intCast(model.header.compiledMetadataBlobLen());
+    if (pos + compiled_metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
+    model.compiled_metadata_blob = mapped_bytes[pos .. pos + compiled_metadata_blob_len];
+    pos += compiled_metadata_blob_len;
 
     pos = alignForward(pos, model.header.alignment);
 
@@ -809,6 +838,9 @@ pub fn loadExecutionModel(allocator: std.mem.Allocator, path: []const u8) !llama
     if (pos + header.metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
     const metadata_bytes = mapped_bytes[pos .. pos + header.metadata_blob_len];
     pos += header.metadata_blob_len;
+    const compiled_metadata_blob_len: usize = @intCast(header.compiledMetadataBlobLen());
+    if (pos + compiled_metadata_blob_len > mapped_bytes.len) return error.TruncatedFile;
+    pos += compiled_metadata_blob_len;
     pos = @intCast(alignForward(pos, header.alignment));
 
     var tensor_refs = try allocator.alloc(llama.ExternalTensorRef, @intCast(header.tensor_count));
@@ -869,6 +901,7 @@ pub const InspectReport = struct {
     runtime_version: u32,
     architecture: []const u8,
     tensor_count: u64,
+    compiled_metadata_bytes: u64,
     quantization_version: u32,
     alignment: u32,
     data_offset: u64,
@@ -899,6 +932,7 @@ pub fn inspectFile(allocator: std.mem.Allocator, path: []const u8) !InspectRepor
         .runtime_version = header.runtime_version,
         .architecture = try allocator.dupe(u8, arch_buf),
         .tensor_count = header.tensor_count,
+        .compiled_metadata_bytes = header.compiledMetadataBlobLen(),
         .quantization_version = header.quantization_version,
         .alignment = header.alignment,
         .data_offset = 0,
@@ -914,6 +948,7 @@ pub fn printInspectReport(writer: anytype, report: InspectReport) !void {
         \\runtime_version: {d}
         \\architecture: {s}
         \\tensor_count: {d}
+        \\compiled_metadata_bytes: {d}
         \\quantization_version: {d}
         \\alignment: {d}
         \\total_size: {d}
@@ -924,10 +959,79 @@ pub fn printInspectReport(writer: anytype, report: InspectReport) !void {
         report.runtime_version,
         report.architecture,
         report.tensor_count,
+        report.compiled_metadata_bytes,
         report.quantization_version,
         report.alignment,
         report.total_size,
     });
+}
+
+pub const GatedFfnMetadata = struct {
+    layer_index: u32,
+    threshold: f32,
+    active_block_ratio: f32,
+    avg_active_blocks: f32,
+    avg_total_blocks: f32,
+};
+
+pub fn parseGatedFfnMetadata(
+    allocator: std.mem.Allocator,
+    blob: []const u8,
+) ![]GatedFfnMetadata {
+    var list = std.ArrayList(GatedFfnMetadata).empty;
+    errdefer list.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, blob, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "gated_ffn.layer.")) continue;
+        var rest = line["gated_ffn.layer.".len..];
+        const eq_index = std.mem.indexOfScalar(u8, rest, '=') orelse continue;
+        const layer_index = std.fmt.parseUnsigned(u32, rest[0..eq_index], 10) catch continue;
+        rest = rest[eq_index + 1 ..];
+
+        var fields = std.mem.splitScalar(u8, rest, ',');
+        const threshold = parseFloatField(fields.next() orelse continue, "threshold") orelse continue;
+        const active_block_ratio = parseFloatField(fields.next() orelse continue, "active_block_ratio") orelse continue;
+        const avg_active_blocks = parseFloatField(fields.next() orelse continue, "avg_active_blocks") orelse continue;
+        const avg_total_blocks = parseFloatField(fields.next() orelse continue, "avg_total_blocks") orelse continue;
+        try list.append(allocator, .{
+            .layer_index = layer_index,
+            .threshold = threshold,
+            .active_block_ratio = active_block_ratio,
+            .avg_active_blocks = avg_active_blocks,
+            .avg_total_blocks = avg_total_blocks,
+        });
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn buildCompiledMetadataBlob(
+    allocator: std.mem.Allocator,
+    plan: *const calibration.Plan,
+) ![]u8 {
+    var blob = std.ArrayList(u8).empty;
+    errdefer blob.deinit(allocator);
+
+    for (plan.gated_ffn_policies) |policy| {
+        if (!policy.selected) continue;
+        try blob.writer(allocator).print(
+            "gated_ffn.layer.{d}=threshold={d:.6},active_block_ratio={d:.6},avg_active_blocks={d:.3},avg_total_blocks={d:.3}\n",
+            .{
+                policy.layer_index,
+                policy.threshold,
+                policy.active_block_ratio,
+                policy.avg_active_blocks,
+                policy.avg_total_blocks,
+            },
+        );
+    }
+    return try blob.toOwnedSlice(allocator);
+}
+
+fn parseFloatField(field: []const u8, key: []const u8) ?f32 {
+    if (!std.mem.startsWith(u8, field, key)) return null;
+    if (field.len <= key.len + 1 or field[key.len] != '=') return null;
+    return std.fmt.parseFloat(f32, field[key.len + 1 ..]) catch null;
 }
 
 pub const ZiggyError = error{
