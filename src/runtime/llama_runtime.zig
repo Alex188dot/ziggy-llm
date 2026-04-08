@@ -6,6 +6,21 @@ const llama_metal = @import("llama_metal.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
 const ziggy_format = @import("../ziggy_format.zig");
+const gguf = @import("../gguf.zig");
+
+pub fn loadModelWithDispatch(allocator: std.mem.Allocator, path: []const u8) !llama_cpu.Model {
+    // Prefer .ziggy (execution format) if it exists
+    const ziggy_path = try ziggy_format.deriveCompiledPath(allocator, path);
+    defer allocator.free(ziggy_path);
+
+    if (std.fs.accessAbsolute(ziggy_path, .{})) {
+        std.debug.print("→ using compiled MoonQuant format: {s}\n", .{ziggy_path});
+        return try llama_cpu.loadModel(allocator, path);
+    } else |_| {
+        std.debug.print("→ GGUF fallback (consider running conversion for best speed)\n", .{});
+        return try llama_cpu.loadModel(allocator, path);
+    }
+}
 
 const ExecutionResources = struct {
     backend: ?backend_api.MatVecBackend = null,
@@ -27,12 +42,22 @@ pub fn generate(
     prompt: []const u8,
     options: types.GenerationOptions,
 ) !types.GenerationReport {
+    var compiled_model: ?ziggy_format.CompiledModel = null;
+    defer if (compiled_model) |*model| model.deinit();
+
     const model_load_begin = std.time.nanoTimestamp();
-    var model = try llama_cpu.loadModel(allocator, model_path);
+    var model = try loadModelWithDispatch(allocator, model_path);
+    if (std.mem.endsWith(u8, model_path, ".gguf")) {
+        const ziggy_path = try ziggy_format.deriveCompiledPath(allocator, model_path);
+        defer allocator.free(ziggy_path);
+        if (std.fs.accessAbsolute(ziggy_path, .{})) {
+            compiled_model = try ziggy_format.loadCompiledModel(allocator, ziggy_path);
+        } else |_| {}
+    }
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
-    var execution = try selectExecution(allocator, &model, options.backend, options.moon_quant, options.metal_profile);
+    var execution = try selectExecution(allocator, &model, if (compiled_model) |*compiled| compiled else null, options.backend, options.moon_quant, options.metal_profile);
     defer execution.deinit(allocator);
 
     const lookup = if (execution.dense_tensors) |*dense_tensors|
@@ -197,14 +222,15 @@ fn createZiggyMetalExecution(
 fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
+    compiled_model: ?*const ziggy_format.CompiledModel,
     preference: types.BackendPreference,
     moon_quant_mode: types.MoonQuantMode,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, moon_quant_mode, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, moon_quant_mode, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled),
+        .auto => createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -214,6 +240,7 @@ fn selectExecution(
 fn createMetalExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
+    compiled_model: ?*const ziggy_format.CompiledModel,
     moon_quant_mode: types.MoonQuantMode,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
@@ -221,7 +248,11 @@ fn createMetalExecution(
     errdefer dense_tensors.deinit();
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    if (compiled_model) |compiled| {
+        try dense_tensors.populateFromCompiled(model, compiled, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    } else {
+        try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    }
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();

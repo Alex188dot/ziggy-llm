@@ -8,6 +8,7 @@ pub const Command = enum {
     chat,
     inspect,
     compile,
+    convert, // NEW: explicit conversion command (still useful for batch scripts / CI)
     bench,
     serve,
     update,
@@ -198,6 +199,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "chat")) return .chat;
     if (std.mem.eql(u8, name, "inspect")) return .inspect;
     if (std.mem.eql(u8, name, "compile")) return .compile;
+    if (std.mem.eql(u8, name, "convert")) return .convert; // NEW: convert command
     if (std.mem.eql(u8, name, "bench")) return .bench;
     if (std.mem.eql(u8, name, "serve")) return .serve;
     if (std.mem.eql(u8, name, "update")) return .update;
@@ -218,6 +220,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  chat      Start an interactive chat session
         \\  inspect   Inspect GGUF/ZIGY metadata and support status
         \\  compile   Compile GGUF to ZIGY format (pre-packed for faster loading)
+        \\  convert   Convert GGUF to ZIGY format (alias for compile)
         \\  bench     Run benchmark routines
         \\  serve     Start the tiny HTTP server
         \\  update    Update ziggy-llm to the latest version

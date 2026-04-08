@@ -9,6 +9,17 @@ pub const q4_k_block_raw_bytes: usize = 144;
 pub const q4_k_subblocks: usize = 8;
 pub const q4_k_packed_block_bytes: usize = 160;
 
+// Q6_K block constants
+pub const q6_k_block_values: usize = 256;
+pub const q6_k_block_raw_bytes: usize = 210;
+pub const q6_k_subblocks: usize = 16;
+pub const q6_k_packed_block_bytes: usize = 224;
+
+// Q8_0 block constants
+pub const q8_0_block_values: usize = 32;
+pub const q8_0_block_raw_bytes: usize = 34;
+pub const q8_0_packed_block_bytes: usize = 36;
+
 pub const TargetFormat = enum {
     q4_k_m,
     q5_k_m,
@@ -113,6 +124,32 @@ comptime {
     std.debug.assert(@sizeOf(Q4KPackedBlock) == q4_k_packed_block_bytes);
 }
 
+// Q6_K packed block structure for Metal-friendly layout
+// Expands scales into fixed-size table for faster GPU decode
+pub const Q6KPackedBlock = extern struct {
+    d: u16,
+    scales: [q6_k_subblocks]u8,
+    ql: [128]u8, // Lower 4 bits of quants
+    qh: [64]u8, // High 2 bits packed (16 groups of 4)
+    padding: [14]u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Q6KPackedBlock) == q6_k_packed_block_bytes);
+}
+
+// Q8_0 packed block structure for Metal-friendly layout
+// Pads to 36 bytes for better memory alignment
+pub const Q8_0PackedBlock = extern struct {
+    d: u16,
+    quants: [32]i8,
+    padding: [2]u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Q8_0PackedBlock) == q8_0_packed_block_bytes);
+}
+
 pub fn classify(report: gguf.InspectReport) Profile {
     const format = detectFormat(report);
     return .{
@@ -148,6 +185,18 @@ pub fn q4KPackedRowByteLen(row_len: usize) !usize {
     if (row_len == 0 or row_len % q4_k_block_values != 0) return error.InvalidTensorMetadata;
     const block_count = row_len / q4_k_block_values;
     return std.math.mul(usize, block_count, q4_k_packed_block_bytes);
+}
+
+pub fn q6KPackedRowByteLen(row_len: usize) !usize {
+    if (row_len == 0 or row_len % q6_k_block_values != 0) return error.InvalidTensorMetadata;
+    const block_count = row_len / q6_k_block_values;
+    return std.math.mul(usize, block_count, q6_k_packed_block_bytes);
+}
+
+pub fn q8_0PackedRowByteLen(row_len: usize) !usize {
+    if (row_len == 0 or row_len % q8_0_block_values != 0) return error.InvalidTensorMetadata;
+    const block_count = row_len / q8_0_block_values;
+    return std.math.mul(usize, block_count, q8_0_packed_block_bytes);
 }
 
 const PackContext = struct {
@@ -251,6 +300,202 @@ fn packQ4KBlockInto(out: []u8, block: []const u8) void {
 
     @memcpy(block_out.quants[0..], block[16..144]);
     @memset(block_out.padding[0..], 0);
+}
+
+// Q6_K packing functions
+
+fn q6KRawRowByteLen(row_len: usize) !usize {
+    if (row_len == 0 or row_len % q6_k_block_values != 0) return error.InvalidTensorMetadata;
+    const block_count = row_len / q6_k_block_values;
+    return std.math.mul(usize, block_count, q6_k_block_raw_bytes);
+}
+
+pub fn packQ6KTensor(
+    allocator: std.mem.Allocator,
+    tensor_bytes: []const u8,
+    row_count: usize,
+    row_len: usize,
+) !PackedTensor {
+    const raw_row_size = try q6KRawRowByteLen(row_len);
+    if (tensor_bytes.len != row_count * raw_row_size) return error.InvalidTensorMetadata;
+
+    const packed_row_size = try q6KPackedRowByteLen(row_len);
+    const packed_bytes = try allocator.alloc(u8, row_count * packed_row_size);
+    errdefer allocator.free(packed_bytes);
+
+    const thread_count = @min(row_count, std.Thread.getCpuCount() catch 4);
+    const rows_per_thread = (row_count + thread_count - 1) / thread_count;
+
+    var threads = try allocator.alloc(std.Thread, thread_count);
+    defer allocator.free(threads);
+
+    var spawned: usize = 0;
+    for (0..thread_count) |i| {
+        const start = i * rows_per_thread;
+        if (start >= row_count) break;
+        const end = @min(start + rows_per_thread, row_count);
+
+        threads[spawned] = try std.Thread.spawn(.{}, packQ6KWorker, .{PackContext{
+            .tensor_bytes = tensor_bytes,
+            .packed_bytes = packed_bytes,
+            .raw_row_size = raw_row_size,
+            .packed_row_size = packed_row_size,
+            .row_len = row_len,
+            .start_row = start,
+            .end_row = end,
+        }});
+        spawned += 1;
+    }
+
+    for (threads[0..spawned]) |thread| {
+        thread.join();
+    }
+
+    return .{
+        .format = .q6_k,
+        .rows = row_count,
+        .cols = row_len,
+        .row_stride = packed_row_size,
+        .bytes = packed_bytes,
+    };
+}
+
+fn packQ6KWorker(ctx: PackContext) void {
+    for (ctx.start_row..ctx.end_row) |row_index| {
+        const raw_row = ctx.tensor_bytes[row_index * ctx.raw_row_size ..][0..ctx.raw_row_size];
+        const packed_row = ctx.packed_bytes[row_index * ctx.packed_row_size ..][0..ctx.packed_row_size];
+        packQ6KRowInto(packed_row, raw_row, ctx.row_len) catch {};
+    }
+}
+
+pub fn packQ6KRowInto(out: []u8, row: []const u8, row_len: usize) !void {
+    const raw_row_size = try q6KRawRowByteLen(row_len);
+    const packed_row_size = try q6KPackedRowByteLen(row_len);
+    if (row.len != raw_row_size or out.len != packed_row_size) return error.InvalidTensorMetadata;
+
+    const block_count = row_len / q6_k_block_values;
+    for (0..block_count) |block_index| {
+        const src = row[block_index * q6_k_block_raw_bytes ..][0..q6_k_block_raw_bytes];
+        const dst = out[block_index * q6_k_packed_block_bytes ..][0..q6_k_packed_block_bytes];
+        packQ6KBlockInto(dst, src);
+    }
+}
+
+fn packQ6KBlockInto(out: []u8, block: []const u8) void {
+    const block_out = std.mem.bytesAsValue(Q6KPackedBlock, out[0..q6_k_packed_block_bytes]);
+
+    // Read d (scale)
+    block_out.d = std.mem.readInt(u16, block[208..210], .little);
+
+    // Q6_K raw layout: ql[128], qh[64], scales[16], d[2]
+    const ql = block[0..128];
+    const qh = block[128..192];
+    const scales = block[192..208];
+
+    // Copy scales expanded
+    @memcpy(block_out.scales[0..16], scales[0..16]);
+
+    // Copy ql (lower 4 bits of each quant)
+    @memcpy(block_out.ql[0..128], ql[0..128]);
+
+    // Copy qh (high 2 bits) - already packed as 64 bytes representing 256 values
+    @memcpy(block_out.qh[0..64], qh[0..64]);
+
+    @memset(block_out.padding[0..14], 0);
+}
+
+// Q8_0 packing functions
+
+fn q8_0RawRowByteLen(row_len: usize) !usize {
+    if (row_len == 0 or row_len % q8_0_block_values != 0) return error.InvalidTensorMetadata;
+    const block_count = row_len / q8_0_block_values;
+    return std.math.mul(usize, block_count, q8_0_block_raw_bytes);
+}
+
+pub fn packQ8_0Tensor(
+    allocator: std.mem.Allocator,
+    tensor_bytes: []const u8,
+    row_count: usize,
+    row_len: usize,
+) !PackedTensor {
+    const raw_row_size = try q8_0RawRowByteLen(row_len);
+    if (tensor_bytes.len != row_count * raw_row_size) return error.InvalidTensorMetadata;
+
+    const packed_row_size = try q8_0PackedRowByteLen(row_len);
+    const packed_bytes = try allocator.alloc(u8, row_count * packed_row_size);
+    errdefer allocator.free(packed_bytes);
+
+    const thread_count = @min(row_count, std.Thread.getCpuCount() catch 4);
+    const rows_per_thread = (row_count + thread_count - 1) / thread_count;
+
+    var threads = try allocator.alloc(std.Thread, thread_count);
+    defer allocator.free(threads);
+
+    var spawned: usize = 0;
+    for (0..thread_count) |i| {
+        const start = i * rows_per_thread;
+        if (start >= row_count) break;
+        const end = @min(start + rows_per_thread, row_count);
+
+        threads[spawned] = try std.Thread.spawn(.{}, packQ8_0Worker, .{PackContext{
+            .tensor_bytes = tensor_bytes,
+            .packed_bytes = packed_bytes,
+            .raw_row_size = raw_row_size,
+            .packed_row_size = packed_row_size,
+            .row_len = row_len,
+            .start_row = start,
+            .end_row = end,
+        }});
+        spawned += 1;
+    }
+
+    for (threads[0..spawned]) |thread| {
+        thread.join();
+    }
+
+    return .{
+        .format = .q8_0,
+        .rows = row_count,
+        .cols = row_len,
+        .row_stride = packed_row_size,
+        .bytes = packed_bytes,
+    };
+}
+
+fn packQ8_0Worker(ctx: PackContext) void {
+    for (ctx.start_row..ctx.end_row) |row_index| {
+        const raw_row = ctx.tensor_bytes[row_index * ctx.raw_row_size ..][0..ctx.raw_row_size];
+        const packed_row = ctx.packed_bytes[row_index * ctx.packed_row_size ..][0..ctx.packed_row_size];
+        packQ8_0RowInto(packed_row, raw_row, ctx.row_len) catch {};
+    }
+}
+
+pub fn packQ8_0RowInto(out: []u8, row: []const u8, row_len: usize) !void {
+    const raw_row_size = try q8_0RawRowByteLen(row_len);
+    const packed_row_size = try q8_0PackedRowByteLen(row_len);
+    if (row.len != raw_row_size or out.len != packed_row_size) return error.InvalidTensorMetadata;
+
+    const block_count = row_len / q8_0_block_values;
+    for (0..block_count) |block_index| {
+        const src = row[block_index * q8_0_block_raw_bytes ..][0..q8_0_block_raw_bytes];
+        const dst = out[block_index * q8_0_packed_block_bytes ..][0..q8_0_packed_block_bytes];
+        packQ8_0BlockInto(dst, src);
+    }
+}
+
+fn packQ8_0BlockInto(out: []u8, block: []const u8) void {
+    const block_out = std.mem.bytesAsValue(Q8_0PackedBlock, out[0..q8_0_packed_block_bytes]);
+
+    // Q8_0 raw layout: d[2] (f16 scale), quants[32] (i8 values)
+    block_out.d = std.mem.readInt(u16, block[0..2], .little);
+
+    // Copy quantized values
+    for (0..32) |i| {
+        block_out.quants[i] = @as(i8, @bitCast(block[2 + i]));
+    }
+
+    // Zero padding
+    @memset(block_out.padding[0..2], 0);
 }
 
 fn detectFormat(report: gguf.InspectReport) TargetFormat {
@@ -431,4 +676,68 @@ test "pack q4_k row expands scale and min tables into a fixed-stride MoonQuant b
     try std.testing.expectEqualSlices(u8, &.{ 9, 10, 11, 12, 13, 14, 15, 1 }, block_view.mins[0..]);
     try std.testing.expectEqualSlices(u8, raw[16..144], block_view.quants[0..]);
     try std.testing.expectEqual(@as(usize, q4_k_packed_block_bytes), try q4KPackedRowByteLen(q4_k_block_values));
+}
+
+test "pack q6_k row produces fixed-stride Metal-friendly block" {
+    // Q6_K raw block layout: ql[128], qh[64], scales[16], d[2]
+    var raw: [q6_k_block_raw_bytes]u8 = undefined;
+    @memset(raw[0..], 0);
+
+    // Set scale value (f16 at offset 208-210)
+    raw[208] = 0x34;
+    raw[209] = 0x12;
+
+    // Set some scales
+    for (192..208) |i| raw[i] = @intCast(i - 191);
+
+    // Set some quantized values
+    for (0..128) |i| raw[i] = @intCast(i);
+    for (128..192) |i| raw[i] = @intCast(i - 127);
+
+    var packed_row: [q6_k_packed_block_bytes]u8 = undefined;
+    try packQ6KRowInto(packed_row[0..], raw[0..], q6_k_block_values);
+
+    const block_view = std.mem.bytesAsValue(Q6KPackedBlock, packed_row[0..q6_k_packed_block_bytes]);
+    try std.testing.expectEqual(@as(u16, 0x1234), block_view.d);
+    try std.testing.expectEqualSlices(u8, raw[192..208], block_view.scales[0..16]);
+    try std.testing.expectEqualSlices(u8, raw[0..128], block_view.ql[0..128]);
+    try std.testing.expectEqualSlices(u8, raw[128..192], block_view.qh[0..64]);
+    try std.testing.expectEqual(@as(usize, q6_k_packed_block_bytes), try q6KPackedRowByteLen(q6_k_block_values));
+}
+
+test "pack q8_0 row produces fixed-stride Metal-friendly block" {
+    // Q8_0 raw block layout: d[2] (f16), quants[32] (i8)
+    var raw: [q8_0_block_raw_bytes]u8 = undefined;
+    @memset(raw[0..], 0);
+
+    // Set scale value (f16)
+    raw[0] = 0x34;
+    raw[1] = 0x12;
+
+    // Set quantized values
+    for (0..32) |i| raw[2 + i] = @intCast(@as(i8, @intCast(i)));
+
+    var packed_row: [q8_0_packed_block_bytes]u8 = undefined;
+    try packQ8_0RowInto(packed_row[0..], raw[0..], q8_0_block_values);
+
+    const block_view = std.mem.bytesAsValue(Q8_0PackedBlock, packed_row[0..q8_0_packed_block_bytes]);
+    try std.testing.expectEqual(@as(u16, 0x1234), block_view.d);
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(i8, @intCast(i)), block_view.quants[i]);
+    }
+    try std.testing.expectEqual(@as(usize, q8_0_packed_block_bytes), try q8_0PackedRowByteLen(q8_0_block_values));
+}
+
+test "q6_k and q8_0 packed row byte length validation" {
+    // Valid row lengths
+    try std.testing.expectEqual(@as(usize, 224), try q6KPackedRowByteLen(256));
+    try std.testing.expectEqual(@as(usize, 448), try q6KPackedRowByteLen(512));
+    try std.testing.expectEqual(@as(usize, 36), try q8_0PackedRowByteLen(32));
+    try std.testing.expectEqual(@as(usize, 72), try q8_0PackedRowByteLen(64));
+
+    // Invalid row lengths should fail
+    try std.testing.expectError(error.InvalidTensorMetadata, q6KPackedRowByteLen(100));
+    try std.testing.expectError(error.InvalidTensorMetadata, q6KPackedRowByteLen(0));
+    try std.testing.expectError(error.InvalidTensorMetadata, q8_0PackedRowByteLen(33));
+    try std.testing.expectError(error.InvalidTensorMetadata, q8_0PackedRowByteLen(0));
 }

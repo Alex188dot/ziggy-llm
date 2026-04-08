@@ -2,6 +2,8 @@ const std = @import("std");
 const gguf = @import("gguf.zig");
 const moon_quant = @import("moon_quant.zig");
 const llama = @import("llama_cpu.zig");
+const calibration = @import("moon_quant_calibration.zig");
+const llama_fixture = @import("runtime/llama_fixture.zig");
 
 pub const magic = "ZIGY";
 pub const current_version: u32 = 1;
@@ -10,20 +12,122 @@ pub const default_alignment: u32 = 32;
 
 pub const CompiledLayoutKind = enum(u32) {
     q4_k_m_packed = 0,
-    q6_k_raw = 1,
-    q8_0_raw = 2,
-    f16_raw = 3,
-    f32_raw = 4,
-    generic_quant_raw = 5,
+    q4_k_s_packed = 1,
+    q5_k_m_packed = 2,
+    q5_k_s_packed = 3,
+    q6_k_raw = 4,
+    q8_0_raw = 5,
+    f16_raw = 6,
+    f32_raw = 7,
+    generic_quant_raw = 8,
 
     pub fn label(self: CompiledLayoutKind) []const u8 {
         return switch (self) {
             .q4_k_m_packed => "q4_k_m_packed",
+            .q4_k_s_packed => "q4_k_s_packed",
+            .q5_k_m_packed => "q5_k_m_packed",
+            .q5_k_s_packed => "q5_k_s_packed",
             .q6_k_raw => "q6_k_raw",
             .q8_0_raw => "q8_0_raw",
             .f16_raw => "f16_raw",
             .f32_raw => "f32_raw",
             .generic_quant_raw => "generic_quant_raw",
+        };
+    }
+};
+
+pub const KernelFamily = enum(u32) {
+    attention = 0,
+    ffn = 1,
+    output = 2,
+    embedding = 3,
+    normalization = 4,
+    other = 5,
+
+    pub fn label(self: KernelFamily) []const u8 {
+        return switch (self) {
+            .attention => "attention",
+            .ffn => "ffn",
+            .output => "output",
+            .embedding => "embedding",
+            .normalization => "normalization",
+            .other => "other",
+        };
+    }
+
+    pub fn fromTensorName(name: []const u8) KernelFamily {
+        if (std.mem.indexOf(u8, name, "attn_q") != null or
+            std.mem.indexOf(u8, name, "attn_k") != null or
+            std.mem.indexOf(u8, name, "attn_v") != null or
+            std.mem.indexOf(u8, name, "attn_output") != null) return .attention;
+        if (std.mem.indexOf(u8, name, "ffn_gate") != null or
+            std.mem.indexOf(u8, name, "ffn_up") != null or
+            std.mem.indexOf(u8, name, "ffn_down") != null) return .ffn;
+        if (std.mem.indexOf(u8, name, "output.weight") != null) return .output;
+        if (std.mem.indexOf(u8, name, "token_embd") != null) return .embedding;
+        if (std.mem.indexOf(u8, name, "norm") != null) return .normalization;
+        return .other;
+    }
+};
+
+pub const DecodeMetadata = extern struct {
+    block_size: u32,
+    type_size: u32,
+    scale_bits: u32,
+    zero_point_bits: u32,
+    reserved: [16]u8,
+
+    pub fn forLayout(layout: CompiledLayoutKind) DecodeMetadata {
+        return switch (layout) {
+            .q4_k_m_packed, .q4_k_s_packed => .{
+                .block_size = 256,
+                .type_size = 144,
+                .scale_bits = 6,
+                .zero_point_bits = 6,
+                .reserved = .{0} ** 16,
+            },
+            .q5_k_m_packed, .q5_k_s_packed => .{
+                .block_size = 256,
+                .type_size = 176,
+                .scale_bits = 6,
+                .zero_point_bits = 6,
+                .reserved = .{0} ** 16,
+            },
+            .q6_k_raw => .{
+                .block_size = 256,
+                .type_size = 210,
+                .scale_bits = 8,
+                .zero_point_bits = 0,
+                .reserved = .{0} ** 16,
+            },
+            .q8_0_raw => .{
+                .block_size = 32,
+                .type_size = 34,
+                .scale_bits = 16,
+                .zero_point_bits = 0,
+                .reserved = .{0} ** 16,
+            },
+            .f16_raw => .{
+                .block_size = 1,
+                .type_size = 2,
+                .scale_bits = 0,
+                .zero_point_bits = 0,
+                .reserved = .{0} ** 16,
+            },
+            .f32_raw => .{
+                .block_size = 1,
+                .type_size = 4,
+                .scale_bits = 0,
+                .zero_point_bits = 0,
+                .reserved = .{0} ** 16,
+            },
+            .generic_quant_raw => .{
+                .block_size = 32,
+                .type_size = 18,
+                .scale_bits = 0,
+                .zero_point_bits = 0,
+                .reserved = .{0} ** 16,
+            },
         };
     }
 };
@@ -65,38 +169,48 @@ pub const TensorRecord = extern struct {
     name_len: u32,
     original_gguf_type: u32,
     compiled_layout_kind: u32,
+    kernel_family: u32,
+    layer_index: u32, // u32 max means no layer
     rows: u64,
     cols: u64,
     byte_offset: u64,
     byte_length: u64,
     row_stride: u64,
     tile_stride: u64,
-    reserved: [16]u8,
+    decode_metadata: DecodeMetadata,
+    reserved: [8]u8,
 };
 
 pub const TensorInfo = struct {
     name: []const u8,
     original_gguf_type: gguf.TensorType,
     compiled_layout_kind: CompiledLayoutKind,
+    kernel_family: KernelFamily,
+    layer_index: ?u32,
     rows: usize,
     cols: usize,
     byte_offset: u64,
     byte_length: usize,
     row_stride: usize,
     tile_stride: usize,
+    decode_metadata: DecodeMetadata,
 
     pub fn fromRecord(allocator: std.mem.Allocator, record: TensorRecord, name_bytes: []const u8) !TensorInfo {
         const name = try allocator.dupe(u8, name_bytes);
+        const layer_index: ?u32 = if (record.layer_index == std.math.maxInt(u32)) null else record.layer_index;
         return .{
             .name = name,
             .original_gguf_type = @enumFromInt(record.original_gguf_type),
             .compiled_layout_kind = @enumFromInt(record.compiled_layout_kind),
+            .kernel_family = @enumFromInt(record.kernel_family),
+            .layer_index = layer_index,
             .rows = record.rows,
             .cols = record.cols,
             .byte_offset = record.byte_offset,
             .byte_length = record.byte_length,
             .row_stride = record.row_stride,
             .tile_stride = record.tile_stride,
+            .decode_metadata = record.decode_metadata,
         };
     }
 
@@ -148,15 +262,44 @@ pub const CompiledModel = struct {
     pub fn tensorBytes(self: *const CompiledModel, tensor: *const TensorInfo) []const u8 {
         const start = self.data_offset + tensor.byte_offset;
         const end = start + tensor.byte_length;
-        if (end > self.bytes.len) return &[]const u8{};
+        if (end > self.bytes.len) return &.{};
         return self.bytes[start..end];
     }
 };
 
 pub const CompileOptions = struct {
     repack_q4_k: bool = true,
+    repack_q6_k: bool = true,
+    repack_q8_0: bool = true,
     keep_raw_for_all: bool = false,
+    use_calibration_plan: bool = false,
+    calibration_plan: ?*const calibration.Plan = null,
 };
+
+pub const LayoutPolicy = enum {
+    // Always use the original GGUF format (no repacking)
+    passthrough,
+    // Use packed layouts for all supported formats (Q4_K, Q6_K, Q8_0)
+    packed_for_metal,
+    // Use calibration plan to determine per-tensor formats
+    calibration_based,
+};
+
+pub fn deriveCompiledPath(allocator: std.mem.Allocator, model_path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, model_path, ".ziggy")) return allocator.dupe(u8, model_path);
+    if (std.mem.endsWith(u8, model_path, ".gguf")) {
+        return std.fmt.allocPrint(allocator, "{s}.ziggy", .{model_path[0 .. model_path.len - 5]});
+    }
+    return std.fmt.allocPrint(allocator, "{s}.ziggy", .{model_path});
+}
+
+pub fn deriveSourceGgufPath(allocator: std.mem.Allocator, model_path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, model_path, ".gguf")) return allocator.dupe(u8, model_path);
+    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
+        return std.fmt.allocPrint(allocator, "{s}.gguf", .{model_path[0 .. model_path.len - 6]});
+    }
+    return allocator.dupe(u8, model_path);
+}
 
 pub fn compileFromGGUF(
     allocator: std.mem.Allocator,
@@ -170,54 +313,83 @@ pub fn compileFromGGUF(
 
     const gguf_model = try llama.loadModel(arena_allocator, gguf_path);
 
-    var builder = CompiledFileBuilder.init(arena_allocator);
+    var tensor_sources = std.ArrayList(TensorSource).empty;
+    defer tensor_sources.deinit(arena_allocator);
+
+    try appendTensorSource(arena_allocator, &tensor_sources, "token_embd.weight", gguf_model.token_embd);
+    try appendTensorSource(arena_allocator, &tensor_sources, "output.weight", gguf_model.output);
+    try appendTensorSource(arena_allocator, &tensor_sources, "output_norm.weight", gguf_model.output_norm);
+
+    for (gguf_model.layers, 0..) |layer, index| {
+        const prefix = try std.fmt.allocPrint(arena_allocator, "blk.{d}.", .{index});
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_norm.weight", layer.attn_norm);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_q.weight", layer.attn_q);
+        if (layer.attn_q_bias) |tensor| try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_q.bias", tensor);
+        if (layer.attn_q_norm) |tensor| try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_q_norm.weight", tensor);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_k.weight", layer.attn_k);
+        if (layer.attn_k_bias) |tensor| try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_k.bias", tensor);
+        if (layer.attn_k_norm) |tensor| try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_k_norm.weight", tensor);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_v.weight", layer.attn_v);
+        if (layer.attn_v_bias) |tensor| try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_v.bias", tensor);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "attn_output.weight", layer.attn_output);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "ffn_norm.weight", layer.ffn_norm);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "ffn_gate.weight", layer.ffn_gate);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "ffn_down.weight", layer.ffn_down);
+        try appendNamedTensorSource(arena_allocator, &tensor_sources, prefix, "ffn_up.weight", layer.ffn_up);
+    }
+
+    var metadata = std.ArrayList(u8).empty;
+    defer metadata.deinit(arena_allocator);
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(arena_allocator);
+
+    for (tensor_sources.items) |source| {
+        const entry = try buildTensorEntry(arena_allocator, source.name, source.tensor, &gguf_model, options);
+        const aligned_offset = alignForward(@intCast(data.items.len), default_alignment);
+        if (aligned_offset > data.items.len) {
+            try data.appendNTimes(arena_allocator, 0, @intCast(aligned_offset - data.items.len));
+        }
+
+        var record = entry.record;
+        record.byte_offset = aligned_offset;
+        record.byte_length = entry.payload.len;
+
+        try metadata.appendSlice(arena_allocator, std.mem.asBytes(&record));
+        try metadata.appendSlice(arena_allocator, source.name);
+        const aligned_metadata_len = alignForward(@intCast(metadata.items.len), 8);
+        if (aligned_metadata_len > metadata.items.len) {
+            try metadata.appendNTimes(arena_allocator, 0, @intCast(aligned_metadata_len - metadata.items.len));
+        }
+
+        try data.appendSlice(arena_allocator, entry.payload);
+    }
 
     var header = ZiggyHeader.init();
     header.architecture_len = @intCast(gguf_model.architecture.len);
-    header.tensor_count = @intCast(gguf_model.layers.len * 13 + 3);
+    header.tensor_count = @intCast(tensor_sources.items.len);
     header.metadata_count = 0;
     header.quantization_version = gguf_model.quantization_version;
     header.alignment = default_alignment;
 
+    var builder = CompiledFileBuilder.init(arena_allocator);
     try builder.writeHeader(header);
     try builder.writeArchitecture(gguf_model.architecture);
-
-    const tensor_table_start = builder.currentPos();
-    const tensor_record_size = @sizeOf(TensorRecord);
-    const tensor_table_size = tensor_record_size * header.tensor_count;
-    try builder.padTo(tensor_table_start + tensor_table_size);
-
-    const data_start = alignForward(builder.currentPos(), default_alignment);
-    try builder.padTo(data_start);
-
-    var current_offset: u64 = 0;
-    var record_index: u64 = 0;
-
-    try writeTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, "token_embd.weight", gguf_model.token_embd, &gguf_model, options);
-    try writeTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, "output.weight", gguf_model.output, &gguf_model, options);
-    try writeTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, "output_norm.weight", gguf_model.output_norm, &gguf_model, options);
-
-    for (gguf_model.layers, 0..) |layer, index| {
-        const prefix = try std.fmt.allocPrint(arena_allocator, "blk.{d}.", .{index});
-
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_norm.weight", layer.attn_norm, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_q.weight", layer.attn_q, &gguf_model, options);
-        if (layer.attn_q_bias) |t| try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_q.bias", t, &gguf_model, options);
-        if (layer.attn_q_norm) |t| try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_q_norm.weight", t, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_k.weight", layer.attn_k, &gguf_model, options);
-        if (layer.attn_k_bias) |t| try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_k.bias", t, &gguf_model, options);
-        if (layer.attn_k_norm) |t| try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_k_norm.weight", t, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_v.weight", layer.attn_v, &gguf_model, options);
-        if (layer.attn_v_bias) |t| try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_v.bias", t, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "attn_output.weight", layer.attn_output, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "ffn_norm.weight", layer.ffn_norm, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "ffn_gate.weight", layer.ffn_gate, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "ffn_down.weight", layer.ffn_down, &gguf_model, options);
-        try writeNamedTensorRecord(&builder, tensor_table_start, &record_index, &current_offset, prefix, "ffn_up.weight", layer.ffn_up, &gguf_model, options);
-    }
-
+    try builder.padTo(alignForward(builder.currentPos(), header.alignment));
+    try builder.buffer.appendSlice(arena_allocator, metadata.items);
+    try builder.padTo(alignForward(builder.currentPos(), header.alignment));
+    try builder.buffer.appendSlice(arena_allocator, data.items);
     try builder.writeToFile(output_path);
 }
+
+const TensorSource = struct {
+    name: []const u8,
+    tensor: llama.TensorRef,
+};
+
+const TensorEntry = struct {
+    record: TensorRecord,
+    payload: []const u8,
+};
 
 const CompiledFileBuilder = struct {
     allocator: std.mem.Allocator,
@@ -268,6 +440,7 @@ const CompiledFileBuilder = struct {
 fn writeNamedTensorRecord(
     builder: *CompiledFileBuilder,
     table_start: u64,
+    data_start: u64,
     record_index: *u64,
     current_offset: *u64,
     prefix: []const u8,
@@ -278,12 +451,94 @@ fn writeNamedTensorRecord(
 ) !void {
     const name = try std.mem.concat(builder.allocator, u8, &.{ prefix, suffix });
     defer builder.allocator.free(name);
-    try writeTensorRecord(builder, table_start, record_index, current_offset, name, tensor, model, options);
+    try writeTensorRecord(builder, table_start, data_start, record_index, current_offset, name, tensor, model, options);
+}
+
+fn appendTensorSource(
+    allocator: std.mem.Allocator,
+    tensor_sources: *std.ArrayList(TensorSource),
+    name: []const u8,
+    tensor: llama.TensorRef,
+) !void {
+    try tensor_sources.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .tensor = tensor,
+    });
+}
+
+fn appendNamedTensorSource(
+    allocator: std.mem.Allocator,
+    tensor_sources: *std.ArrayList(TensorSource),
+    prefix: []const u8,
+    suffix: []const u8,
+    tensor: llama.TensorRef,
+) !void {
+    const name = try std.mem.concat(allocator, u8, &.{ prefix, suffix });
+    try tensor_sources.append(allocator, .{
+        .name = name,
+        .tensor = tensor,
+    });
+}
+
+fn buildTensorEntry(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    tensor: llama.TensorRef,
+    model: *const llama.Model,
+    options: CompileOptions,
+) !TensorEntry {
+    const rows = try tensor.rowCount();
+    const cols = try tensor.rowLen();
+    const gguf_type = tensor.tensor_type;
+    const layer_index = extractLayerIndex(name);
+    const kernel_family = KernelFamily.fromTensorName(name);
+    const layout_kind = detectLayoutKind(gguf_type, name, options);
+    const tensor_bytes = try llama.tensorBytes(model, tensor);
+
+    var record = TensorRecord{
+        .name_len = @intCast(name.len),
+        .original_gguf_type = @intFromEnum(gguf_type),
+        .compiled_layout_kind = @intFromEnum(layout_kind),
+        .kernel_family = @intFromEnum(kernel_family),
+        .layer_index = layer_index orelse std.math.maxInt(u32),
+        .rows = rows,
+        .cols = cols,
+        .byte_offset = 0,
+        .byte_length = 0,
+        .row_stride = 0,
+        .tile_stride = 0,
+        .decode_metadata = DecodeMetadata.forLayout(layout_kind),
+        .reserved = .{0} ** 8,
+    };
+
+    const payload = if (layout_kind == .q4_k_m_packed and options.repack_q4_k) blk: {
+        const packed_result = try moon_quant.packQ4KTensor(allocator, tensor_bytes, rows, cols);
+        record.row_stride = moon_quant.q4_k_packed_block_bytes * (cols / moon_quant.q4_k_block_values);
+        break :blk packed_result.bytes;
+    } else if (layout_kind == .q6_k_raw and options.repack_q6_k) blk: {
+        const packed_result = try moon_quant.packQ6KTensor(allocator, tensor_bytes, rows, cols);
+        record.row_stride = moon_quant.q6_k_packed_block_bytes * (cols / moon_quant.q6_k_block_values);
+        break :blk packed_result.bytes;
+    } else if (layout_kind == .q8_0_raw and options.repack_q8_0) blk: {
+        const packed_result = try moon_quant.packQ8_0Tensor(allocator, tensor_bytes, rows, cols);
+        record.row_stride = moon_quant.q8_0_packed_block_bytes * (cols / moon_quant.q8_0_block_values);
+        break :blk packed_result.bytes;
+    } else blk: {
+        record.row_stride = try llama.tensorRowByteSize(gguf_type, cols);
+        break :blk tensor_bytes;
+    };
+    record.tile_stride = record.row_stride;
+
+    return .{
+        .record = record,
+        .payload = payload,
+    };
 }
 
 fn writeTensorRecord(
     builder: *CompiledFileBuilder,
     table_start: u64,
+    data_start: u64,
     record_index: *u64,
     current_offset: *u64,
     name: []const u8,
@@ -294,23 +549,32 @@ fn writeTensorRecord(
     const rows = try tensor.rowCount();
     const cols = try tensor.rowLen();
     const gguf_type = tensor.tensor_type;
-    const layout_kind = detectLayoutKind(gguf_type, options);
+    const layer_index = extractLayerIndex(name);
+    const kernel_family = KernelFamily.fromTensorName(name);
+    const layout_kind = detectLayoutKind(gguf_type, name, options);
 
     var record = TensorRecord{
         .name_len = @intCast(name.len),
         .original_gguf_type = @intFromEnum(gguf_type),
         .compiled_layout_kind = @intFromEnum(layout_kind),
+        .kernel_family = @intFromEnum(kernel_family),
+        .layer_index = layer_index orelse std.math.maxInt(u32),
         .rows = rows,
         .cols = cols,
         .byte_offset = current_offset.*,
         .byte_length = 0,
         .row_stride = 0,
         .tile_stride = 0,
-        .reserved = .{0} ** 16,
+        .decode_metadata = DecodeMetadata.forLayout(layout_kind),
+        .reserved = .{0} ** 8,
     };
 
     if (layout_kind == .q4_k_m_packed and options.repack_q4_k) {
         record.row_stride = moon_quant.q4_k_packed_block_bytes * (cols / moon_quant.q4_k_block_values);
+    } else if (layout_kind == .q6_k_raw and options.repack_q6_k) {
+        record.row_stride = moon_quant.q6_k_packed_block_bytes * (cols / moon_quant.q6_k_block_values);
+    } else if (layout_kind == .q8_0_raw and options.repack_q8_0) {
+        record.row_stride = moon_quant.q8_0_packed_block_bytes * (cols / moon_quant.q8_0_block_values);
     } else {
         record.row_stride = try llama.tensorRowByteSize(gguf_type, cols);
     }
@@ -324,35 +588,114 @@ fn writeTensorRecord(
         const packed_result = try moon_quant.packQ4KTensor(builder.allocator, tensor_bytes, rows, cols);
         record.byte_length = packed_result.bytes.len;
 
+        // Calculate actual data position after alignment
+        const data_offset = alignForward(builder.currentPos(), default_alignment);
+        try builder.padTo(data_offset);
+
+        // byte_offset is relative to data section start
+        record.byte_offset = data_offset - data_start;
+
         try builder.writeBytesAt(record_offset, std.mem.asBytes(&record));
         try builder.writeBytesAt(record_offset + @sizeOf(TensorRecord), name);
 
+        try builder.buffer.appendSlice(builder.allocator, packed_result.bytes);
+        current_offset.* = data_offset - data_start + packed_result.bytes.len;
+    } else if (layout_kind == .q6_k_raw and options.repack_q6_k) {
+        const packed_result = try moon_quant.packQ6KTensor(builder.allocator, tensor_bytes, rows, cols);
+        record.byte_length = packed_result.bytes.len;
+
         const data_offset = alignForward(builder.currentPos(), default_alignment);
         try builder.padTo(data_offset);
+
+        record.byte_offset = data_offset - data_start;
+
+        try builder.writeBytesAt(record_offset, std.mem.asBytes(&record));
+        try builder.writeBytesAt(record_offset + @sizeOf(TensorRecord), name);
+
         try builder.buffer.appendSlice(builder.allocator, packed_result.bytes);
-        current_offset.* += packed_result.bytes.len;
+        current_offset.* = data_offset - data_start + packed_result.bytes.len;
+    } else if (layout_kind == .q8_0_raw and options.repack_q8_0) {
+        const packed_result = try moon_quant.packQ8_0Tensor(builder.allocator, tensor_bytes, rows, cols);
+        record.byte_length = packed_result.bytes.len;
+
+        const data_offset = alignForward(builder.currentPos(), default_alignment);
+        try builder.padTo(data_offset);
+
+        record.byte_offset = data_offset - data_start;
+
+        try builder.writeBytesAt(record_offset, std.mem.asBytes(&record));
+        try builder.writeBytesAt(record_offset + @sizeOf(TensorRecord), name);
+
+        try builder.buffer.appendSlice(builder.allocator, packed_result.bytes);
+        current_offset.* = data_offset - data_start + packed_result.bytes.len;
     } else {
         const row_size = try llama.tensorRowByteSize(gguf_type, cols);
         const total_bytes = rows * row_size;
         record.byte_length = total_bytes;
 
+        const data_offset = alignForward(builder.currentPos(), default_alignment);
+        try builder.padTo(data_offset);
+
+        record.byte_offset = data_offset - data_start;
+
         try builder.writeBytesAt(record_offset, std.mem.asBytes(&record));
         try builder.writeBytesAt(record_offset + @sizeOf(TensorRecord), name);
 
-        const data_offset = alignForward(builder.currentPos(), default_alignment);
-        try builder.padTo(data_offset);
         try builder.buffer.appendSlice(builder.allocator, tensor_bytes);
-        current_offset.* += total_bytes;
+        current_offset.* = data_offset - data_start + total_bytes;
     }
 
     record_index.* += 1;
 }
 
-fn detectLayoutKind(tensor_type: llama.TensorType, options: CompileOptions) CompiledLayoutKind {
+fn extractLayerIndex(name: []const u8) ?u32 {
+    // Look for "blk.N." pattern where N is the layer index
+    const prefix = "blk.";
+    if (std.mem.indexOf(u8, name, prefix)) |start| {
+        const num_start = start + prefix.len;
+        if (num_start >= name.len) return null;
+
+        var end = num_start;
+        while (end < name.len and std.ascii.isDigit(name[end])) {
+            end += 1;
+        }
+
+        if (end > num_start) {
+            return std.fmt.parseInt(u32, name[num_start..end], 10) catch null;
+        }
+    }
+    return null;
+}
+
+fn detectLayoutKind(tensor_type: llama.TensorType, name: []const u8, options: CompileOptions) CompiledLayoutKind {
+    // If calibration-based layout policy is enabled, try to use the calibration plan
+    if (options.use_calibration_plan) {
+        if (options.calibration_plan) |plan| {
+            // Find matching entry in calibration plan
+            for (plan.entries) |entry| {
+                if (std.mem.eql(u8, entry.name, name)) {
+                    // Use the target format from calibration
+                    return switch (entry.target_format) {
+                        .q4_k_m => .q4_k_m_packed,
+                        .q5_k_m => .q5_k_m_packed,
+                        .q6_k => .q6_k_raw,
+                        .q8_0 => .q8_0_raw,
+                        .f16_reference => .f16_raw,
+                        .f32_reference => .f32_raw,
+                        .legacy_q4_k => if (options.repack_q4_k) .q4_k_m_packed else .generic_quant_raw,
+                        .legacy_q6_k => .q6_k_raw,
+                        else => .generic_quant_raw,
+                    };
+                }
+            }
+        }
+    }
+
+    // Default layout detection based on tensor type
     return switch (tensor_type) {
         .q4_k => if (options.repack_q4_k) .q4_k_m_packed else .generic_quant_raw,
-        .q6_k => .q6_k_raw,
-        .q8_0 => .q8_0_raw,
+        .q6_k => if (options.repack_q6_k) .q6_k_raw else .generic_quant_raw,
+        .q8_0 => if (options.repack_q8_0) .q8_0_raw else .generic_quant_raw,
         .f16 => .f16_raw,
         .f32 => .f32_raw,
     };
@@ -528,10 +871,39 @@ test "ZIGY magic validation rejects invalid files" {
 
     const file = try tmp.dir.createFile("bad.ziggy", .{});
     defer file.close();
-    try file.writeAll("NOTZIGY");
+    var bytes = [_]u8{0} ** @sizeOf(ZiggyHeader);
+    @memcpy(bytes[0..4], "NOPE");
+    try file.writeAll(&bytes);
 
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, "bad.ziggy");
     defer std.testing.allocator.free(path);
 
     try std.testing.expectError(error.InvalidMagic, inspectFile(std.testing.allocator, path));
+}
+
+test "compileFromGGUF writes a loadable ZIGY container" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaModelFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "fixture.gguf", fixture);
+
+    const gguf_path = try tmp.dir.realpathAlloc(std.testing.allocator, "fixture.gguf");
+    defer std.testing.allocator.free(gguf_path);
+    const ziggy_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ziggy_path);
+
+    const output_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/fixture.ziggy", .{ziggy_path});
+    defer std.testing.allocator.free(output_path);
+
+    try compileFromGGUF(std.testing.allocator, gguf_path, output_path, .{});
+
+    var model = try loadCompiledModel(std.testing.allocator, output_path);
+    defer model.deinit();
+
+    try std.testing.expectEqualStrings("llama", model.architecture);
+    try std.testing.expect(model.header.tensor_count > 0);
+    try std.testing.expect(model.getTensor("token_embd.weight") != null);
+    try std.testing.expect(model.getTensor("blk.0.attn_q.weight") != null);
 }

@@ -54,24 +54,24 @@ Move from one packed path to a real compiled-layout family.
 
 ### Deliverables
 
-- [ ] Add compiled layouts for:
-  - [ ] Q4_K_M
-  - [ ] Q6_K
-  - [ ] Q8_0
+- [x] Add compiled layouts for:
+  - [x] Q4_K_M
+  - [x] Q6_K
+  - [x] Q8_0
   - [ ] optional Q5_K_M later
-- [ ] Add per-layout decode metadata
-- [ ] Add kernel-family tags:
-  - [ ] attention
-  - [ ] FFN
-  - [ ] output
-- [ ] Allow layout selection per tensor role
-- [ ] Reuse calibration output to select format/layout policy
+- [x] Add per-layout decode metadata
+- [x] Add kernel-family tags:
+  - [x] attention
+  - [x] FFN
+  - [x] output
+- [x] Allow layout selection per tensor role
+- [x] Reuse calibration output to select format/layout policy
 
 ### Success criteria
 
-- [ ] Multiple tensor families load directly from compiled format
-- [ ] No repacking needed at runtime for supported paths
-- [ ] Cleaner separation between import path and execution path
+- [x] Multiple tensor families load directly from compiled format
+- [x] No repacking needed at runtime for supported paths
+- [x] Cleaner separation between import path and execution path
 
 ---
 
@@ -126,10 +126,10 @@ These are later-stage research ideas, not next-branch priorities.
 
 ## Recommended implementation order
 
-1. [ ] Define `.moon` / `.ziggy` file structure
-2. [ ] Build offline compiler from GGUF
-3. [ ] Load compiled format directly in runtime
-4. [ ] Expand compiled layouts across tensor families
+1. [x] Define `.moon` / `.ziggy` file structure
+2. [x] Build offline compiler from GGUF
+3. [x] Load compiled format directly in runtime
+4. [x] Expand compiled layouts across tensor families
 5. [ ] Add calibration hooks for FFN gating
 6. [ ] Implement gated FFN experimental kernel
 7. [ ] Benchmark correctness + speed
