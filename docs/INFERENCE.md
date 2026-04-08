@@ -321,6 +321,10 @@ Current implementation note:
 | 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.036 |   152.272 |  152.573 |    123.440 |
 | 2026-04-06 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |    326.123 |   184.923 |  511.118 |    126.740 |
 | 2026-04-06 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.050 |   157.499 |  157.626 |    123.711 |
+| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits       | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |    558.738 |   233.343 |  793.449 |    122.783 |
+| 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    125.010 |
+| 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     48.951 |   373.827 |  422.834 |    126.056 |
+| 2026-04-08 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.025 |   152.389 |  152.463 |    127.346 |
 
 ## Benchmark Table — Llama 3.2 3B
 

@@ -89,9 +89,20 @@ const max_matvec_helper_threads: usize = 3;
 
 fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOptions) runtime_types.EffectiveSamplingPath {
     if (!has_gpu_session) return .cpu_logits;
-    const path = runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
-    if (path == .gpu_topk_sampler and !runtime_types.canUseGpuTopKSampling(options)) return .cpu_logits;
-    return path;
+    if (options.temperature <= 0) {
+        return runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
+    }
+
+    return switch (options.sampling_strategy) {
+        .cpu_full_logits => .cpu_logits,
+        .gpu_greedy => .cpu_logits,
+        .gpu_topk_sample => if (runtime_types.canUseGpuTopKSampling(options)) .gpu_topk_sampler else .cpu_logits,
+        .gpu_shortlist => if (runtime_types.canUseGpuShortlistSampling(options)) .gpu_shortlist_cpu_sampler else .cpu_logits,
+        .auto => if (runtime_types.canUseGpuShortlistSampling(options))
+            .gpu_shortlist_cpu_sampler
+        else
+            .cpu_logits,
+    };
 }
 
 const ValueType = enum(u32) {

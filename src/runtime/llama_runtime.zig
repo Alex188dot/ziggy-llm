@@ -57,7 +57,15 @@ pub fn generate(
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
-    var execution = try selectExecution(allocator, &model, if (compiled_model) |*compiled| compiled else null, options.backend, options.moon_quant, options.metal_profile);
+    var execution = try selectExecution(
+        allocator,
+        &model,
+        if (compiled_model) |*compiled| compiled else null,
+        options.backend,
+        options.moon_quant,
+        options.metal_profile,
+        .off,
+    );
     defer execution.deinit(allocator);
 
     const lookup = if (execution.dense_tensors) |*dense_tensors|
@@ -127,7 +135,15 @@ pub fn generateZiggy(
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
     defer model.deinit(allocator);
 
-    var execution = try selectExecution(allocator, &model, &compiled_model, options.backend, options.moon_quant, options.metal_profile);
+    var execution = try selectExecution(
+        allocator,
+        &model,
+        &compiled_model,
+        options.backend,
+        options.moon_quant,
+        options.metal_profile,
+        .off,
+    );
     defer execution.deinit(allocator);
 
     const lookup = if (execution.dense_tensors) |*dense_tensors|
@@ -190,11 +206,12 @@ fn selectExecution(
     preference: types.BackendPreference,
     moon_quant_mode: types.MoonQuantMode,
     startup_profile_enabled: bool,
+    metal_prewarm_mode: types.MetalPrewarmMode,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled, metal_prewarm_mode),
+        .auto => createMetalExecution(allocator, model, compiled_model, moon_quant_mode, startup_profile_enabled, metal_prewarm_mode) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -207,6 +224,7 @@ fn createMetalExecution(
     compiled_model: ?*const ziggy_format.CompiledModel,
     moon_quant_mode: types.MoonQuantMode,
     startup_profile_enabled: bool,
+    metal_prewarm_mode: types.MetalPrewarmMode,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
@@ -223,9 +241,11 @@ fn createMetalExecution(
     const backend = try metal_backend.create(allocator);
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
-    const metal_prewarm_begin = std.time.nanoTimestamp();
-    try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
-    const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    const metal_prewarm_ns = if (metal_prewarm_mode == .on) blk: {
+        const metal_prewarm_begin = std.time.nanoTimestamp();
+        try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
+        break :blk types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());
+    } else 0;
     const startup_profile_summary = if (startup_profiler.enabled) try startup_profiler.renderSummary(allocator) else null;
 
     return .{

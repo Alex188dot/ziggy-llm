@@ -161,6 +161,11 @@ pub const GenerationOptions = struct {
     sampling_strategy: SamplingStrategy = .auto,
 };
 
+pub const MetalPrewarmMode = enum {
+    off,
+    on,
+};
+
 pub const StartupBreakdown = struct {
     model_load_ns: u64 = 0,
     tensor_prepare_ns: u64 = 0,
@@ -221,8 +226,18 @@ pub fn resolveSamplingPath(has_gpu_session: bool, temperature: f32, strategy: Sa
 }
 
 pub fn canUseGpuTopKSampling(options: GenerationOptions) bool {
-    _ = options;
-    return false;
+    return options.temperature > 0 and
+        options.top_k > 0 and
+        options.top_k <= 64 and
+        options.repeat_penalty <= 1.0 and
+        options.top_p >= 1.0 and
+        options.min_p <= 0.0;
+}
+
+pub fn canUseGpuShortlistSampling(options: GenerationOptions) bool {
+    return options.temperature > 0 and
+        options.top_k > 0 and
+        options.top_k <= 64;
 }
 
 pub fn readbackModeFor(backend: BackendUsed, sampling_path: EffectiveSamplingPath) ReadbackMode {
@@ -256,9 +271,16 @@ test "resolveSamplingPath keeps cpu backend on cpu logits and leaves gpu shortli
 
 test "canUseGpuTopKSampling only accepts simple stochastic policy" {
     try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7 }));
-    try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .top_k = 8 }));
+    try std.testing.expect(canUseGpuTopKSampling(.{ .temperature = 0.7, .top_k = 8 }));
     try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .repeat_penalty = 1.1 }));
     try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .top_p = 0.9 }));
     try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .min_p = 0.1 }));
     try std.testing.expect(!canUseGpuTopKSampling(.{ .temperature = 0.7, .top_k = 128 }));
+}
+
+test "canUseGpuShortlistSampling accepts exact top-k bounded stochastic policy" {
+    try std.testing.expect(!canUseGpuShortlistSampling(.{ .temperature = 0.7 }));
+    try std.testing.expect(canUseGpuShortlistSampling(.{ .temperature = 0.7, .top_k = 8 }));
+    try std.testing.expect(canUseGpuShortlistSampling(.{ .temperature = 0.7, .top_k = 8, .repeat_penalty = 1.2, .top_p = 0.9, .min_p = 0.1 }));
+    try std.testing.expect(!canUseGpuShortlistSampling(.{ .temperature = 0.7, .top_k = 128 }));
 }
