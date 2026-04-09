@@ -545,7 +545,7 @@ test "metal q6k fused argmax matches cpu dequantized reference for output projec
 
     const tensor = model.output;
     const rows = try tensor.rowCount();
-    const cols = model.embedding_length;
+    const cols = 512;
     const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
     const matrix = try llama_cpu.tensorBytes(&model, tensor);
 

@@ -104,6 +104,69 @@ kernel void store_kv_half(
     dst[dst_offset + index] = half(src[index]);
 }
 
+kernel void pack_kv_half_f32(
+    device const float *k_src [[buffer(0)]],
+    device const float *v_src [[buffer(1)]],
+    device half *k_dst [[buffer(2)]],
+    device half *v_dst [[buffer(3)]],
+    constant uint &dst_base [[buffer(4)]],
+    constant uint &head_count [[buffer(5)]],
+    constant uint &head_dim [[buffer(6)]],
+    constant uint &pair_count [[buffer(7)]],
+    constant uint &position [[buffer(8)]],
+    constant float &freq_base [[buffer(9)]],
+    constant uint &rope_style [[buffer(10)]],
+    uint index [[thread_position_in_grid]]
+) {
+    const uint total_values = head_count * head_dim;
+    if (index >= total_values) return;
+
+    const uint head = index / head_dim;
+    const uint dim = index % head_dim;
+    const uint dst_index = dst_base + index;
+    v_dst[dst_index] = half(v_src[index]);
+
+    if (pair_count == 0 || dim >= pair_count * 2) {
+        k_dst[dst_index] = half(k_src[index]);
+        return;
+    }
+
+    float result = 0.0f;
+    if (rope_style == 0) {
+        const uint pair = dim / 2;
+        const uint base = head * head_dim + pair * 2;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = k_src[base];
+        const float x1 = k_src[base + 1];
+
+        if ((dim & 1) == 0) {
+            result = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            result = x0 * sin_theta + x1 * cos_theta;
+        }
+    } else {
+        const uint pair = dim % pair_count;
+        const bool is_first_half = dim < pair_count;
+        const uint base = head * head_dim;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = k_src[base + pair];
+        const float x1 = k_src[base + pair + pair_count];
+
+        if (is_first_half) {
+            result = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            result = x0 * sin_theta + x1 * cos_theta;
+        }
+    }
+    k_dst[dst_index] = half(result);
+}
+
 #define ZIGGY_DENSE_MATVEC_ADD_KERNEL(NAME, STATIC_COLS) \
 kernel void NAME( \
     device const float *matrix [[buffer(0)]], \
@@ -418,6 +481,162 @@ ZIGGY_Q4K_DUAL_KERNEL(matvec_q4k_dual_2048_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_0)
 ZIGGY_Q4K_DUAL_KERNEL(matvec_q4k_dual_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
 
 #undef ZIGGY_Q4K_DUAL_KERNEL
+
+#define ZIGGY_Q4K_DUAL_KV_HALF_KERNEL(NAME, STATIC_COLS) \
+kernel void NAME( \
+    device const uchar *matrix_k [[buffer(0)]], \
+    device const uchar *matrix_v [[buffer(1)]], \
+    device const float *input [[buffer(2)]], \
+    device half *k_cache [[buffer(3)]], \
+    device half *v_cache [[buffer(4)]], \
+    constant uint &dst_base [[buffer(5)]], \
+    constant uint &head_count [[buffer(6)]], \
+    constant uint &head_dim [[buffer(7)]], \
+    constant uint &pair_count [[buffer(8)]], \
+    constant uint &cols [[buffer(9)]], \
+    constant uint &position [[buffer(10)]], \
+    constant float &freq_base [[buffer(11)]], \
+    uint row_pair [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]], \
+    uint simd_lane [[thread_index_in_simdgroup]], \
+    uint simd_group [[simdgroup_index_in_threadgroup]], \
+    uint threads_per_group [[threads_per_threadgroup]], \
+    uint threads_per_simdgroup [[threads_per_simdgroup]] \
+) { \
+    if (row_pair >= head_count * pair_count) return; \
+    constexpr uint kStaticCols = STATIC_COLS; \
+    const uint effective_cols = kStaticCols == 0 ? cols : kStaticCols; \
+    if (kStaticCols != 0 && cols != kStaticCols) return; \
+    const uint head = row_pair / pair_count; \
+    const uint pair = row_pair % pair_count; \
+    const uint row0 = head * head_dim + pair * 2; \
+    const uint row1 = row0 + 1; \
+    const uint blocks_per_row = effective_cols / ZIGGY_Q4K_VALUES_PER_BLOCK; \
+    const uint row_stride = blocks_per_row * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+    const device uchar *k_row_bytes0 = matrix_k + row0 * row_stride; \
+    const device uchar *k_row_bytes1 = matrix_k + row1 * row_stride; \
+    const device uchar *v_row_bytes0 = matrix_v + row0 * row_stride; \
+    const device uchar *v_row_bytes1 = matrix_v + row1 * row_stride; \
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+    threadgroup float partial_k0[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    threadgroup float partial_k1[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    threadgroup float partial_v0[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    threadgroup float partial_v1[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
+    float local_k0 = 0.0f; \
+    float local_k1 = 0.0f; \
+    float local_v0 = 0.0f; \
+    float local_v1 = 0.0f; \
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) { \
+        const uint block_group_index = chunk_index / ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint chunk_in_group = chunk_index % ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP; \
+        const uint block_index = block_group_index / ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint group = block_group_index % ZIGGY_Q4K_GROUPS_PER_BLOCK; \
+        const uint q_offset = chunk_in_group * 4; \
+        const uint input_offset = block_index * ZIGGY_Q4K_VALUES_PER_BLOCK + group * ZIGGY_Q4K_VALUES_PER_GROUP + q_offset; \
+        const float4 input_low = float4(input[input_offset + 0], input[input_offset + 1], input[input_offset + 2], input[input_offset + 3]); \
+        const float4 input_high = float4(input[input_offset + 32 + 0], input[input_offset + 32 + 1], input[input_offset + 32 + 2], input[input_offset + 32 + 3]); \
+        const uint scale_index = group * 2; \
+        { \
+            const device uchar *block = k_row_bytes0 + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+            const float d = read_half_le(block, 0); \
+            const float dmin = read_half_le(block, 2); \
+            const device uchar *scales = block + 4; \
+            const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+            const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+            const uchar4 low_q = packed & uchar4(0x0F); \
+            const uchar4 high_q = packed >> 4; \
+            const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+            const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+            const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+            const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+            local_k0 += dot(float4(low_q) * d1 - float4(m1), input_low); \
+            local_k0 += dot(float4(high_q) * d2 - float4(m2), input_high); \
+        } \
+        { \
+            const device uchar *block = k_row_bytes1 + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+            const float d = read_half_le(block, 0); \
+            const float dmin = read_half_le(block, 2); \
+            const device uchar *scales = block + 4; \
+            const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+            const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+            const uchar4 low_q = packed & uchar4(0x0F); \
+            const uchar4 high_q = packed >> 4; \
+            const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+            const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+            const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+            const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+            local_k1 += dot(float4(low_q) * d1 - float4(m1), input_low); \
+            local_k1 += dot(float4(high_q) * d2 - float4(m2), input_high); \
+        } \
+        { \
+            const device uchar *block = v_row_bytes0 + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+            const float d = read_half_le(block, 0); \
+            const float dmin = read_half_le(block, 2); \
+            const device uchar *scales = block + 4; \
+            const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+            const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+            const uchar4 low_q = packed & uchar4(0x0F); \
+            const uchar4 high_q = packed >> 4; \
+            const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+            const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+            const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+            const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+            local_v0 += dot(float4(low_q) * d1 - float4(m1), input_low); \
+            local_v0 += dot(float4(high_q) * d2 - float4(m2), input_high); \
+        } \
+        { \
+            const device uchar *block = v_row_bytes1 + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK; \
+            const float d = read_half_le(block, 0); \
+            const float dmin = read_half_le(block, 2); \
+            const device uchar *scales = block + 4; \
+            const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset; \
+            const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+            const uchar4 low_q = packed & uchar4(0x0F); \
+            const uchar4 high_q = packed >> 4; \
+            const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+            const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+            const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+            const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+            local_v1 += dot(float4(low_q) * d1 - float4(m1), input_low); \
+            local_v1 += dot(float4(high_q) * d2 - float4(m2), input_high); \
+        } \
+    } \
+    const float sum_k0 = simd_sum(local_k0); \
+    const float sum_k1 = simd_sum(local_k1); \
+    const float sum_v0 = simd_sum(local_v0); \
+    const float sum_v1 = simd_sum(local_v1); \
+    if (simd_lane == 0) { \
+        partial_k0[simd_group] = sum_k0; \
+        partial_k1[simd_group] = sum_k1; \
+        partial_v0[simd_group] = sum_v0; \
+        partial_v1[simd_group] = sum_v1; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (lane == 0) { \
+        float k0 = 0.0f, k1 = 0.0f, v0 = 0.0f, v1 = 0.0f; \
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup; \
+        for (uint index = 0; index < simd_group_count; index += 1) { \
+            k0 += partial_k0[index]; \
+            k1 += partial_k1[index]; \
+            v0 += partial_v0[index]; \
+            v1 += partial_v1[index]; \
+        } \
+        const float exponent = float(pair * 2) / float(pair_count * 2); \
+        const float theta = float(position) / pow(freq_base, exponent); \
+        const float cos_theta = cos(theta); \
+        const float sin_theta = sin(theta); \
+        k_cache[dst_base + row0] = half(k0 * cos_theta - k1 * sin_theta); \
+        k_cache[dst_base + row1] = half(k0 * sin_theta + k1 * cos_theta); \
+        v_cache[dst_base + row0] = half(v0); \
+        v_cache[dst_base + row1] = half(v1); \
+    } \
+}
+
+ZIGGY_Q4K_DUAL_KV_HALF_KERNEL(matvec_q4k_dual_kv_half_f32, 0)
+ZIGGY_Q4K_DUAL_KV_HALF_KERNEL(matvec_q4k_dual_kv_half_2048_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_0)
+ZIGGY_Q4K_DUAL_KV_HALF_KERNEL(matvec_q4k_dual_kv_half_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
+
+#undef ZIGGY_Q4K_DUAL_KV_HALF_KERNEL
 
 kernel void matvec_q6k_f32(
     device const uchar *matrix [[buffer(0)]],

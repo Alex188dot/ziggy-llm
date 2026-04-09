@@ -252,7 +252,10 @@ pub const Session = struct {
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
         const kv_k_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_k, self.normed, self.k);
+        if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
+            try self.runProjection(layer.attn_k, self.normed, self.k);
+            try self.runProjection(layer.attn_v, self.normed, self.v);
+        }
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
         if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
         try metal_backend.applyRoPEToHalfDst(
@@ -281,7 +284,6 @@ pub const Session = struct {
         });
 
         const kv_v_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_v, self.normed, self.v);
         if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
         try metal_backend.storeKvHalf(
             self.backend,
@@ -296,7 +298,6 @@ pub const Session = struct {
             .depth = layer_index,
             .extra = position + 1,
         });
-
         const attention_start = std.time.nanoTimestamp();
         try metal_backend.attentionFused(
             self.backend,
@@ -695,6 +696,65 @@ pub const Session = struct {
         return true;
     }
 
+    fn runFusedKvFanout(
+        self: *Session,
+        k_tensor: TensorDesc,
+        v_tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        k_output: metal_backend.BufferHandle,
+        v_output: metal_backend.BufferHandle,
+    ) !bool {
+        if (k_tensor.tensor_type != 12 or v_tensor.tensor_type != 12) return false;
+        if (k_tensor.rows != v_tensor.rows or k_tensor.cols != v_tensor.cols) return false;
+
+        if (self.dense_lookup.getMoonQuant(k_tensor.offset)) |k_matrix| {
+            const v_matrix = self.dense_lookup.getMoonQuant(v_tensor.offset) orelse return false;
+            const start = std.time.nanoTimestamp();
+            try metal_backend.runMatVecMoonQuantQ4KDualToBuffers(
+                self.backend,
+                k_matrix,
+                v_matrix,
+                input,
+                k_output,
+                v_output,
+                k_tensor.rows,
+                k_tensor.cols,
+            );
+            const shape = metal_profile.ShapeDesc{
+                .rows = k_tensor.rows,
+                .cols = k_tensor.cols,
+                .tensor_type = k_tensor.tensor_type,
+                .extra = 2,
+            };
+            self.recordCategoryWithShape(.projection_quantized, start, shape);
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+            return true;
+        }
+
+        const k_matrix = self.dense_lookup.getRaw(k_tensor.offset) orelse return false;
+        const v_matrix = self.dense_lookup.getRaw(v_tensor.offset) orelse return false;
+        const start = std.time.nanoTimestamp();
+        try metal_backend.runMatVecQ4KDualToBuffers(
+            self.backend,
+            k_matrix,
+            v_matrix,
+            input,
+            k_output,
+            v_output,
+            k_tensor.rows,
+            k_tensor.cols,
+        );
+        self.recordCategoryWithShape(.projection_quantized, start, .{
+            .rows = k_tensor.rows,
+            .cols = k_tensor.cols,
+            .tensor_type = k_tensor.tensor_type,
+            .extra = 2,
+        });
+        return true;
+    }
+
     fn runProjectionToDst(
         self: *Session,
         tensor: TensorDesc,
@@ -882,7 +942,10 @@ pub const Session = struct {
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
                 const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-                try self.runProjection(layer.attn_k, self.normed, self.k);
+                if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
+                    try self.runProjection(layer.attn_k, self.normed, self.k);
+                    try self.runProjection(layer.attn_v, self.normed, self.v);
+                }
                 try metal_backend.applyRoPEToHalfDst(
                     self.backend,
                     self.k,
@@ -896,7 +959,6 @@ pub const Session = struct {
                     self.model.rope_style,
                 );
 
-                try self.runProjection(layer.attn_v, self.normed, self.v);
                 try metal_backend.storeKvHalf(
                     self.backend,
                     self.v,

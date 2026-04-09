@@ -307,6 +307,41 @@ pub fn storeKvHalf(
     ), &error_buf);
 }
 
+pub fn packKvHalf(
+    backend: backend_api.MatVecBackend,
+    k_src: BufferHandle,
+    v_src: BufferHandle,
+    k_dst: BufferHandle,
+    v_dst: BufferHandle,
+    dst_offset_elements: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_pack_kv_half_f32(
+        state.context,
+        k_src.raw,
+        v_src.raw,
+        k_dst.raw,
+        v_dst.raw,
+        @intCast(dst_offset_elements),
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        rope_style,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (!buffer.host_visible) return error.MetalBufferError;
@@ -1495,6 +1530,47 @@ pub fn runMatVecQ4KDualToBuffers(
         output1.raw,
         @intCast(rows),
         @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ4KDualKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_k_bytes: []const u8,
+    matrix_v_bytes: []const u8,
+    input: BufferHandle,
+    k_cache: BufferHandle,
+    v_cache: BufferHandle,
+    dst_offset_elements: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    cols: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_k_buffer = try state.rawBuffer(matrix_k_bytes);
+    const matrix_v_buffer = try state.rawBuffer(matrix_v_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_dual_kv_half_f32(
+        state.context,
+        matrix_k_buffer.raw,
+        matrix_v_buffer.raw,
+        input.raw,
+        k_cache.raw,
+        v_cache.raw,
+        dst_offset_elements,
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(cols),
+        @intCast(position),
+        freq_base,
+        rope_style,
         &error_buf,
         error_buf.len,
     ), &error_buf);

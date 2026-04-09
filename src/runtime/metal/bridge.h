@@ -395,6 +395,23 @@ int ziggy_metal_store_kv_half(
     size_t error_message_len
 );
 
+int ziggy_metal_pack_kv_half_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *k_src,
+    const ZiggyMetalBuffer *v_src,
+    ZiggyMetalBuffer *k_dst,
+    ZiggyMetalBuffer *v_dst,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_apply_rope_to_half_dst_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *src,
@@ -615,6 +632,25 @@ int ziggy_metal_run_matvec_q4k_dual_f32(
     ZiggyMetalBuffer *output1,
     uint32_t rows,
     uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_q4k_dual_kv_half_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_k,
+    const ZiggyMetalBuffer *matrix_v,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *v_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
     char *error_message,
     size_t error_message_len
 );
