@@ -61,6 +61,13 @@ int ziggy_metal_create_empty_buffer(
     char *error_message,
     size_t error_message_len
 );
+int ziggy_metal_create_empty_buffer_private(
+    ZiggyMetalContext *ctx,
+    size_t length,
+    ZiggyMetalBuffer **out_buffer,
+    char *error_message,
+    size_t error_message_len
+);
 void ziggy_metal_destroy_buffer(ZiggyMetalBuffer *buffer);
 size_t ziggy_metal_buffer_length(const ZiggyMetalBuffer *buffer);
 

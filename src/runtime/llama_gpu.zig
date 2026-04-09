@@ -95,6 +95,7 @@ pub const Session = struct {
     gate: metal_backend.BufferHandle,
     up: metal_backend.BufferHandle,
     tmp: metal_backend.BufferHandle,
+    logits_readback: metal_backend.BufferHandle,
     sampled_token: metal_backend.BufferHandle,
     sampled_token_packed: metal_backend.BufferHandle,
     shortlist_entries: metal_backend.BufferHandle,
@@ -123,38 +124,40 @@ pub const Session = struct {
         const cache_len = model.block_count * model.context_length * model.kv_dimension;
         const hidden = try metal_backend.createScratchBuffer(backend, max_input);
         errdefer metal_backend.destroyBuffer(hidden);
-        const normed = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        const normed = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(normed);
-        const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        const q = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
-        const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        const k = try metal_backend.createGpuScratchBuffer(backend, model.kv_dimension);
         errdefer metal_backend.destroyBuffer(k);
-        const v = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        const v = try metal_backend.createGpuScratchBuffer(backend, model.kv_dimension);
         errdefer metal_backend.destroyBuffer(v);
-        const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        const attn = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(attn);
-        const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        const gate = try metal_backend.createGpuScratchBuffer(backend, model.feed_forward_length);
         errdefer metal_backend.destroyBuffer(gate);
-        const up = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        const up = try metal_backend.createGpuScratchBuffer(backend, model.feed_forward_length);
         errdefer metal_backend.destroyBuffer(up);
-        const tmp = try metal_backend.createScratchBuffer(backend, max_vec);
+        const tmp = try metal_backend.createGpuScratchBuffer(backend, max_vec);
         errdefer metal_backend.destroyBuffer(tmp);
+        const logits_readback = try metal_backend.createScratchBuffer(backend, model.vocab_size);
+        errdefer metal_backend.destroyBuffer(logits_readback);
         const sampled_token = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(sampled_token);
         const sampled_token_packed = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(sampled_token_packed);
         const shortlist_entries = try metal_backend.createByteScratchBuffer(backend, max_shortlist_len * @sizeOf(metal_backend.ShortlistEntry));
         errdefer metal_backend.destroyBuffer(shortlist_entries);
-        const k_cache = try metal_backend.createByteScratchBuffer(backend, cache_len * @sizeOf(f16));
+        const k_cache = try metal_backend.createGpuByteScratchBuffer(backend, cache_len * @sizeOf(f16));
         errdefer metal_backend.destroyBuffer(k_cache);
-        const v_cache = try metal_backend.createByteScratchBuffer(backend, cache_len * @sizeOf(f16));
+        const v_cache = try metal_backend.createGpuByteScratchBuffer(backend, cache_len * @sizeOf(f16));
         errdefer metal_backend.destroyBuffer(v_cache);
-        const batch_logits = try metal_backend.createScratchBuffer(backend, max_draft_len * model.vocab_size);
+        const batch_logits = try metal_backend.createGpuScratchBuffer(backend, max_draft_len * model.vocab_size);
         errdefer metal_backend.destroyBuffer(batch_logits);
         const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(batch_tokens);
         const ffn_block_count = std.math.divCeil(usize, model.feed_forward_length, 256) catch unreachable;
-        const ffn_block_mask = try metal_backend.createByteScratchBuffer(backend, ffn_block_count * @sizeOf(u32));
+        const ffn_block_mask = try metal_backend.createGpuByteScratchBuffer(backend, ffn_block_count * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(ffn_block_mask);
         const ffn_gate_stats = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(ffn_gate_stats);
@@ -172,6 +175,7 @@ pub const Session = struct {
             .gate = gate,
             .up = up,
             .tmp = tmp,
+            .logits_readback = logits_readback,
             .sampled_token = sampled_token,
             .sampled_token_packed = sampled_token_packed,
             .shortlist_entries = shortlist_entries,
@@ -197,6 +201,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.gate);
         metal_backend.destroyBuffer(self.up);
         metal_backend.destroyBuffer(self.tmp);
+        metal_backend.destroyBuffer(self.logits_readback);
         metal_backend.destroyBuffer(self.sampled_token);
         metal_backend.destroyBuffer(self.sampled_token_packed);
         metal_backend.destroyBuffer(self.shortlist_entries);
@@ -380,13 +385,21 @@ pub const Session = struct {
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
+        try metal_backend.copyBufferRegion(
+            self.backend,
+            self.tmp,
+            0,
+            self.logits_readback,
+            0,
+            out.len * @sizeOf(f32),
+        );
         const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = out.len,
         };
         try self.commitOutputSequence(shape);
         const host_readback_start = std.time.nanoTimestamp();
-        try metal_backend.readBufferF32(self.tmp, out);
+        try metal_backend.readBufferF32(self.logits_readback, out);
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
     }
 

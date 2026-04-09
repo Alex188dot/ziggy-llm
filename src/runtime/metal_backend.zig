@@ -18,6 +18,7 @@ const MatrixKey = struct {
 pub const BufferHandle = if (build_enabled_value) struct {
     raw: *c.ZiggyMetalBuffer,
     byte_len: usize,
+    host_visible: bool,
 } else struct {};
 
 pub const ShortlistEntry = extern struct {
@@ -34,6 +35,15 @@ pub const CommitStats = struct {
 pub const GateMaskStats = struct {
     active_blocks: u32,
     total_blocks: u32,
+};
+
+pub const BufferResidency = enum {
+    cpu_visible_shared,
+    gpu_only_private,
+
+    fn hostVisible(self: BufferResidency) bool {
+        return self == .cpu_visible_shared;
+    }
 };
 
 const State = if (build_enabled_value) struct {
@@ -127,6 +137,7 @@ const State = if (build_enabled_value) struct {
         const buffer = BufferHandle{
             .raw = raw,
             .byte_len = matrix.len * @sizeOf(f32),
+            .host_visible = true,
         };
         try self.matrix_buffers.put(key, buffer);
         return buffer;
@@ -140,10 +151,11 @@ const State = if (build_enabled_value) struct {
             slot.* = null;
         }
 
-        const raw = try createEmptyBuffer(self.context, required_len);
+        const raw = try createEmptyBuffer(self.context, required_len, .cpu_visible_shared);
         const buffer = BufferHandle{
             .raw = raw,
             .byte_len = required_len,
+            .host_visible = true,
         };
         slot.* = buffer;
         return buffer;
@@ -160,6 +172,7 @@ const State = if (build_enabled_value) struct {
         const buffer = BufferHandle{
             .raw = raw,
             .byte_len = bytes.len,
+            .host_visible = true,
         };
         try self.raw_buffers.put(key, buffer);
         return buffer;
@@ -208,22 +221,48 @@ pub fn cacheRawMatrix(backend: backend_api.MatVecBackend, bytes: []const u8) !vo
 }
 
 pub fn createScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) !BufferHandle {
+    return createScratchBufferWithResidency(backend, elements, .cpu_visible_shared);
+}
+
+pub fn createGpuScratchBuffer(backend: backend_api.MatVecBackend, elements: usize) !BufferHandle {
+    return createScratchBufferWithResidency(backend, elements, .gpu_only_private);
+}
+
+pub fn createScratchBufferWithResidency(
+    backend: backend_api.MatVecBackend,
+    elements: usize,
+    residency: BufferResidency,
+) !BufferHandle {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
-    const raw = try createEmptyBuffer(state.context, elements * @sizeOf(f32));
+    const raw = try createEmptyBuffer(state.context, elements * @sizeOf(f32), residency);
     return .{
         .raw = raw,
         .byte_len = elements * @sizeOf(f32),
+        .host_visible = residency.hostVisible(),
     };
 }
 
 pub fn createByteScratchBuffer(backend: backend_api.MatVecBackend, byte_len: usize) !BufferHandle {
+    return createByteScratchBufferWithResidency(backend, byte_len, .cpu_visible_shared);
+}
+
+pub fn createGpuByteScratchBuffer(backend: backend_api.MatVecBackend, byte_len: usize) !BufferHandle {
+    return createByteScratchBufferWithResidency(backend, byte_len, .gpu_only_private);
+}
+
+pub fn createByteScratchBufferWithResidency(
+    backend: backend_api.MatVecBackend,
+    byte_len: usize,
+    residency: BufferResidency,
+) !BufferHandle {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
-    const raw = try createEmptyBuffer(state.context, byte_len);
+    const raw = try createEmptyBuffer(state.context, byte_len, residency);
     return .{
         .raw = raw,
         .byte_len = byte_len,
+        .host_visible = residency.hostVisible(),
     };
 }
 
@@ -234,12 +273,14 @@ pub fn destroyBuffer(buffer: BufferHandle) void {
 
 pub fn writeBufferF32(buffer: BufferHandle, values: []const f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (values.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
     try writeBuffer(buffer.raw, values);
 }
 
 pub fn writeBufferF16(buffer: BufferHandle, values: []const f16) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (values.len * @sizeOf(f16) > buffer.byte_len) return error.MetalBufferError;
     try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
 }
@@ -267,30 +308,35 @@ pub fn storeKvHalf(
 
 pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (out.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
     try readBuffer(buffer.raw, out);
 }
 
 pub fn readBufferU32(buffer: BufferHandle, out: []u32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (out.len * @sizeOf(u32) > buffer.byte_len) return error.MetalBufferError;
     try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
 }
 
 pub fn writeBufferU32(buffer: BufferHandle, values: []const u32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (values.len * @sizeOf(u32) > buffer.byte_len) return error.MetalBufferError;
     try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
 }
 
 pub fn writeBufferU64(buffer: BufferHandle, values: []const u64) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (values.len * @sizeOf(u64) > buffer.byte_len) return error.MetalBufferError;
     try writeBufferBytes(buffer.raw, std.mem.sliceAsBytes(values));
 }
 
 pub fn readBufferU64(buffer: BufferHandle, out: []u64) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (out.len * @sizeOf(u64) > buffer.byte_len) return error.MetalBufferError;
     try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
 }
@@ -1205,6 +1251,7 @@ pub fn sampleTopK(
 
 pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
     if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
     if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;
     try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
 }
@@ -1436,16 +1483,25 @@ fn createRawBuffer(context: *c.ZiggyMetalContext, bytes: []const u8) !*c.ZiggyMe
     return raw.?;
 }
 
-fn createEmptyBuffer(context: *c.ZiggyMetalContext, byte_len: usize) !*c.ZiggyMetalBuffer {
+fn createEmptyBuffer(context: *c.ZiggyMetalContext, byte_len: usize, residency: BufferResidency) !*c.ZiggyMetalBuffer {
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     var raw: ?*c.ZiggyMetalBuffer = null;
-    const status = c.ziggy_metal_create_empty_buffer(
-        context,
-        byte_len,
-        &raw,
-        &error_buf,
-        error_buf.len,
-    );
+    const status = switch (residency) {
+        .cpu_visible_shared => c.ziggy_metal_create_empty_buffer(
+            context,
+            byte_len,
+            &raw,
+            &error_buf,
+            error_buf.len,
+        ),
+        .gpu_only_private => c.ziggy_metal_create_empty_buffer_private(
+            context,
+            byte_len,
+            &raw,
+            &error_buf,
+            error_buf.len,
+        ),
+    };
     try mapStatus(status, &error_buf);
     return raw.?;
 }

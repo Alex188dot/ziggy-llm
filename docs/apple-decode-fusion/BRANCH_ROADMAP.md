@@ -87,18 +87,18 @@ Stop guessing where decode time goes.
 
 ### Deliverables
 
-- [ ] Add per-op timing instrumentation inside the Metal decode path.
-- [ ] Separate GPU execution time from CPU wait time where the Metal API allows it.
-- [ ] Attribute decode cost at least at the layer-subgraph level.
-- [ ] Add a stable benchmark report section for decode stage timings.
+- [x] Add per-op timing instrumentation inside the Metal decode path.
+- [x] Separate GPU execution time from CPU wait time where the Metal API allows it.
+- [x] Attribute decode cost at least at the layer-subgraph level.
+- [x] Add a stable benchmark report section for decode stage timings.
 - [ ] Confirm whether current decode is matvec-bound, attention-bound, or synchronization-bound on:
-- [ ] TinyLlama 1.1B Q4_K_M
+- [x] TinyLlama 1.1B Q4_K_M
 - [ ] Llama 3.2 3B Q4_K_M
 
 ### Success criteria
 
-- [ ] We can rank the top decode bottlenecks with measured evidence.
-- [ ] We know whether launch overhead and readback overhead are large enough to justify deeper fusion work.
+- [x] We can rank the top decode bottlenecks with measured evidence.
+- [x] We know whether launch overhead and readback overhead are large enough to justify deeper fusion work.
 
 ---
 
@@ -110,15 +110,15 @@ Reduce bytes moved and resource churn before deeper kernel work.
 
 ### Deliverables
 
-- [ ] Audit which decode-path buffers remain host-visible by default and which can be made more GPU-friendly.
-- [ ] Reuse scratch buffers, pipeline state, and encoder setup more aggressively across tokens.
-- [ ] Remove avoidable per-token resource setup in the llama Metal runtime.
-- [ ] Keep more decode intermediates resident on GPU through the token step.
-- [ ] Measure whether logits readback volume can be reduced before CPU sampling.
+- [x] Audit which decode-path buffers remain host-visible by default and which can be made more GPU-friendly.
+- [x] Reuse scratch buffers, pipeline state, and encoder setup more aggressively across tokens.
+- [x] Remove avoidable per-token resource setup in the llama Metal runtime.
+- [x] Keep more decode intermediates resident on GPU through the token step.
+- [x] Measure whether logits readback volume can be reduced before CPU sampling.
 
 ### Success criteria
 
-- [ ] Lower CPU-side decode overhead without correctness regressions.
+- [x] Lower CPU-side decode overhead without correctness regressions.
 - [ ] Lower command-buffer or encoder churn measurably on the canonical benchmark runs.
 
 ---

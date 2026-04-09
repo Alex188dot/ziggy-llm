@@ -73,6 +73,7 @@
 @interface ZiggyMetalBufferState : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
 @property(nonatomic) size_t length;
+@property(nonatomic) bool hostVisible;
 @end
 
 @implementation ZiggyMetalBufferState
@@ -835,6 +836,7 @@ int ziggy_metal_create_buffer(
         ZiggyMetalBufferState *wrapper = [ZiggyMetalBufferState new];
         wrapper.buffer = buffer;
         wrapper.length = length;
+        wrapper.hostVisible = true;
         *out_buffer = (__bridge_retained void *)wrapper;
         return ZIGGY_METAL_OK;
     }
@@ -863,6 +865,36 @@ int ziggy_metal_create_empty_buffer(
         ZiggyMetalBufferState *wrapper = [ZiggyMetalBufferState new];
         wrapper.buffer = buffer;
         wrapper.length = length;
+        wrapper.hostVisible = true;
+        *out_buffer = (__bridge_retained void *)wrapper;
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_create_empty_buffer_private(
+    ZiggyMetalContext *ctx,
+    size_t length,
+    ZiggyMetalBuffer **out_buffer,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || out_buffer == NULL || length == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid private Metal buffer creation request");
+        return ZIGGY_METAL_BUFFER_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        id<MTLBuffer> buffer = [state.device newBufferWithLength:length options:MTLResourceStorageModePrivate];
+        if (buffer == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to allocate private Metal buffer");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        ZiggyMetalBufferState *wrapper = [ZiggyMetalBufferState new];
+        wrapper.buffer = buffer;
+        wrapper.length = length;
+        wrapper.hostVisible = false;
         *out_buffer = (__bridge_retained void *)wrapper;
         return ZIGGY_METAL_OK;
     }
@@ -893,6 +925,10 @@ int ziggy_metal_write_buffer(
 
     @autoreleasepool {
         ZiggyMetalBufferState *wrapper = ziggy_buffer(buffer);
+        if (!wrapper.hostVisible) {
+            ziggy_write_error(error_message, error_message_len, @"Metal buffer write requires a host-visible buffer");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
         if (offset + length > wrapper.length) {
             ziggy_write_error(error_message, error_message_len, @"Metal buffer write exceeded allocation");
             return ZIGGY_METAL_BUFFER_FAILED;
@@ -918,6 +954,10 @@ int ziggy_metal_read_buffer(
 
     @autoreleasepool {
         const ZiggyMetalBufferState *wrapper = ziggy_const_buffer(buffer);
+        if (!wrapper.hostVisible) {
+            ziggy_write_error(error_message, error_message_len, @"Metal buffer read requires a host-visible buffer");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
         if (offset + length > wrapper.length) {
             ziggy_write_error(error_message, error_message_len, @"Metal buffer read exceeded allocation");
             return ZIGGY_METAL_BUFFER_FAILED;
