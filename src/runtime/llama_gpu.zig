@@ -1042,26 +1042,48 @@ pub const Session = struct {
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
         const start = std.time.nanoTimestamp();
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            const v_matrix = self.dense_lookup.getMoonQuant(layer.attn_v.offset) orelse {
+            if (self.dense_lookup.getMoonQuant(layer.attn_v.offset)) |v_matrix| {
+                try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
+                    self.backend,
+                    k_matrix,
+                    v_matrix,
+                    input,
+                    self.k_cache,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    layer.attn_k.cols,
+                    position,
+                    self.model.rope_freq_base,
+                    self.model.rope_style,
+                );
+            } else if (layer.attn_v.tensor_type == 14) {
+                const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse {
+                    self.recordFusedKvFallback(.matrix_missing);
+                    return false;
+                };
+                try metal_backend.runMatVecMoonQuantQ4KQ6KDualKvHalf(
+                    self.backend,
+                    k_matrix,
+                    v_matrix,
+                    input,
+                    self.k_cache,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    layer.attn_k.cols,
+                    position,
+                    self.model.rope_freq_base,
+                    self.model.rope_style,
+                );
+            } else {
                 self.recordFusedKvFallback(.matrix_missing);
                 return false;
-            };
-            try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
-                self.backend,
-                k_matrix,
-                v_matrix,
-                input,
-                self.k_cache,
-                self.v_cache,
-                kv_offset_elements,
-                self.model.head_count_kv,
-                self.model.head_dimension,
-                self.model.rope_dimension_count,
-                layer.attn_k.cols,
-                position,
-                self.model.rope_freq_base,
-                self.model.rope_style,
-            );
+            }
             const shape = metal_profile.ShapeDesc{
                 .rows = layer.attn_k.rows,
                 .cols = layer.attn_k.cols,
@@ -1097,22 +1119,44 @@ pub const Session = struct {
             self.recordFusedKvFallback(.matrix_missing);
             return false;
         };
-        try metal_backend.runMatVecQ4KDualKvHalf(
-            self.backend,
-            k_matrix,
-            v_matrix,
-            input,
-            self.k_cache,
-            self.v_cache,
-            kv_offset_elements,
-            self.model.head_count_kv,
-            self.model.head_dimension,
-            self.model.rope_dimension_count,
-            layer.attn_k.cols,
-            position,
-            self.model.rope_freq_base,
-            self.model.rope_style,
-        );
+        if (layer.attn_v.tensor_type == 12) {
+            try metal_backend.runMatVecQ4KDualKvHalf(
+                self.backend,
+                k_matrix,
+                v_matrix,
+                input,
+                self.k_cache,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                layer.attn_k.cols,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+        } else if (layer.attn_v.tensor_type == 14) {
+            try metal_backend.runMatVecQ4KQ6KDualKvHalf(
+                self.backend,
+                k_matrix,
+                v_matrix,
+                input,
+                self.k_cache,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                layer.attn_k.cols,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+        } else {
+            self.recordFusedKvFallback(.tensor_type);
+            return false;
+        }
         self.recordCategoryWithShape(.projection_quantized, start, .{
             .rows = layer.attn_k.rows,
             .cols = layer.attn_k.cols,
