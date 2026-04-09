@@ -93,7 +93,7 @@ Stop guessing where decode time goes.
 - [x] Add a stable benchmark report section for decode stage timings.
 - [ ] Confirm whether current decode is matvec-bound, attention-bound, or synchronization-bound on:
 - [x] TinyLlama 1.1B Q4_K_M
-- [ ] Llama 3.2 3B Q4_K_M
+- [x] Llama 3.2 3B Q4_K_M
 
 ### Success criteria
 
@@ -172,7 +172,7 @@ Cut host orchestration overhead that does not contribute useful model work.
 
 ### Deliverables
 
-- [ ] Measure time spent in final readback and CPU-side sampling.
+- [x] Measure time spent in final readback and CPU-side sampling.
 - [ ] Reduce host synchronization points in the steady-state token loop.
 - [ ] Investigate shortlist or top-k/top-p preparation on GPU before final CPU token choice.
 - [ ] Ensure the decode loop performs no avoidable steady-state allocations.
@@ -275,8 +275,14 @@ Strictly limited to:
 3. [ ] Fuse one high-value llama decode subgraph.
 4. [ ] Tighten the attention and KV decode path.
 5. [ ] Align MoonQuant and compiled layout with the hottest kernels.
-6. [ ] Re-benchmark TinyLlama 1.1B and Llama 3.2 3B.
+6. [x] Re-benchmark TinyLlama 1.1B and Llama 3.2 3B.
 7. [ ] Decide whether a persistent decode-step experiment is justified.
+
+### Current evidence notes
+
+- 2026-04-09 TinyLlama 1.1B Q4_K_M warm decode measured `129.032 tok/s` with GPU greedy argmax. Decode remained synchronization-bound: `966.409 ms` of `992.630 ms` warm decode time was `commit_wait` (`97.358%`), with `22528` dispatches total or `176` dispatches per token.
+- 2026-04-09 Llama 3.2 3B Q4_K_M warm decode measured `41.790 tok/s` with CPU logits sampling. This path also remained synchronization-bound: `2945.919 ms` of `3063.268 ms` warm decode time was `commit_wait` (`96.169%`). CPU sampling was measurable at `77.857 ms` plus `1.356 ms` host readback, but still not the dominant bottleneck.
+- Fused decode profiling on both canonical llama-family models showed `Q+RoPE` active on all attempted layers. Fused `KV half-write` coverage was partial (`54.545%` on TinyLlama, `50.000%` on Llama 3.2), and the remaining cases fell back because `attn_v` was not `tensor_type=12` while the single fused `K` path still succeeded on all remaining attempts.
 
 ---
 

@@ -1337,6 +1337,9 @@ pub const Session = struct {
         if (self.profiler) |profiler| {
             profiler.recordWithShape(.commit_wait, stats.cpu_wait_ns, shape);
             if (stats.gpu_timestamps_valid) profiler.recordCommitWaitGpu(stats.gpu_elapsed_ns);
+            profiler.recordCommitWaitNonGpu(stats.non_gpu_wait_ns);
+            profiler.recordCommandBuffers(stats.command_buffer_count);
+            profiler.recordEncoders(stats.encoder_count);
             profiler.recordDispatches(stats.dispatch_count);
         }
     }

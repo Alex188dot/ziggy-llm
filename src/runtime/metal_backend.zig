@@ -29,7 +29,10 @@ pub const ShortlistEntry = extern struct {
 pub const CommitStats = struct {
     cpu_wait_ns: u64 = 0,
     gpu_elapsed_ns: u64 = 0,
+    non_gpu_wait_ns: u64 = 0,
     gpu_timestamps_valid: bool = false,
+    command_buffer_count: u32 = 0,
+    encoder_count: u32 = 0,
     dispatch_count: u32 = 0,
 };
 
@@ -413,7 +416,10 @@ pub fn commitSequenceTimed(backend: backend_api.MatVecBackend) !CommitStats {
     return .{
         .cpu_wait_ns = raw_stats.cpu_wait_ns,
         .gpu_elapsed_ns = raw_stats.gpu_elapsed_ns,
+        .non_gpu_wait_ns = raw_stats.non_gpu_wait_ns,
         .gpu_timestamps_valid = raw_stats.gpu_timestamps_valid,
+        .command_buffer_count = raw_stats.command_buffer_count,
+        .encoder_count = raw_stats.encoder_count,
         .dispatch_count = raw_stats.dispatch_count,
     };
 }

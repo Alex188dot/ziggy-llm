@@ -19,7 +19,10 @@ typedef struct {
 typedef struct {
     uint64_t cpu_wait_ns;
     uint64_t gpu_elapsed_ns;
+    uint64_t non_gpu_wait_ns;
     bool gpu_timestamps_valid;
+    uint32_t command_buffer_count;
+    uint32_t encoder_count;
     uint32_t dispatch_count;
 } ZiggyMetalCommitStats;
 

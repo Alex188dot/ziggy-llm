@@ -91,6 +91,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> batchAddInPlacePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> batchRmsNormPipeline;
 @property(nonatomic, strong) id<MTLCommandBuffer> pendingCommandBuffer;
+@property(nonatomic) uint32_t pendingEncoderCount;
 @property(nonatomic) uint32_t pendingDispatchCount;
 @end
 
@@ -158,13 +159,17 @@ static uint64_t ziggy_now_ns(void) {
 static void ziggy_fill_commit_stats(
     id<MTLCommandBuffer> command_buffer,
     uint64_t cpu_wait_ns,
+    uint32_t encoder_count,
     uint32_t dispatch_count,
     ZiggyMetalCommitStats *out_stats
 ) {
     if (out_stats == NULL) return;
     out_stats->cpu_wait_ns = cpu_wait_ns;
     out_stats->gpu_elapsed_ns = 0;
+    out_stats->non_gpu_wait_ns = 0;
     out_stats->gpu_timestamps_valid = false;
+    out_stats->command_buffer_count = command_buffer != nil ? 1 : 0;
+    out_stats->encoder_count = encoder_count;
     out_stats->dispatch_count = dispatch_count;
 
     if (![command_buffer respondsToSelector:@selector(GPUStartTime)] ||
@@ -178,10 +183,47 @@ static void ziggy_fill_commit_stats(
 
     out_stats->gpu_elapsed_ns = (uint64_t)((gpu_end - gpu_start) * 1000000000.0);
     out_stats->gpu_timestamps_valid = out_stats->gpu_elapsed_ns > 0;
+    if (out_stats->gpu_timestamps_valid && cpu_wait_ns > out_stats->gpu_elapsed_ns) {
+        out_stats->non_gpu_wait_ns = cpu_wait_ns - out_stats->gpu_elapsed_ns;
+    }
+}
+
+static void ziggy_record_encoder(ZiggyMetalState *state) {
+    state.pendingEncoderCount += 1;
 }
 
 static void ziggy_record_dispatch(ZiggyMetalState *state) {
     state.pendingDispatchCount += 1;
+}
+
+static id<MTLComputeCommandEncoder> ziggy_new_compute_encoder(
+    ZiggyMetalState *state,
+    id<MTLCommandBuffer> command_buffer,
+    char *error_message,
+    size_t error_message_len
+) {
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+        return nil;
+    }
+    ziggy_record_encoder(state);
+    return encoder;
+}
+
+static id<MTLBlitCommandEncoder> ziggy_new_blit_encoder(
+    ZiggyMetalState *state,
+    id<MTLCommandBuffer> command_buffer,
+    char *error_message,
+    size_t error_message_len
+) {
+    id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
+    if (encoder == nil) {
+        ziggy_write_error(error_message, error_message_len, @"failed to create Metal blit encoder");
+        return nil;
+    }
+    ziggy_record_encoder(state);
+    return encoder;
 }
 
 static id<MTLCommandBuffer> ziggy_new_command_buffer(id<MTLCommandQueue> queue, char *error_message, size_t error_message_len) {
@@ -396,14 +438,16 @@ static int ziggy_commit_pending(
         return ZIGGY_METAL_OK;
     }
 
+    const uint32_t encoder_count = state.pendingEncoderCount;
     const uint32_t dispatch_count = state.pendingDispatchCount;
     const uint64_t wait_start_ns = ziggy_now_ns();
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
     const uint64_t cpu_wait_ns = ziggy_now_ns() - wait_start_ns;
     state.pendingCommandBuffer = nil;
+    state.pendingEncoderCount = 0;
     state.pendingDispatchCount = 0;
-    ziggy_fill_commit_stats(command_buffer, cpu_wait_ns, dispatch_count, out_stats);
+    ziggy_fill_commit_stats(command_buffer, cpu_wait_ns, encoder_count, dispatch_count, out_stats);
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal command buffer failed");
@@ -425,11 +469,8 @@ static int ziggy_run_compute(
     if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
     if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    if (encoder == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     [encoder setComputePipelineState:pipeline];
     encode(encoder);
@@ -462,11 +503,8 @@ static int ziggy_run_single_threadgroup(
     if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
     if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    if (encoder == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     [encoder setComputePipelineState:pipeline];
     encode(encoder);
@@ -517,11 +555,8 @@ static int ziggy_run_rowwise_matvec(
     if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
     if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    if (encoder == nil) {
-        ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-        return ZIGGY_METAL_EXECUTION_FAILED;
-    }
+    id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+    if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
@@ -537,6 +572,7 @@ static int ziggy_run_rowwise_matvec(
     } else {
         ziggy_dispatch_rowwise(encoder, pipeline, rows);
     }
+    ziggy_record_dispatch(state);
     [encoder endEncoding];
 
     if (has_pending) return ZIGGY_METAL_OK;
@@ -1278,11 +1314,8 @@ int ziggy_metal_run_matvec_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_dense_add_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -1428,11 +1461,8 @@ int ziggy_metal_run_matvec_q4k_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q4k_add_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -1492,11 +1522,8 @@ int ziggy_metal_run_matvec_q4k_dual_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q4k_dual_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -1566,11 +1593,8 @@ int ziggy_metal_run_matvec_q4k_k_half_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q4k_k_half_pipeline(state, cols);
         uint32_t dst_base = (uint32_t)dst_offset_elements;
@@ -1643,11 +1667,8 @@ int ziggy_metal_run_matvec_q4k_q_rope_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q4k_q_rope_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -1720,11 +1741,8 @@ int ziggy_metal_run_matvec_moonq_q4k_k_half_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_k_half_pipeline(state, cols);
         uint32_t dst_base = (uint32_t)dst_offset_elements;
@@ -1797,11 +1815,8 @@ int ziggy_metal_run_matvec_moonq_q4k_q_rope_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_q_rope_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -1879,11 +1894,8 @@ int ziggy_metal_run_matvec_q4k_dual_kv_half_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q4k_dual_kv_half_pipeline(state, cols);
         uint32_t dst_base = (uint32_t)dst_offset_elements;
@@ -1964,11 +1976,8 @@ int ziggy_metal_run_matvec_moonq_q4k_dual_kv_half_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_dual_kv_half_pipeline(state, cols);
         uint32_t dst_base = (uint32_t)dst_offset_elements;
@@ -2036,11 +2045,8 @@ int ziggy_metal_run_matvec_moonq_q4k_dual_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_dual_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -2152,11 +2158,8 @@ int ziggy_metal_run_matvec_q6k_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_q6k_add_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
@@ -2207,11 +2210,8 @@ int ziggy_metal_run_matvec_q6k_argmax_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         if (input_buffer.length < ((size_t)cols * sizeof(float)) ||
             output_buffer.length < sizeof(uint64_t)) {
@@ -2316,11 +2316,8 @@ int ziggy_metal_run_matvec_q8_0_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.matvecQ80AddPipeline];
         [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
@@ -2430,7 +2427,7 @@ static int ziggy_run_fused_silu_down_matvec(
     if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
     if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
     if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     [encoder setComputePipelineState:pipeline];
@@ -2487,7 +2484,7 @@ static int ziggy_run_gated_fused_silu_down_matvec(
     if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
     if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
     if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
     [encoder setComputePipelineState:pipeline];
@@ -2653,21 +2650,19 @@ int ziggy_metal_run_matvec_moonq_q4k_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+    id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+    if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_pipeline(state, cols, true);
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
-        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-        ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
-        [encoder endEncoding];
+	    id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_pipeline(state, cols, true);
+	    [encoder setComputePipelineState:pipeline];
+	    [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+	    [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+	    [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+	    [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+	    [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+	    ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
+	    ziggy_record_dispatch(state);
+	    [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
 
@@ -2707,11 +2702,8 @@ int ziggy_metal_copy_buffer_region(
         }
 
         if (state.pendingCommandBuffer != nil) {
-            id<MTLBlitCommandEncoder> encoder = [state.pendingCommandBuffer blitCommandEncoder];
-            if (encoder == nil) {
-                ziggy_write_error(error_message, error_message_len, @"failed to create Metal blit encoder");
-                return ZIGGY_METAL_EXECUTION_FAILED;
-            }
+            id<MTLBlitCommandEncoder> encoder = ziggy_new_blit_encoder(state, state.pendingCommandBuffer, error_message, error_message_len);
+            if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
             [encoder copyFromBuffer:src_buffer.buffer sourceOffset:src_offset toBuffer:dst_buffer.buffer destinationOffset:dst_offset size:length];
             [encoder endEncoding];
@@ -2721,11 +2713,8 @@ int ziggy_metal_copy_buffer_region(
         id<MTLCommandBuffer> command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal blit encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLBlitCommandEncoder> encoder = ziggy_new_blit_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder copyFromBuffer:src_buffer.buffer sourceOffset:src_offset toBuffer:dst_buffer.buffer destinationOffset:dst_offset size:length];
         [encoder endEncoding];
@@ -3065,11 +3054,8 @@ int ziggy_metal_attention_fused_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+    id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+    if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.attentionFusedPipeline];
         [encoder setBuffer:q_buffer.buffer offset:0 atIndex:0];
@@ -3163,6 +3149,7 @@ int ziggy_metal_begin_sequence(
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         state.pendingCommandBuffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        state.pendingEncoderCount = 0;
         state.pendingDispatchCount = 0;
         if (state.pendingCommandBuffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
         
@@ -3365,11 +3352,8 @@ int ziggy_metal_rms_norm_per_head_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.rmsNormPerHeadPipeline];
         [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
@@ -3583,11 +3567,8 @@ int ziggy_metal_batch_argmax_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.batchArgmaxPipeline];
         [encoder setBuffer:input_buffer.buffer offset:0 atIndex:0];
@@ -3599,6 +3580,7 @@ int ziggy_metal_batch_argmax_f32(
         MTLSize grid_size = MTLSizeMake(batch_count, 1, 1);
         MTLSize group_size = MTLSizeMake(thread_count, 1, 1);
         [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
+        ziggy_record_dispatch(state);
         [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
@@ -3654,21 +3636,19 @@ int ziggy_metal_batch_matvec_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.batchMatvecAddPipeline];
         [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
         [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
-        ziggy_dispatch_rowwise(encoder, state.batchMatvecAddPipeline, rows);
-        [encoder endEncoding];
+	        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+	        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+	        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+	        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
+	        ziggy_dispatch_rowwise(encoder, state.batchMatvecAddPipeline, rows);
+	        ziggy_record_dispatch(state);
+	        [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
 
@@ -3714,22 +3694,20 @@ int ziggy_metal_batch_matvec_q4k_add_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         id<MTLComputePipelineState> pipeline = ziggy_select_batch_q4k_add_pipeline(state, cols);
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
         [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
-        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
-        [encoder endEncoding];
+	        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+	        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+	        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+	        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
+	        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+	        ziggy_record_dispatch(state);
+	        [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
 
@@ -3905,21 +3883,19 @@ int ziggy_metal_batch_matvec_q4k_f32(
         if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
         if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
-            return ZIGGY_METAL_EXECUTION_FAILED;
-        }
+        id<MTLComputeCommandEncoder> encoder = ziggy_new_compute_encoder(state, command_buffer, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
 
         [encoder setComputePipelineState:state.batchMatvecQ4KPipeline];
         [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
         [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
-        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
-        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
-        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
-        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
-        ziggy_dispatch_q4k_rows(encoder, state.batchMatvecQ4KPipeline, rows);
-        [encoder endEncoding];
+	        [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
+	        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+	        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+	        [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
+	        ziggy_dispatch_q4k_rows(encoder, state.batchMatvecQ4KPipeline, rows);
+	        ziggy_record_dispatch(state);
+	        [encoder endEncoding];
 
         if (has_pending) return ZIGGY_METAL_OK;
 
