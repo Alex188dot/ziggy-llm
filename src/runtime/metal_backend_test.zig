@@ -574,16 +574,77 @@ test "metal q6k fused argmax matches cpu dequantized reference for output projec
 
     const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
     defer metal_backend.destroyBuffer(input_buffer);
-    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(u32));
     defer metal_backend.destroyBuffer(packed_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, input);
-    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, std.math.maxInt(u32) });
+    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, 0, std.math.maxInt(u32) });
     try metal_backend.runMatVecQ6KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
 
-    var argmax_state: [2]u32 = .{ 0, 0 };
+    var argmax_state: [3]u32 = .{ 0, 0, 0 };
     try metal_backend.readBufferU32(packed_buffer, &argmax_state);
-    const actual_token = argmax_state[1];
+    const actual_token = argmax_state[2];
+    try std.testing.expectEqual(expected_best_token, actual_token);
+}
+
+test "metal q4k fused argmax matches cpu dequantized reference for output projection" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q4_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q4k-argmax.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q4k-argmax.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const tensor = model.output;
+    const rows = try tensor.rowCount();
+    const cols = 512;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    const matrix = try llama_cpu.tensorBytes(&model, tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 41)) - 20)) * 0.015625) + 0.02;
+    }
+
+    var expected_best_token: u32 = 0;
+    var expected_best_logit = -std.math.inf(f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, row_bytes, cols);
+        const logit = dot(dequantized_row, input);
+        if (logit > expected_best_logit) {
+            expected_best_logit = logit;
+            expected_best_token = @intCast(row);
+        }
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(u32));
+    defer metal_backend.destroyBuffer(packed_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, 0, std.math.maxInt(u32) });
+    try metal_backend.runMatVecQ4KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
+
+    var argmax_state: [3]u32 = .{ 0, 0, 0 };
+    try metal_backend.readBufferU32(packed_buffer, &argmax_state);
+    const actual_token = argmax_state[2];
     try std.testing.expectEqual(expected_best_token, actual_token);
 }
 

@@ -977,19 +977,117 @@ kernel void matvec_q6k_argmax_f32(
             sum += partial_sums[index];
         }
 
-        device atomic_uint *best_value = output_state;
-        device atomic_uint *best_token = output_state + 1;
-        uint observed = atomic_load_explicit(best_value, memory_order_relaxed);
+        device atomic_uint *state_lock = output_state;
+        device atomic_uint *best_value = output_state + 1;
+        device atomic_uint *best_token = output_state + 2;
         const uint bits = as_type<uint>(sum);
         const uint ordered = (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
-        while (ordered > observed) {
-            if (atomic_compare_exchange_weak_explicit(
-                    best_value,
-                    &observed,
-                    ordered,
-                    memory_order_relaxed,
-                    memory_order_relaxed)) {
-                atomic_store_explicit(best_token, row, memory_order_relaxed);
+        while (true) {
+            const uint current_best = atomic_load_explicit(best_value, memory_order_relaxed);
+            const uint current_token = atomic_load_explicit(best_token, memory_order_relaxed);
+            if (ordered < current_best || (ordered == current_best && row >= current_token)) break;
+            if (atomic_exchange_explicit(state_lock, 1u, memory_order_relaxed) == 0u) {
+                const uint locked_best = atomic_load_explicit(best_value, memory_order_relaxed);
+                const uint locked_token = atomic_load_explicit(best_token, memory_order_relaxed);
+                if (ordered > locked_best || (ordered == locked_best && row < locked_token)) {
+                    atomic_store_explicit(best_value, ordered, memory_order_relaxed);
+                    atomic_store_explicit(best_token, row, memory_order_relaxed);
+                }
+                atomic_store_explicit(state_lock, 0u, memory_order_relaxed);
+                break;
+            }
+        }
+    }
+}
+
+kernel void matvec_q4k_argmax_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device atomic_uint *output_state [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint blocks_per_row = cols / ZIGGY_Q4K_VALUES_PER_BLOCK;
+    const uint row_stride = blocks_per_row * ZIGGY_Q4K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q4K_GROUPS_PER_BLOCK * ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP;
+    threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) {
+        const uint block_group_index = chunk_index / ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP;
+        const uint chunk_in_group = chunk_index % ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP;
+        const uint block_index = block_group_index / ZIGGY_Q4K_GROUPS_PER_BLOCK;
+        const uint group = block_group_index % ZIGGY_Q4K_GROUPS_PER_BLOCK;
+        const uint q_offset = chunk_in_group * 4;
+        const uint input_offset = block_index * ZIGGY_Q4K_VALUES_PER_BLOCK + group * ZIGGY_Q4K_VALUES_PER_GROUP + q_offset;
+
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q4K_BYTES_PER_BLOCK;
+        const float d = read_half_le(block, 0);
+        const float dmin = read_half_le(block, 2);
+        const device uchar *scales = block + 4;
+        const device uchar *q = block + 16 + group * ZIGGY_Q4K_PACKED_BYTES_PER_GROUP + q_offset;
+        const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]);
+        const uchar4 low_q = packed & uchar4(0x0F);
+        const uchar4 high_q = packed >> 4;
+        const float4 input_low = float4(
+            input[input_offset + 0],
+            input[input_offset + 1],
+            input[input_offset + 2],
+            input[input_offset + 3]
+        );
+        const float4 input_high = float4(
+            input[input_offset + 32 + 0],
+            input[input_offset + 32 + 1],
+            input[input_offset + 32 + 2],
+            input[input_offset + 32 + 3]
+        );
+
+        const uint scale_index = group * 2;
+        const float d1 = d * float(get_scale_k4(scales, scale_index + 0));
+        const float m1 = dmin * float(get_min_k4(scales, scale_index + 0));
+        const float d2 = d * float(get_scale_k4(scales, scale_index + 1));
+        const float m2 = dmin * float(get_min_k4(scales, scale_index + 1));
+        local_sum += dot(float4(low_q) * d1 - float4(m1), input_low);
+        local_sum += dot(float4(high_q) * d2 - float4(m2), input_high);
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+
+        device atomic_uint *state_lock = output_state;
+        device atomic_uint *best_value = output_state + 1;
+        device atomic_uint *best_token = output_state + 2;
+        const uint bits = as_type<uint>(sum);
+        const uint ordered = (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
+        while (true) {
+            const uint current_best = atomic_load_explicit(best_value, memory_order_relaxed);
+            const uint current_token = atomic_load_explicit(best_token, memory_order_relaxed);
+            if (ordered < current_best || (ordered == current_best && row >= current_token)) break;
+            if (atomic_exchange_explicit(state_lock, 1u, memory_order_relaxed) == 0u) {
+                const uint locked_best = atomic_load_explicit(best_value, memory_order_relaxed);
+                const uint locked_token = atomic_load_explicit(best_token, memory_order_relaxed);
+                if (ordered > locked_best || (ordered == locked_best && row < locked_token)) {
+                    atomic_store_explicit(best_value, ordered, memory_order_relaxed);
+                    atomic_store_explicit(best_token, row, memory_order_relaxed);
+                }
+                atomic_store_explicit(state_lock, 0u, memory_order_relaxed);
                 break;
             }
         }

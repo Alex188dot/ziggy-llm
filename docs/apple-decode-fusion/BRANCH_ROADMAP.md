@@ -39,12 +39,13 @@ The repo already has the right ingredients for aggressive Apple-first decode opt
 - Metal is already the hot path for supported llama-family decode.
 - Quant-aware kernels and MoonQuant packing already exist.
 - Per-token work is already batched more intelligently than a naive op-by-op runtime.
-- The current path still pays for too many small operations, too much orchestration, and too much host-visible synchronization.
+- The current path still pays for too many small operations, too many per-token kernel/encoder boundaries, and too much memory traffic inside the steady-state decode step.
 
 The working thesis for this branch is:
 
 - a strict CUDA-style whole-model megakernel is not the best first move on Apple Silicon
 - decode-step graph fusion, residency, and orchestration cleanup should come first
+- once steady-state decode reaches one command buffer per token with low non-GPU wait, further wins must come primarily from reducing real GPU work per token rather than from more command-submission cleanup
 - if those improvements stall, a narrower persistent decode-step kernel can be tested later
 
 ---
@@ -168,7 +169,7 @@ Tighten the attention-side hot path without overfitting only to matvec work.
 
 ### Goal
 
-Cut host orchestration overhead that does not contribute useful model work.
+Cut host orchestration overhead that does not contribute useful model work, but stop treating it as the default explanation once measurements show the steady-state token loop is already mostly GPU-bound.
 
 ### Deliverables
 
@@ -177,10 +178,12 @@ Cut host orchestration overhead that does not contribute useful model work.
 - [ ] Investigate shortlist or top-k/top-p preparation on GPU before final CPU token choice.
 - [ ] Ensure the decode loop performs no avoidable steady-state allocations.
 - [ ] Keep the resident runtime path as the primary benchmark target for optimization work.
+- [ ] Document when command-buffer structure stops being the top limiter so later work shifts toward kernel count, memory traffic, and decode-step specialization.
 
 ### Success criteria
 
 - [ ] CPU overhead is no longer one of the top decode bottlenecks on the benchmarked llama path.
+- [ ] The roadmap clearly marks when command-buffer churn is no longer the primary decode bottleneck.
 
 ---
 
@@ -280,8 +283,8 @@ Strictly limited to:
 
 ### Current evidence notes
 
-- 2026-04-09 TinyLlama 1.1B Q4_K_M warm decode measured `129.032 tok/s` with GPU greedy argmax. Decode remained synchronization-bound: `966.409 ms` of `992.630 ms` warm decode time was `commit_wait` (`97.358%`), with `22528` dispatches total or `176` dispatches per token.
-- 2026-04-09 Llama 3.2 3B Q4_K_M warm decode measured `41.790 tok/s` with CPU logits sampling. This path also remained synchronization-bound: `2945.919 ms` of `3063.268 ms` warm decode time was `commit_wait` (`96.169%`). CPU sampling was measurable at `77.857 ms` plus `1.356 ms` host readback, but still not the dominant bottleneck.
+- 2026-04-09 TinyLlama 1.1B Q4_K_M warm decode measured `125.185 tok/s` with GPU greedy argmax after commit-path instrumentation updates. Warm decode still spent `996.927 ms` of `1023.226 ms` in `commit_wait` (`97.430%`), but the new split showed this was overwhelmingly real GPU work: `968.863 ms` GPU time vs `28.064 ms` non-GPU wait. The steady-state path is already at `1.000` command buffer per generated token, so command-buffer structure is no longer the main frontier. The remaining hot-path shape was `26624` encoders and `23808` dispatches total, or `208` encoders and `186` dispatches per generated token.
+- 2026-04-09 Llama 3.2 3B Q4_K_M warm decode measured `41.790 tok/s` with CPU logits sampling. This path also remained dominated by `commit_wait`, but CPU sampling plus readback were still secondary to the GPU-side decode workload. The working conclusion after the TinyLlama command-buffer split is that future wins are more likely to come from reducing real GPU work per token than from more submission-structure cleanup alone.
 - Fused decode profiling on both canonical llama-family models showed `Q+RoPE` active on all attempted layers. Fused `KV half-write` coverage was partial (`54.545%` on TinyLlama, `50.000%` on Llama 3.2), and the remaining cases fell back because `attn_v` was not `tensor_type=12` while the single fused `K` path still succeeded on all remaining attempts.
 
 ---

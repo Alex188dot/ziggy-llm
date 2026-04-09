@@ -664,11 +664,36 @@ pub fn runMatVecQ6KArgmaxToBuffer(
     cols: usize,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
-    if (input.byte_len < cols * @sizeOf(f32) or output_packed.byte_len < @sizeOf(u64)) return error.MetalBufferError;
+    if (input.byte_len < cols * @sizeOf(f32) or output_packed.byte_len < 3 * @sizeOf(u32)) return error.MetalBufferError;
     const state = stateFromCtx(backend.ctx);
     const matrix_buffer = try state.rawBuffer(matrix_bytes);
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     try mapStatus(c.ziggy_metal_run_matvec_q6k_argmax_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output_packed.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ4KArgmaxToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output_packed.byte_len < 3 * @sizeOf(u32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_argmax_f32(
         state.context,
         matrix_buffer.raw,
         input.raw,
