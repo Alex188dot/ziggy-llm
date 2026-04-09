@@ -127,20 +127,20 @@ Reduce bytes moved and resource churn before deeper kernel work.
 
 ### Goal
 
-Fuse the hot decode graph in modular pieces instead of jumping directly to a single giant shader.
+Fuse the hot decode graph in modular pieces instead of jumping directly to a single giant shader, explicitly prioritizing fewer dispatches and lower `commit_wait` before kernel math tuning.
 
 ### Deliverables
 
-- [ ] Identify the highest-value subgraph to fuse first for llama decode.
-- [ ] Add one fused decode-first kernel family for a stable high-frequency shape.
+- [x] Identify the highest-value subgraph to fuse first for llama decode.
+- [x] Add one fused decode-first kernel family for a stable high-frequency shape that reduces steady-state dispatch count.
 - [ ] Fuse at least one residual-add-adjacent path with its producer operation where it reduces extra writes.
-- [ ] Fuse at least one FFN-local sequence where shape stability makes the tradeoff favorable.
-- [ ] Add shape-specialized kernel variants only where benchmark evidence justifies them.
+- [x] Fuse at least one FFN-local sequence where shape stability makes the tradeoff favorable.
+- [x] Add shape-specialized kernel variants only where benchmark evidence justifies them.
 
 ### Success criteria
 
 - [ ] At least one fused decode subgraph shows a measurable warm decode gain.
-- [ ] Kernel count per generated token is reduced on the instrumented path.
+- [ ] Kernel count or dispatch count per generated token is reduced on the instrumented path.
 
 ---
 

@@ -47,6 +47,7 @@ pub const SummaryStats = struct {
     profiled_decode_tokens: usize = 0,
     profiled_decode_ns: u64 = 0,
     commit_wait_gpu_ns: u64 = 0,
+    dispatch_count: u64 = 0,
     categories_ns: [category_count]u64 = [_]u64{0} ** category_count,
     categories_calls: [category_count]usize = [_]usize{0} ** category_count,
 
@@ -56,6 +57,7 @@ pub const SummaryStats = struct {
         self.profiled_decode_tokens += other.profiled_decode_tokens;
         self.profiled_decode_ns += other.profiled_decode_ns;
         self.commit_wait_gpu_ns += other.commit_wait_gpu_ns;
+        self.dispatch_count += other.dispatch_count;
         for (0..category_count) |index| {
             self.categories_ns[index] += other.categories_ns[index];
             self.categories_calls[index] += other.categories_calls[index];
@@ -69,6 +71,7 @@ pub const SummaryStats = struct {
         averaged.profiled_decode_tokens /= runs;
         averaged.profiled_decode_ns /= runs;
         averaged.commit_wait_gpu_ns /= runs;
+        averaged.dispatch_count /= runs;
         for (0..category_count) |index| {
             averaged.categories_ns[index] /= runs;
             averaged.categories_calls[index] /= runs;
@@ -137,6 +140,9 @@ pub const Profiler = struct {
     commit_wait_gpu_total_ns: u64 = 0,
     commit_wait_gpu_token_steps: std.ArrayList(u64),
     current_commit_wait_gpu_ns: u64 = 0,
+    total_dispatch_count: u64 = 0,
+    dispatch_token_steps: std.ArrayList(u32),
+    current_dispatch_count: u32 = 0,
     token_active: bool = false,
     dropped_shape_samples: bool = false,
     dropped_moon_quant_shape_samples: bool = false,
@@ -148,6 +154,7 @@ pub const Profiler = struct {
             .token_steps = .empty,
             .moon_quant_token_steps = .empty,
             .commit_wait_gpu_token_steps = .empty,
+            .dispatch_token_steps = .empty,
             .shapes = std.AutoHashMap(ShapeKey, ShapeStats).init(allocator),
             .moon_quant_shapes = std.AutoHashMap(ShapeKey, ShapeStats).init(allocator),
         };
@@ -157,6 +164,7 @@ pub const Profiler = struct {
         self.token_steps.deinit(self.allocator);
         self.moon_quant_token_steps.deinit(self.allocator);
         self.commit_wait_gpu_token_steps.deinit(self.allocator);
+        self.dispatch_token_steps.deinit(self.allocator);
         self.shapes.deinit();
         self.moon_quant_shapes.deinit();
         self.* = undefined;
@@ -167,6 +175,7 @@ pub const Profiler = struct {
         self.current_token = .{};
         self.current_moon_quant_token_ns = 0;
         self.current_commit_wait_gpu_ns = 0;
+        self.current_dispatch_count = 0;
         self.token_active = true;
     }
 
@@ -175,9 +184,11 @@ pub const Profiler = struct {
         self.token_steps.append(self.allocator, self.current_token) catch {};
         self.moon_quant_token_steps.append(self.allocator, self.current_moon_quant_token_ns) catch {};
         self.commit_wait_gpu_token_steps.append(self.allocator, self.current_commit_wait_gpu_ns) catch {};
+        self.dispatch_token_steps.append(self.allocator, self.current_dispatch_count) catch {};
         self.current_token = .{};
         self.current_moon_quant_token_ns = 0;
         self.current_commit_wait_gpu_ns = 0;
+        self.current_dispatch_count = 0;
         self.token_active = false;
     }
 
@@ -243,6 +254,12 @@ pub const Profiler = struct {
         self.current_commit_wait_gpu_ns += duration_ns;
     }
 
+    pub fn recordDispatches(self: *Profiler, dispatch_count: u32) void {
+        if (!self.enabled or !self.token_active or dispatch_count == 0) return;
+        self.total_dispatch_count += dispatch_count;
+        self.current_dispatch_count += dispatch_count;
+    }
+
     pub fn renderSummary(self: *const Profiler, allocator: std.mem.Allocator) ![]u8 {
         if (!self.enabled) return allocator.dupe(u8, "");
 
@@ -254,6 +271,7 @@ pub const Profiler = struct {
         try writer.print("metal_decode_profile_enabled=true\n", .{});
         try writer.print("profiled_decode_tokens={d}\n", .{self.token_steps.items.len});
         try writer.print("profiled_decode_ns={d}\n", .{total_decode_ns});
+        try writer.print("profile.dispatches={d}\n", .{self.total_dispatch_count});
         try writer.print("moon_quant.profile.total_ns={d}\n", .{self.moon_quant_total_ns});
         try writer.print("moon_quant.profile.calls={d}\n", .{self.moon_quant_calls});
         try writer.print(
@@ -353,6 +371,10 @@ pub const Profiler = struct {
                 "profile.token_{d}.commit_wait.gpu_ns={d}\n",
                 .{ index, self.commit_wait_gpu_token_steps.items[index] },
             );
+            try writer.print(
+                "profile.token_{d}.dispatches={d}\n",
+                .{ index, self.dispatch_token_steps.items[index] },
+            );
         }
 
         return buffer.toOwnedSlice(allocator);
@@ -381,6 +403,10 @@ pub fn parseSummary(summary: ?[]const u8) SummaryStats {
             stats.commit_wait_gpu_ns = value;
             continue;
         }
+        if (parseMetricU64(line, "profile.dispatches=")) |value| {
+            stats.dispatch_count = value;
+            continue;
+        }
         if (parseCategoryMetricU64(line, ".ns=")) |entry| {
             stats.categories_ns[@intFromEnum(entry.category)] = entry.value;
             continue;
@@ -397,6 +423,7 @@ pub fn renderBenchStageSummary(
     allocator: std.mem.Allocator,
     prefix: []const u8,
     stats: SummaryStats,
+    generated_token_count: usize,
 ) !?[]u8 {
     if (!stats.enabled) return null;
 
@@ -405,8 +432,14 @@ pub fn renderBenchStageSummary(
     const writer = buffer.writer(allocator);
 
     try writer.print("{s}.decode_profile.tokens={d}\n", .{ prefix, stats.profiled_decode_tokens });
+    try writer.print("{s}.decode_profile.generated_tokens={d}\n", .{ prefix, generated_token_count });
     try writer.print("{s}.decode_profile.total_ms={d:.3}\n", .{ prefix, nsToMs(stats.profiled_decode_ns) });
     try writer.print("{s}.decode_profile.commit_wait_gpu_ms={d:.3}\n", .{ prefix, nsToMs(stats.commit_wait_gpu_ns) });
+    try writer.print("{s}.decode_profile.dispatches={d}\n", .{ prefix, stats.dispatch_count });
+    try writer.print(
+        "{s}.decode_profile.dispatches_per_token={d:.3}\n",
+        .{ prefix, if (generated_token_count == 0) @as(f64, 0) else @as(f64, @floatFromInt(stats.dispatch_count)) / @as(f64, @floatFromInt(generated_token_count)) },
+    );
     try writer.print(
         "{s}.decode_profile.commit_wait_gpu_share_pct={d:.3}\n",
         .{ prefix, percentage(stats.commit_wait_gpu_ns, stats.profiled_decode_ns) },
@@ -581,6 +614,7 @@ test "summary parser and bench renderer expose averaged decode stages" {
         \\profiled_decode_tokens=4
         \\profiled_decode_ns=1000
         \\profile.commit_wait.gpu_ns=100
+        \\profile.dispatches=44
         \\profile.projection_quantized.ns=400
         \\profile.projection_quantized.calls=8
         \\profile.attention.ns=300
@@ -592,13 +626,17 @@ test "summary parser and bench renderer expose averaged decode stages" {
     const stats = parseSummary(summary);
     try std.testing.expect(stats.enabled);
     try std.testing.expectEqual(@as(usize, 4), stats.profiled_decode_tokens);
+    try std.testing.expectEqual(@as(u64, 44), stats.dispatch_count);
     try std.testing.expectEqual(@as(u64, 400), stats.categories_ns[@intFromEnum(Category.projection_quantized)]);
 
-    const rendered = try renderBenchStageSummary(std.testing.allocator, "warm", stats);
+    const rendered = try renderBenchStageSummary(std.testing.allocator, "warm", stats, 8);
     defer if (rendered) |text| std.testing.allocator.free(text);
 
     try std.testing.expect(rendered != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.total_ms=0.001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.generated_tokens=8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.dispatches=44") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.dispatches_per_token=5.500") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.projection_quantized_ms=0.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.attention_share_pct=30.000") != null);
 }

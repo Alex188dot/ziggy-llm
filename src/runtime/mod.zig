@@ -264,6 +264,7 @@ pub fn benchCommand(
             allocator,
             "cold",
             metal_profile.parseSummary(summary.cold.metal_profile_summary),
+            summary.cold.generated_token_count,
         )) |stage_summary| {
             defer allocator.free(stage_summary);
             try writer.print("{s}", .{stage_summary});
@@ -272,6 +273,7 @@ pub fn benchCommand(
             allocator,
             "warm",
             summary.warm_metal_profile_stats,
+            summary.warm_generated_token_count_avg,
         )) |stage_summary| {
             defer allocator.free(stage_summary);
             try writer.print("{s}", .{stage_summary});
@@ -344,6 +346,7 @@ pub fn benchCommand(
         allocator,
         "bench",
         metal_profile.parseSummary(report.metal_profile_summary),
+        report.generated_token_count,
     )) |stage_summary| {
         defer allocator.free(stage_summary);
         try writer.print("{s}", .{stage_summary});

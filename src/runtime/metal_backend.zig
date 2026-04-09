@@ -30,6 +30,7 @@ pub const CommitStats = struct {
     cpu_wait_ns: u64 = 0,
     gpu_elapsed_ns: u64 = 0,
     gpu_timestamps_valid: bool = false,
+    dispatch_count: u32 = 0,
 };
 
 pub const GateMaskStats = struct {
@@ -371,6 +372,7 @@ pub fn commitSequenceTimed(backend: backend_api.MatVecBackend) !CommitStats {
         .cpu_wait_ns = raw_stats.cpu_wait_ns,
         .gpu_elapsed_ns = raw_stats.gpu_elapsed_ns,
         .gpu_timestamps_valid = raw_stats.gpu_timestamps_valid,
+        .dispatch_count = raw_stats.dispatch_count,
     };
 }
 
@@ -1425,6 +1427,66 @@ pub fn batchMatvecQ4K(
         @intCast(rows),
         @intCast(cols),
         @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecQ4KDualToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix0_bytes: []const u8,
+    matrix1_bytes: []const u8,
+    input: BufferHandle,
+    output0: BufferHandle,
+    output1: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (output0.byte_len < rows * @sizeOf(f32) or output1.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix0_buffer = try state.rawBuffer(matrix0_bytes);
+    const matrix1_buffer = try state.rawBuffer(matrix1_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_dual_f32(
+        state.context,
+        matrix0_buffer.raw,
+        matrix1_buffer.raw,
+        input.raw,
+        output0.raw,
+        output1.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn runMatVecMoonQuantQ4KDualToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix0_bytes: []const u8,
+    matrix1_bytes: []const u8,
+    input: BufferHandle,
+    output0: BufferHandle,
+    output1: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (output0.byte_len < rows * @sizeOf(f32) or output1.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix0_buffer = try state.rawBuffer(matrix0_bytes);
+    const matrix1_buffer = try state.rawBuffer(matrix1_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_moonq_q4k_dual_f32(
+        state.context,
+        matrix0_buffer.raw,
+        matrix1_buffer.raw,
+        input.raw,
+        output0.raw,
+        output1.raw,
+        @intCast(rows),
+        @intCast(cols),
         &error_buf,
         error_buf.len,
     ), &error_buf);

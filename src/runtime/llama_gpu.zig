@@ -329,8 +329,10 @@ pub const Session = struct {
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc, layer_index: usize) !void {
         try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-        try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-        try self.runProjection(layer.ffn_up, self.normed, self.up);
+        if (!try self.runFusedFfnFanout(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+            try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+            try self.runProjection(layer.ffn_up, self.normed, self.up);
+        }
 
         const tensor = layer.ffn_down;
         var handled_fused = false;
@@ -638,6 +640,66 @@ pub const Session = struct {
         }
     }
 
+    fn runFusedFfnFanout(
+        self: *Session,
+        gate_tensor: TensorDesc,
+        up_tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        gate_output: metal_backend.BufferHandle,
+        up_output: metal_backend.BufferHandle,
+    ) !bool {
+        if (gate_tensor.tensor_type != 12 or up_tensor.tensor_type != 12) return false;
+        if (gate_tensor.rows != up_tensor.rows or gate_tensor.cols != up_tensor.cols) return false;
+
+        if (self.dense_lookup.getMoonQuant(gate_tensor.offset)) |gate_matrix| {
+            const up_matrix = self.dense_lookup.getMoonQuant(up_tensor.offset) orelse return false;
+            const start = std.time.nanoTimestamp();
+            try metal_backend.runMatVecMoonQuantQ4KDualToBuffers(
+                self.backend,
+                gate_matrix,
+                up_matrix,
+                input,
+                gate_output,
+                up_output,
+                gate_tensor.rows,
+                gate_tensor.cols,
+            );
+            const shape = metal_profile.ShapeDesc{
+                .rows = gate_tensor.rows,
+                .cols = gate_tensor.cols,
+                .tensor_type = gate_tensor.tensor_type,
+                .extra = 2,
+            };
+            self.recordCategoryWithShape(.projection_quantized, start, shape);
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+            return true;
+        }
+
+        const gate_matrix = self.dense_lookup.getRaw(gate_tensor.offset) orelse return false;
+        const up_matrix = self.dense_lookup.getRaw(up_tensor.offset) orelse return false;
+
+        const start = std.time.nanoTimestamp();
+        try metal_backend.runMatVecQ4KDualToBuffers(
+            self.backend,
+            gate_matrix,
+            up_matrix,
+            input,
+            gate_output,
+            up_output,
+            gate_tensor.rows,
+            gate_tensor.cols,
+        );
+        self.recordCategoryWithShape(.projection_quantized, start, .{
+            .rows = gate_tensor.rows,
+            .cols = gate_tensor.cols,
+            .tensor_type = gate_tensor.tensor_type,
+            .extra = 2,
+        });
+        return true;
+    }
+
     fn runProjectionToDst(
         self: *Session,
         tensor: TensorDesc,
@@ -762,6 +824,7 @@ pub const Session = struct {
         if (self.profiler) |profiler| {
             profiler.recordWithShape(.commit_wait, stats.cpu_wait_ns, shape);
             if (stats.gpu_timestamps_valid) profiler.recordCommitWaitGpu(stats.gpu_elapsed_ns);
+            profiler.recordDispatches(stats.dispatch_count);
         }
     }
 
@@ -873,8 +936,10 @@ pub const Session = struct {
 
             for (layers) |layer| {
                 try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-                try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-                try self.runProjection(layer.ffn_up, self.normed, self.up);
+                if (!try self.runFusedFfnFanout(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+                    try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+                    try self.runProjection(layer.ffn_up, self.normed, self.up);
+                }
                 try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
                 try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
             }

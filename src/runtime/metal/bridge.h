@@ -20,6 +20,7 @@ typedef struct {
     uint64_t cpu_wait_ns;
     uint64_t gpu_elapsed_ns;
     bool gpu_timestamps_valid;
+    uint32_t dispatch_count;
 } ZiggyMetalCommitStats;
 
 typedef struct {
@@ -586,6 +587,32 @@ int ziggy_metal_batch_matvec_q4k_f32(
     uint32_t rows,
     uint32_t cols,
     uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_q4k_dual_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix0,
+    const ZiggyMetalBuffer *matrix1,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output0,
+    ZiggyMetalBuffer *output1,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_dual_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix0,
+    const ZiggyMetalBuffer *matrix1,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output0,
+    ZiggyMetalBuffer *output1,
+    uint32_t rows,
+    uint32_t cols,
     char *error_message,
     size_t error_message_len
 );
