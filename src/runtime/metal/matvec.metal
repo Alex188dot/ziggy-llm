@@ -1078,6 +1078,65 @@ kernel void apply_rope_to_dst_f32(
     }
 }
 
+kernel void apply_rope_to_half_dst_f32(
+    device const float *src [[buffer(0)]],
+    device half *dst [[buffer(1)]],
+    constant uint &dst_base [[buffer(2)]],
+    constant uint &head_count [[buffer(3)]],
+    constant uint &head_dim [[buffer(4)]],
+    constant uint &pair_count [[buffer(5)]],
+    constant uint &position [[buffer(6)]],
+    constant float &freq_base [[buffer(7)]],
+    constant uint &rope_style [[buffer(8)]],
+    uint index [[thread_position_in_grid]]
+) {
+    const uint total_values = head_count * head_dim;
+    if (index >= total_values) return;
+
+    const uint head = index / head_dim;
+    const uint dim = index % head_dim;
+    const uint dst_index = dst_base + index;
+    if (pair_count == 0 || dim >= pair_count * 2) {
+        dst[dst_index] = half(src[index]);
+        return;
+    }
+
+    float result = 0.0f;
+    if (rope_style == 0) {
+        const uint pair = dim / 2;
+        const uint base = head * head_dim + pair * 2;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = src[base];
+        const float x1 = src[base + 1];
+
+        if ((dim & 1) == 0) {
+            result = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            result = x0 * sin_theta + x1 * cos_theta;
+        }
+    } else {
+        const uint pair = dim % pair_count;
+        const bool is_first_half = dim < pair_count;
+        const uint base = head * head_dim;
+        const float exponent = float(pair * 2) / float(pair_count * 2);
+        const float theta = float(position) / pow(freq_base, exponent);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
+        const float x0 = src[base + pair];
+        const float x1 = src[base + pair + pair_count];
+
+        if (is_first_half) {
+            result = x0 * cos_theta - x1 * sin_theta;
+        } else {
+            result = x0 * sin_theta + x1 * cos_theta;
+        }
+    }
+    dst[dst_index] = half(result);
+}
+
 kernel void attention_fused_f32(
     device const float *q [[buffer(0)]],
     device const half *k_cache [[buffer(1)]],

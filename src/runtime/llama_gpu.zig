@@ -255,22 +255,17 @@ pub const Session = struct {
         try self.runProjection(layer.attn_k, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
         if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
-        try metal_backend.applyRoPE(
+        try metal_backend.applyRoPEToHalfDst(
             self.backend,
             self.k,
+            self.k_cache,
+            kv_offset_elements,
             self.model.head_count_kv,
             self.model.head_dimension,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
             self.model.rope_style,
-        );
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.k,
-            self.k_cache,
-            kv_offset_elements,
-            self.model.kv_dimension,
         );
         self.recordCategoryWithShape(.rope, kv_k_start, .{
             .rows = self.model.head_count_kv,
@@ -888,22 +883,17 @@ pub const Session = struct {
                 const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
                 try self.runProjection(layer.attn_k, self.normed, self.k);
-                try metal_backend.applyRoPE(
+                try metal_backend.applyRoPEToHalfDst(
                     self.backend,
                     self.k,
+                    self.k_cache,
+                    kv_offset_elements,
                     self.model.head_count_kv,
                     self.model.head_dimension,
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
                     self.model.rope_style,
-                );
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.k,
-                    self.k_cache,
-                    kv_offset_elements,
-                    self.model.kv_dimension,
                 );
 
                 try self.runProjection(layer.attn_v, self.normed, self.v);

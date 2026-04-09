@@ -894,6 +894,58 @@ test "metal rope-to-dst writes rotated kv slice directly" {
     }
 }
 
+test "metal rope-to-half-dst writes rotated kv slice directly" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 6;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+
+    var src: [head_count * head_dim]f32 = undefined;
+    for (&src, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index)) - 7)) * 0.125) + 0.05;
+    }
+
+    var expected_f32 = [_]f32{-9.0} ** (dst_prefix + src.len + 3);
+    applyRoPEReference(expected_f32[dst_prefix .. dst_prefix + src.len], &src, head_count, head_dim, rope_dim, position, freq_base, 0);
+    var expected = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + src.len + 3);
+    for (expected_f32, 0..) |value, index| expected[index] = @floatCast(value);
+    var actual = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + src.len + 3);
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const src_buffer = try metal_backend.createScratchBuffer(backend, src.len);
+    defer metal_backend.destroyBuffer(src_buffer);
+    const dst_buffer = try metal_backend.createByteScratchBuffer(backend, actual.len * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(dst_buffer);
+
+    try metal_backend.writeBufferF32(src_buffer, &src);
+    try metal_backend.writeBufferF16(dst_buffer, &actual);
+    try metal_backend.applyRoPEToHalfDst(
+        backend,
+        src_buffer,
+        dst_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(dst_buffer, &actual);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.001);
+    }
+}
+
 test "metal rope at offset rotates kv slice in place" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);

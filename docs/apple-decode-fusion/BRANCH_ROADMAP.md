@@ -153,14 +153,14 @@ Tighten the attention-side hot path without overfitting only to matvec work.
 ### Deliverables
 
 - [ ] Measure the attention share of decode time across short and medium contexts.
-- [ ] Reduce unnecessary writes or format conversions around K and V handling.
+- [x] Reduce unnecessary writes or format conversions around K and V handling.
 - [ ] Revisit KV append layout for decode locality.
-- [ ] Reduce synchronization around attention-adjacent kernels where safe.
-- [ ] Validate numerical stability against the CPU reference path.
+- [x] Reduce synchronization around attention-adjacent kernels where safe.
+- [x] Validate numerical stability against the CPU reference path.
 
 ### Success criteria
 
-- [ ] Attention and KV work become a smaller fraction of per-token decode time on at least one canonical model.
+- [x] Attention and KV work become a smaller fraction of per-token decode time on at least one canonical model.
 
 ---
 

@@ -395,6 +395,21 @@ int ziggy_metal_store_kv_half(
     size_t error_message_len
 );
 
+int ziggy_metal_apply_rope_to_half_dst_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_attention_fused_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *q,

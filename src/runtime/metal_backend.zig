@@ -314,6 +314,13 @@ pub fn readBufferF32(buffer: BufferHandle, out: []f32) !void {
     try readBuffer(buffer.raw, out);
 }
 
+pub fn readBufferF16(buffer: BufferHandle, out: []f16) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (!buffer.host_visible) return error.MetalBufferError;
+    if (out.len * @sizeOf(f16) > buffer.byte_len) return error.MetalBufferError;
+    try readBufferBytes(buffer.raw, std.mem.sliceAsBytes(out));
+}
+
 pub fn readBufferU32(buffer: BufferHandle, out: []u32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (!buffer.host_visible) return error.MetalBufferError;
@@ -1028,6 +1035,37 @@ pub fn applyRoPEToDst(
         src.raw,
         dst.raw,
         dst_offset_bytes,
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        rope_style,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn applyRoPEToHalfDst(
+    backend: backend_api.MatVecBackend,
+    src: BufferHandle,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_apply_rope_to_half_dst_f32(
+        state.context,
+        src.raw,
+        dst.raw,
+        dst_offset_elements,
         @intCast(head_count),
         @intCast(head_dim),
         @intCast(rope_dim),
