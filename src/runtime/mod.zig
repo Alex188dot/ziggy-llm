@@ -278,6 +278,8 @@ pub fn benchCommand(
             defer allocator.free(stage_summary);
             try writer.print("{s}", .{stage_summary});
         }
+        try printBenchAuxProfiles(writer, summary.cold.metal_profile_summary, "cold");
+        try printBenchAuxProfiles(writer, summary.warm_metal_profile_summary, "warm");
         if (requested_profile) {
             if (summary.cold.metal_profile_summary) |summary_text| {
                 try writer.print("cold.metal_profile:\n{s}", .{summary_text});
@@ -351,9 +353,24 @@ pub fn benchCommand(
         defer allocator.free(stage_summary);
         try writer.print("{s}", .{stage_summary});
     }
+    try printBenchAuxProfiles(writer, report.metal_profile_summary, "bench");
     if (requested_profile) {
         if (report.metal_profile_summary) |summary| {
             try writer.print("{s}", .{summary});
+        }
+    }
+}
+
+fn printBenchAuxProfiles(writer: *std.Io.Writer, summary: ?[]const u8, stage: []const u8) !void {
+    const text = summary orelse return;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "fused_q_rope.profile.") or
+            std.mem.startsWith(u8, line, "fused_kv_half.profile.") or
+            std.mem.startsWith(u8, line, "fused_k.profile."))
+        {
+            try writer.print("{s}.{s}\n", .{ stage, line });
         }
     }
 }

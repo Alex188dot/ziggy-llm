@@ -330,11 +330,14 @@ Current implementation note:
 | 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits, experimental gated FFN via `.ziggy`* | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    129.461 |
 | 2026-04-09 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     71.526 |  1764.783 | 1940.379 |    127.663 |
 | 2026-04-09 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.134 |   171.289 |  275.656 |    128.529 |
+| 2026-04-09 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     67.398 |  1548.502 | 1717.667 |    126.792 |
+| 2026-04-09 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.160 |   166.766 |  269.447 |    129.032 |
 
 Experimental gated FFN note:
 
 - The current gated-FFN prototype produced a modest warm decode gain on TinyLlama (`129.461 TPS` vs `128.130 TPS`, about `+1.04%`), but the same run showed a large prompt perplexity regression (`+44.9%`) and changed output bytes early in generation. Treat it as a speed experiment, not a production-quality benchmark winner.
 - The 2026-04-09 profile confirms the decode loop is still dominated by synchronization and command submission rather than arithmetic. Warm decode spent `968.186 ms` in `commit_wait` out of `999.019 ms` total (`96.914%`), with `24064` dispatches for `128` generated tokens, or `188` dispatches per token.
+- The later 2026-04-09 re-run with fused decode-path profiling is directionally consistent: TinyLlama warm decode reached `129.032 TPS`, while warm `commit_wait` still dominated at `966.409 ms` out of `992.630 ms` (`97.358%`) with `22528` dispatches total, or `176` dispatches per token. The fused-path counters show `Q+RoPE` active on all eligible layers, `KV half-write` active on `1776 / 3256` attempts (`54.545%`), and the remaining KV cases falling back only because `attn_v` is not `tensor_type=12`, after which the single fused `K` path still succeeds on all `1480` attempts.
 
 ## Benchmark Table — Llama 3.2 3B
 
@@ -352,6 +355,12 @@ Experimental gated FFN note:
 | 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |             7 |              128 |      0.040 |   147.928 |  148.848 |     40.317 |
 | 2026-04-06 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |             7 |              128 |   1364.490 |   943.845 | 2308.407 |     40.768 |
 | 2026-04-06 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |             7 |              128 |      0.046 |   154.242 |  154.356 |     39.919 |
+| 2026-04-09 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits       | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |             7 |              128 |    226.450 |  2879.281 | 3210.800 |     41.897 |
+| 2026-04-09 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits        | MacBook Pro M3 18GB | `metal` | `Llama-3.2-3B-Instruct-Q4_K_M.gguf` |             7 |              128 |      0.188 |   166.905 |  272.176 |     41.790 |
+
+Llama 3.2 note:
+
+- The 2026-04-09 Llama 3.2 run is now the clearest current Phase 5 data point for CPU-side overhead. Warm decode stayed near the documented baseline at `41.790 TPS`, but unlike TinyLlama it used `cpu-logits` sampling and spent `77.857 ms` in CPU sampling plus `1.356 ms` in host readback during decode. GPU `commit_wait` still dominated overall at `2945.919 ms` out of `3063.268 ms` (`96.169%`), with `28800` dispatches total or `225` dispatches per token. The fused-path counters again show `Q+RoPE` active everywhere, with fused `KV half-write` active on `1890 / 3780` attempts (`50%`) and fused `K` succeeding on the remaining `1890` attempts.
 
 ## Benchmark Table — Llama 3.1 8B
 
