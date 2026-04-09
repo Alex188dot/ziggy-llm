@@ -236,7 +236,7 @@ pub const Session = struct {
             self.model.rope_freq_base,
             self.model.rope_style,
         );
-        self.recordCategoryWithShape(.elementwise_ops, q_rope_start, .{
+        self.recordCategoryWithShape(.rope, q_rope_start, .{
             .rows = self.model.head_count,
             .cols = self.model.head_dimension,
             .depth = self.model.rope_dimension_count,
@@ -267,7 +267,7 @@ pub const Session = struct {
             kv_offset_elements,
             self.model.kv_dimension,
         );
-        self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
+        self.recordCategoryWithShape(.rope, kv_k_start, .{
             .rows = self.model.head_count_kv,
             .cols = self.model.head_dimension,
             .depth = self.model.rope_dimension_count,
@@ -346,7 +346,7 @@ pub const Session = struct {
                     try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
                 }
                 const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
-                self.recordCategoryWithShape(.projections, start, shape);
+                self.recordCategoryWithShape(.projection_add_quantized, start, shape);
                 handled_fused = true;
             } else {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -360,7 +360,7 @@ pub const Session = struct {
                     try metal_backend.runMatVecQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
                 }
                 const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
-                self.recordCategoryWithShape(.projections, start, shape);
+                self.recordCategoryWithShape(.projection_add_quantized, start, shape);
                 handled_fused = true;
             }
         }
@@ -368,7 +368,7 @@ pub const Session = struct {
         if (!handled_fused) {
             const silu_start = std.time.nanoTimestamp();
             try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
-            self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
+            self.recordCategoryWithShape(.ffn_activation, silu_start, .{
                 .rows = 1,
                 .cols = self.model.feed_forward_length,
                 .depth = 2,
@@ -617,7 +617,7 @@ pub const Session = struct {
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
         };
-        self.recordCategoryWithShape(.projections, start, shape);
+        self.recordCategoryWithShape(projectionCategoryFor(tensor.tensor_type), start, shape);
         if (used_moon_quant) {
             if (self.profiler) |profiler| {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
@@ -662,7 +662,7 @@ pub const Session = struct {
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
         };
-        self.recordCategoryWithShape(.projections, start, shape);
+        self.recordCategoryWithShape(projectionCategoryFor(tensor.tensor_type), start, shape);
         if (used_moon_quant) {
             if (self.profiler) |profiler| {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
@@ -707,7 +707,7 @@ pub const Session = struct {
             .tensor_type = tensor.tensor_type,
             .extra = 1,
         };
-        self.recordCategoryWithShape(.projections, start, shape);
+        self.recordCategoryWithShape(projectionAddCategoryFor(tensor.tensor_type), start, shape);
         if (used_moon_quant) {
             if (self.profiler) |profiler| {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
@@ -719,7 +719,7 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         const bias_weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
         try metal_backend.addBiasF32(self.backend, target, bias_weights, tensor.cols);
-        self.recordCategoryWithShape(.elementwise_ops, start, .{
+        self.recordCategoryWithShape(.bias_add, start, .{
             .rows = 1,
             .cols = tensor.cols,
         });
@@ -754,6 +754,20 @@ pub const Session = struct {
 
     fn elapsedSince(start_ns: i128) u64 {
         return @intCast(@max(@as(i128, 0), std.time.nanoTimestamp() - start_ns));
+    }
+
+    fn projectionCategoryFor(tensor_type: u32) metal_profile.Category {
+        return switch (tensor_type) {
+            8, 12, 14 => .projection_quantized,
+            else => .projection_dense,
+        };
+    }
+
+    fn projectionAddCategoryFor(tensor_type: u32) metal_profile.Category {
+        return switch (tensor_type) {
+            8, 12, 14 => .projection_add_quantized,
+            else => .projection_add_dense,
+        };
     }
 
     pub fn runBatchSpeculativeDecode(

@@ -352,11 +352,11 @@ test "guardrail violation catches ttft regressions" {
 
 test "profile metric parser extracts category and moon quant totals" {
     const summary =
-        \\profile.projections.ns=120
+        \\profile.projection_quantized.ns=120
         \\profile.attention.ns=40
         \\moon_quant.profile.total_ns=70
         \\
     ;
-    try std.testing.expectEqual(@as(u64, 120), parseMetricU64ForLabel(summary, "profile.", "projections", ".ns="));
+    try std.testing.expectEqual(@as(u64, 120), parseMetricU64ForLabel(summary, "profile.", "projection_quantized", ".ns="));
     try std.testing.expectEqual(@as(u64, 70), parseMetricU64(summary, "moon_quant.profile.total_ns="));
 }

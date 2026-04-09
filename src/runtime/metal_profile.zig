@@ -1,11 +1,16 @@
 const std = @import("std");
 
 pub const Category = enum(u8) {
-    projections,
+    projection_dense,
+    projection_quantized,
+    projection_add_dense,
+    projection_add_quantized,
     attention,
     kv_writes,
     normalization,
-    elementwise_ops,
+    rope,
+    ffn_activation,
+    bias_add,
     output_reduce,
     commit_wait,
     host_readback,
@@ -13,11 +18,16 @@ pub const Category = enum(u8) {
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
-            .projections => "projections",
+            .projection_dense => "projection_dense",
+            .projection_quantized => "projection_quantized",
+            .projection_add_dense => "projection_add_dense",
+            .projection_add_quantized => "projection_add_quantized",
             .attention => "attention",
             .kv_writes => "kv_writes",
             .normalization => "normalization",
-            .elementwise_ops => "elementwise_ops",
+            .rope => "rope",
+            .ffn_activation => "ffn_activation",
+            .bias_add => "bias_add",
             .output_reduce => "output_reduce",
             .commit_wait => "commit_wait",
             .host_readback => "host_readback",
@@ -31,6 +41,41 @@ const category_count = @typeInfo(Category).@"enum".fields.len;
 pub fn categoryCount() usize {
     return category_count;
 }
+
+pub const SummaryStats = struct {
+    enabled: bool = false,
+    profiled_decode_tokens: usize = 0,
+    profiled_decode_ns: u64 = 0,
+    commit_wait_gpu_ns: u64 = 0,
+    categories_ns: [category_count]u64 = [_]u64{0} ** category_count,
+    categories_calls: [category_count]usize = [_]usize{0} ** category_count,
+
+    pub fn add(self: *SummaryStats, other: SummaryStats) void {
+        if (!other.enabled) return;
+        self.enabled = true;
+        self.profiled_decode_tokens += other.profiled_decode_tokens;
+        self.profiled_decode_ns += other.profiled_decode_ns;
+        self.commit_wait_gpu_ns += other.commit_wait_gpu_ns;
+        for (0..category_count) |index| {
+            self.categories_ns[index] += other.categories_ns[index];
+            self.categories_calls[index] += other.categories_calls[index];
+        }
+    }
+
+    pub fn average(self: SummaryStats, runs: usize) SummaryStats {
+        if (!self.enabled or runs == 0) return .{};
+
+        var averaged = self;
+        averaged.profiled_decode_tokens /= runs;
+        averaged.profiled_decode_ns /= runs;
+        averaged.commit_wait_gpu_ns /= runs;
+        for (0..category_count) |index| {
+            averaged.categories_ns[index] /= runs;
+            averaged.categories_calls[index] /= runs;
+        }
+        return averaged;
+    }
+};
 
 pub const ShapeDesc = struct {
     rows: usize = 0,
@@ -176,7 +221,7 @@ pub const Profiler = struct {
         self.current_moon_quant_token_ns += duration_ns;
 
         const key = ShapeKey{
-            .category = .projections,
+            .category = .projection_quantized,
             .rows = shape.rows,
             .cols = shape.cols,
             .depth = shape.depth,
@@ -314,6 +359,81 @@ pub const Profiler = struct {
     }
 };
 
+pub fn parseSummary(summary: ?[]const u8) SummaryStats {
+    const text = summary orelse return .{};
+    var stats = SummaryStats{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "metal_decode_profile_enabled=true")) {
+            stats.enabled = true;
+            continue;
+        }
+        if (parseMetricUsize(line, "profiled_decode_tokens=")) |value| {
+            stats.profiled_decode_tokens = value;
+            continue;
+        }
+        if (parseMetricU64(line, "profiled_decode_ns=")) |value| {
+            stats.profiled_decode_ns = value;
+            continue;
+        }
+        if (parseMetricU64(line, "profile.commit_wait.gpu_ns=")) |value| {
+            stats.commit_wait_gpu_ns = value;
+            continue;
+        }
+        if (parseCategoryMetricU64(line, ".ns=")) |entry| {
+            stats.categories_ns[@intFromEnum(entry.category)] = entry.value;
+            continue;
+        }
+        if (parseCategoryMetricUsize(line, ".calls=")) |entry| {
+            stats.categories_calls[@intFromEnum(entry.category)] = entry.value;
+            continue;
+        }
+    }
+    return stats;
+}
+
+pub fn renderBenchStageSummary(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    stats: SummaryStats,
+) !?[]u8 {
+    if (!stats.enabled) return null;
+
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    const writer = buffer.writer(allocator);
+
+    try writer.print("{s}.decode_profile.tokens={d}\n", .{ prefix, stats.profiled_decode_tokens });
+    try writer.print("{s}.decode_profile.total_ms={d:.3}\n", .{ prefix, nsToMs(stats.profiled_decode_ns) });
+    try writer.print("{s}.decode_profile.commit_wait_gpu_ms={d:.3}\n", .{ prefix, nsToMs(stats.commit_wait_gpu_ns) });
+    try writer.print(
+        "{s}.decode_profile.commit_wait_gpu_share_pct={d:.3}\n",
+        .{ prefix, percentage(stats.commit_wait_gpu_ns, stats.profiled_decode_ns) },
+    );
+
+    for (std.enums.values(Category)) |category| {
+        const total_ns = stats.categories_ns[@intFromEnum(category)];
+        const total_calls = stats.categories_calls[@intFromEnum(category)];
+        try writer.print(
+            "{s}.decode_profile.{s}_ms={d:.3}\n{s}.decode_profile.{s}_share_pct={d:.3}\n{s}.decode_profile.{s}_calls={d}\n",
+            .{
+                prefix,
+                category.label(),
+                nsToMs(total_ns),
+                prefix,
+                category.label(),
+                percentage(total_ns, stats.profiled_decode_ns),
+                prefix,
+                category.label(),
+                total_calls,
+            },
+        );
+    }
+
+    return try buffer.toOwnedSlice(allocator);
+}
+
 fn totalCategoryTime(categories: *const [category_count]CategoryStats) u64 {
     var total: u64 = 0;
     for (categories) |stats| total += stats.total_ns;
@@ -331,11 +451,59 @@ fn percentage(part: u64, whole: u64) f64 {
     return (@as(f64, @floatFromInt(part)) * 100.0) / @as(f64, @floatFromInt(whole));
 }
 
+fn nsToMs(value: u64) f64 {
+    return @as(f64, @floatFromInt(value)) / std.time.ns_per_ms;
+}
+
+fn parseMetricU64(line: []const u8, key: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, line, key)) return null;
+    return std.fmt.parseUnsigned(u64, line[key.len..], 10) catch null;
+}
+
+fn parseMetricUsize(line: []const u8, key: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, line, key)) return null;
+    return std.fmt.parseUnsigned(usize, line[key.len..], 10) catch null;
+}
+
+fn parseCategoryMetricU64(line: []const u8, suffix: []const u8) ?struct { category: Category, value: u64 } {
+    const prefix = "profile.";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = line[prefix.len..];
+    for (std.enums.values(Category)) |category| {
+        const label = category.label();
+        if (!std.mem.startsWith(u8, rest, label)) continue;
+        const remainder = rest[label.len..];
+        if (!std.mem.startsWith(u8, remainder, suffix)) continue;
+        return .{
+            .category = category,
+            .value = std.fmt.parseUnsigned(u64, remainder[suffix.len..], 10) catch return null,
+        };
+    }
+    return null;
+}
+
+fn parseCategoryMetricUsize(line: []const u8, suffix: []const u8) ?struct { category: Category, value: usize } {
+    const prefix = "profile.";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = line[prefix.len..];
+    for (std.enums.values(Category)) |category| {
+        const label = category.label();
+        if (!std.mem.startsWith(u8, rest, label)) continue;
+        const remainder = rest[label.len..];
+        if (!std.mem.startsWith(u8, remainder, suffix)) continue;
+        return .{
+            .category = category,
+            .value = std.fmt.parseUnsigned(usize, remainder[suffix.len..], 10) catch return null,
+        };
+    }
+    return null;
+}
+
 fn topCategoryBreakdown(categories: [category_count]CategoryStats) [3]TopCategory {
     var top = [_]TopCategory{
-        .{ .category = .projections, .total_ns = 0 },
-        .{ .category = .projections, .total_ns = 0 },
-        .{ .category = .projections, .total_ns = 0 },
+        .{ .category = .projection_dense, .total_ns = 0 },
+        .{ .category = .projection_dense, .total_ns = 0 },
+        .{ .category = .projection_dense, .total_ns = 0 },
     };
 
     for (std.enums.values(Category)) |category| {
@@ -386,7 +554,7 @@ test "profiler summary exposes top bottlenecks and shapes" {
     defer profiler.deinit();
 
     profiler.beginDecodeToken();
-    profiler.recordWithShape(.projections, 200, .{ .rows = 64, .cols = 128, .tensor_type = 12 });
+    profiler.recordWithShape(.projection_quantized, 200, .{ .rows = 64, .cols = 128, .tensor_type = 12 });
     profiler.record(.attention, 90);
     profiler.recordWithShape(.kv_writes, 30, .{ .rows = 1, .cols = 128, .depth = 2 });
     profiler.record(.cpu_sampling, 10);
@@ -398,11 +566,39 @@ test "profiler summary exposes top bottlenecks and shapes" {
     const summary = try profiler.renderSummary(std.testing.allocator);
     defer std.testing.allocator.free(summary);
 
-    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.top_bottleneck_1=projections:200ns") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.shape_1=projections:rows=64:cols=128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.top_bottleneck_1=projection_quantized:200ns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "profile.shape_1=projection_quantized:rows=64:cols=128") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.token_0.cpu_sampling.ns=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.commit_wait.gpu_ns=25") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "profile.token_0.commit_wait.gpu_ns=25") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "moon_quant.profile.total_ns=150") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "moon_quant.profile.token_0.ns=150") != null);
+}
+
+test "summary parser and bench renderer expose averaged decode stages" {
+    const summary =
+        \\metal_decode_profile_enabled=true
+        \\profiled_decode_tokens=4
+        \\profiled_decode_ns=1000
+        \\profile.commit_wait.gpu_ns=100
+        \\profile.projection_quantized.ns=400
+        \\profile.projection_quantized.calls=8
+        \\profile.attention.ns=300
+        \\profile.attention.calls=4
+        \\profile.cpu_sampling.ns=50
+        \\profile.cpu_sampling.calls=4
+        \\
+    ;
+    const stats = parseSummary(summary);
+    try std.testing.expect(stats.enabled);
+    try std.testing.expectEqual(@as(usize, 4), stats.profiled_decode_tokens);
+    try std.testing.expectEqual(@as(u64, 400), stats.categories_ns[@intFromEnum(Category.projection_quantized)]);
+
+    const rendered = try renderBenchStageSummary(std.testing.allocator, "warm", stats);
+    defer if (rendered) |text| std.testing.allocator.free(text);
+
+    try std.testing.expect(rendered != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.total_ms=0.001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.projection_quantized_ms=0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.?, "warm.decode_profile.attention_share_pct=30.000") != null);
 }
