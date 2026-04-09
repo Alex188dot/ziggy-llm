@@ -485,11 +485,6 @@ kernel void matvec_q6k_f32(
     }
 }
 
-inline uint ziggy_ordered_float_bits(float value) {
-    const uint bits = as_type<uint>(value);
-    return (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
-}
-
 kernel void matvec_q6k_argmax_f32(
     device const uchar *matrix [[buffer(0)]],
     device const float *input [[buffer(1)]],
@@ -556,7 +551,8 @@ kernel void matvec_q6k_argmax_f32(
         device atomic_uint *best_value = output_state;
         device atomic_uint *best_token = output_state + 1;
         uint observed = atomic_load_explicit(best_value, memory_order_relaxed);
-        const uint ordered = ziggy_ordered_float_bits(sum);
+        const uint bits = as_type<uint>(sum);
+        const uint ordered = (bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u);
         while (ordered > observed) {
             if (atomic_compare_exchange_weak_explicit(
                     best_value,

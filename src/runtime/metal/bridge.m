@@ -577,7 +577,6 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k add 5632 pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
-
         id<MTLComputePipelineState> matvec_q6k_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_f32", &pipeline_error);
         if (matvec_q6k_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k matvec pipeline");
@@ -659,7 +658,6 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal MoonQuant q4k add 5632 pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
-
         id<MTLComputePipelineState> matvec_q4k_silu_down_add_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_silu_down_add_f32", &pipeline_error);
         if (matvec_q4k_silu_down_add_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k silu down add pipeline");

@@ -328,10 +328,13 @@ Current implementation note:
 | 2026-04-08 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax* | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     48.951 |   373.827 |  422.834 |    126.056 |
 | 2026-04-08 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax*  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.025 |   152.389 |  152.463 |    127.346 |
 | 2026-04-08 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits, experimental gated FFN via `.ziggy`* | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.026 |   153.441 |  153.750 |    129.461 |
+| 2026-04-09 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |     71.526 |  1764.783 | 1940.379 |    127.663 |
+| 2026-04-09 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` |            20 |              128 |      0.134 |   171.289 |  275.656 |    128.529 |
 
 Experimental gated FFN note:
 
 - The current gated-FFN prototype produced a modest warm decode gain on TinyLlama (`129.461 TPS` vs `128.130 TPS`, about `+1.04%`), but the same run showed a large prompt perplexity regression (`+44.9%`) and changed output bytes early in generation. Treat it as a speed experiment, not a production-quality benchmark winner.
+- The 2026-04-09 profile confirms the decode loop is still dominated by synchronization and command submission rather than arithmetic. Warm decode spent `968.186 ms` in `commit_wait` out of `999.019 ms` total (`96.914%`), with `24064` dispatches for `128` generated tokens, or `188` dispatches per token.
 
 ## Benchmark Table — Llama 3.2 3B
 

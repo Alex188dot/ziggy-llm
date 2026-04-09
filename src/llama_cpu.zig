@@ -1536,34 +1536,6 @@ pub fn generateLoadedStreaming(
                     }
                 }
                 greedy_next_token = accepted_tokens[i];
-            } else if (draft_tokens.len > 0) {
-                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
-                var i: usize = 0;
-                while (i < accepted_count - 1) : (i += 1) {
-                    const t = accepted_tokens[i];
-                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
-                        greedy_next_token = t;
-                        break;
-                    }
-                    if (generated_token_count + 1 >= options.max_tokens) {
-                        greedy_next_token = t;
-                        break;
-                    }
-                    generated_token_count += 1;
-                    const inner_chunk_start = output.items.len;
-                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
-                    if (stream_callback) |inner_cb| {
-                        const chunk = output.items[inner_chunk_start..];
-                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
-                            error.StopStreaming => {
-                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
-                                break;
-                            },
-                            else => return err,
-                        };
-                    }
-                }
-                greedy_next_token = accepted_tokens[i];
             } else {
                 greedy_next_token = try session.stepGreedy(next_token);
             }
