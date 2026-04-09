@@ -1555,9 +1555,13 @@ pub fn generateLoadedStreaming(
     const decode_end = std.time.nanoTimestamp();
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
-    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
+    const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const profile_summary = try combineOptionalSummaries(allocator, base_plus_gated, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
+    if (fused_k_summary) |summary| allocator.free(summary);
+    if (base_plus_gated) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -1759,9 +1763,13 @@ pub fn generateLoadedStreamingCached(
     const decode_end = std.time.nanoTimestamp();
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
-    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
+    const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const profile_summary = try combineOptionalSummaries(allocator, base_plus_gated, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
+    if (fused_k_summary) |summary| allocator.free(summary);
+    if (base_plus_gated) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),

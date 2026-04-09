@@ -79,6 +79,16 @@ pub const ShortlistEntry = struct {
     logit: f32,
 };
 
+const FusedKFallbackReason = enum(u8) {
+    success,
+    tensor_type,
+    k_bias,
+    k_norm,
+    rope_style,
+    rope_dim,
+    raw_missing,
+};
+
 pub const max_shortlist_len: usize = 64;
 pub const max_draft_len: usize = 4;
 
@@ -109,6 +119,10 @@ pub const Session = struct {
     gated_ffn_enabled: bool,
     gated_ffn_total_blocks: u64 = 0,
     gated_ffn_active_blocks: u64 = 0,
+    fused_k_attempts: u64 = 0,
+    fused_k_successes: u64 = 0,
+    fused_k_fallback_counts: [@typeInfo(FusedKFallbackReason).@"enum".fields.len]u64 =
+        [_]u64{0} ** @typeInfo(FusedKFallbackReason).@"enum".fields.len,
     profiler: ?*metal_profile.Profiler = null,
 
     pub fn init(
@@ -251,53 +265,60 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-        const kv_k_start = std.time.nanoTimestamp();
-        if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
-            try self.runProjection(layer.attn_k, self.normed, self.k);
-            try self.runProjection(layer.attn_v, self.normed, self.v);
-        }
-        if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
-        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
-        try metal_backend.applyRoPEToHalfDst(
-            self.backend,
-            self.k,
-            self.k_cache,
-            kv_offset_elements,
-            self.model.head_count_kv,
-            self.model.head_dimension,
-            self.model.rope_dimension_count,
-            position,
-            self.model.rope_freq_base,
-            self.model.rope_style,
-        );
-        self.recordCategoryWithShape(.rope, kv_k_start, .{
-            .rows = self.model.head_count_kv,
-            .cols = self.model.head_dimension,
-            .depth = self.model.rope_dimension_count,
-            .extra = position + 1,
-        });
-        self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
-            .rows = 1,
-            .cols = self.model.kv_dimension,
-            .depth = layer_index,
-            .extra = position + 1,
-        });
+        if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.normed)) {
+            const kv_k_start = std.time.nanoTimestamp();
+            const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.normed);
+            if (fused_k_written) {
+                try self.runProjection(layer.attn_v, self.normed, self.v);
+            } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
+                try self.runProjection(layer.attn_k, self.normed, self.k);
+                try self.runProjection(layer.attn_v, self.normed, self.v);
+            }
+            if (!fused_k_written) {
+                if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
+                if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
+                try metal_backend.applyRoPEToHalfDst(
+                    self.backend,
+                    self.k,
+                    self.k_cache,
+                    kv_offset_elements,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    position,
+                    self.model.rope_freq_base,
+                    self.model.rope_style,
+                );
+                self.recordCategoryWithShape(.rope, kv_k_start, .{
+                    .rows = self.model.head_count_kv,
+                    .cols = self.model.head_dimension,
+                    .depth = self.model.rope_dimension_count,
+                    .extra = position + 1,
+                });
+                self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
+                    .rows = 1,
+                    .cols = self.model.kv_dimension,
+                    .depth = layer_index,
+                    .extra = position + 1,
+                });
+            }
 
-        const kv_v_start = std.time.nanoTimestamp();
-        if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.v,
-            self.v_cache,
-            kv_offset_elements,
-            self.model.kv_dimension,
-        );
-        self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
-            .rows = 1,
-            .cols = self.model.kv_dimension,
-            .depth = layer_index,
-            .extra = position + 1,
-        });
+            const kv_v_start = std.time.nanoTimestamp();
+            if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
+            try metal_backend.storeKvHalf(
+                self.backend,
+                self.v,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.kv_dimension,
+            );
+            self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
+                .rows = 1,
+                .cols = self.model.kv_dimension,
+                .depth = layer_index,
+                .extra = position + 1,
+            });
+        }
         const attention_start = std.time.nanoTimestamp();
         try metal_backend.attentionFused(
             self.backend,
@@ -419,6 +440,37 @@ pub const Session = struct {
                 (1.0 - active_ratio) * 100.0,
             },
         );
+    }
+
+    pub fn renderFusedKSummary(self: *const Session, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.fused_k_attempts == 0) return null;
+
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
+        try writer.print(
+            "fused_k.profile.attempts={d}\nfused_k.profile.successes={d}\nfused_k.profile.success_pct={d:.3}\n",
+            .{
+                self.fused_k_attempts,
+                self.fused_k_successes,
+                percent(self.fused_k_successes, self.fused_k_attempts),
+            },
+        );
+        inline for ([_]FusedKFallbackReason{
+            .success,
+            .tensor_type,
+            .k_bias,
+            .k_norm,
+            .rope_style,
+            .rope_dim,
+            .raw_missing,
+        }) |reason| {
+            try writer.print(
+                "fused_k.profile.reason.{s}={d}\n",
+                .{ @tagName(reason), self.fused_k_fallback_counts[@intFromEnum(reason)] },
+            );
+        }
+        return try buffer.toOwnedSlice(allocator);
     }
 
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
@@ -755,6 +807,138 @@ pub const Session = struct {
         return true;
     }
 
+    fn runFusedKvCacheWrite(
+        self: *Session,
+        layer: LayerDesc,
+        layer_index: usize,
+        position: usize,
+        input: metal_backend.BufferHandle,
+    ) !bool {
+        if (layer.attn_k.tensor_type != 12 or layer.attn_v.tensor_type != 12) return false;
+        if (layer.attn_k.rows != layer.attn_v.rows or layer.attn_k.cols != layer.attn_v.cols) return false;
+        if (layer.attn_k_bias != null or layer.attn_k_norm != null or layer.attn_v_bias != null) return false;
+        if (self.model.rope_style != 0) return false;
+        if (self.model.rope_dimension_count != self.model.head_dimension) return false;
+
+        const k_matrix = self.dense_lookup.getRaw(layer.attn_k.offset) orelse return false;
+        const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse return false;
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+        const start = std.time.nanoTimestamp();
+        try metal_backend.runMatVecQ4KDualKvHalf(
+            self.backend,
+            k_matrix,
+            v_matrix,
+            input,
+            self.k_cache,
+            self.v_cache,
+            kv_offset_elements,
+            self.model.head_count_kv,
+            self.model.head_dimension,
+            self.model.rope_dimension_count,
+            layer.attn_k.cols,
+            position,
+            self.model.rope_freq_base,
+            self.model.rope_style,
+        );
+        self.recordCategoryWithShape(.projection_quantized, start, .{
+            .rows = layer.attn_k.rows,
+            .cols = layer.attn_k.cols,
+            .tensor_type = layer.attn_k.tensor_type,
+            .extra = 2,
+        });
+        return true;
+    }
+
+    fn runFusedKCacheWrite(
+        self: *Session,
+        layer: LayerDesc,
+        layer_index: usize,
+        position: usize,
+        input: metal_backend.BufferHandle,
+    ) !bool {
+        self.fused_k_attempts += 1;
+        if (layer.attn_k.tensor_type != 12) {
+            self.recordFusedKFallback(.tensor_type);
+            return false;
+        }
+        if (layer.attn_k_bias != null) {
+            self.recordFusedKFallback(.k_bias);
+            return false;
+        }
+        if (layer.attn_k_norm != null) {
+            self.recordFusedKFallback(.k_norm);
+            return false;
+        }
+        if (self.model.rope_style != 0) {
+            self.recordFusedKFallback(.rope_style);
+            return false;
+        }
+        if (self.model.rope_dimension_count != self.model.head_dimension) {
+            self.recordFusedKFallback(.rope_dim);
+            return false;
+        }
+
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+        const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
+        if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
+            try metal_backend.runMatVecMoonQuantQ4KKHalf(
+                self.backend,
+                k_matrix,
+                input,
+                self.k_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                layer.attn_k.cols,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+            used_moon_quant = true;
+        } else if (self.dense_lookup.getRaw(layer.attn_k.offset)) |k_matrix| {
+            try metal_backend.runMatVecQ4KKHalf(
+                self.backend,
+                k_matrix,
+                input,
+                self.k_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                layer.attn_k.cols,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+        } else {
+            self.recordFusedKFallback(.raw_missing);
+            return false;
+        }
+        self.recordCategoryWithShape(.projection_quantized, start, .{
+            .rows = layer.attn_k.rows,
+            .cols = layer.attn_k.cols,
+            .tensor_type = layer.attn_k.tensor_type,
+            .extra = 1,
+        });
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), .{
+                    .rows = layer.attn_k.rows,
+                    .cols = layer.attn_k.cols,
+                    .tensor_type = layer.attn_k.tensor_type,
+                    .extra = 1,
+                });
+            }
+        }
+        self.fused_k_successes += 1;
+        self.recordFusedKFallback(.success);
+        return true;
+    }
+
     fn runProjectionToDst(
         self: *Session,
         tensor: TensorDesc,
@@ -887,6 +1071,15 @@ pub const Session = struct {
         return @intCast(@max(@as(i128, 0), std.time.nanoTimestamp() - start_ns));
     }
 
+    fn percent(numerator: u64, denominator: u64) f64 {
+        if (denominator == 0) return 0;
+        return (@as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator))) * 100.0;
+    }
+
+    fn recordFusedKFallback(self: *Session, reason: FusedKFallbackReason) void {
+        self.fused_k_fallback_counts[@intFromEnum(reason)] += 1;
+    }
+
     fn projectionCategoryFor(tensor_type: u32) metal_profile.Category {
         return switch (tensor_type) {
             8, 12, 14 => .projection_quantized,
@@ -942,30 +1135,37 @@ pub const Session = struct {
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
                 const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-                if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
-                    try self.runProjection(layer.attn_k, self.normed, self.k);
-                    try self.runProjection(layer.attn_v, self.normed, self.v);
-                }
-                try metal_backend.applyRoPEToHalfDst(
-                    self.backend,
-                    self.k,
-                    self.k_cache,
-                    kv_offset_elements,
-                    self.model.head_count_kv,
-                    self.model.head_dimension,
-                    self.model.rope_dimension_count,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
+                if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.normed)) {
+                    const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.normed);
+                    if (fused_k_written) {
+                        try self.runProjection(layer.attn_v, self.normed, self.v);
+                    } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
+                        try self.runProjection(layer.attn_k, self.normed, self.k);
+                        try self.runProjection(layer.attn_v, self.normed, self.v);
+                    }
+                    if (!fused_k_written) {
+                        try metal_backend.applyRoPEToHalfDst(
+                            self.backend,
+                            self.k,
+                            self.k_cache,
+                            kv_offset_elements,
+                            self.model.head_count_kv,
+                            self.model.head_dimension,
+                            self.model.rope_dimension_count,
+                            position,
+                            self.model.rope_freq_base,
+                            self.model.rope_style,
+                        );
+                    }
 
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.v,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.kv_dimension,
-                );
+                    try metal_backend.storeKvHalf(
+                        self.backend,
+                        self.v,
+                        self.v_cache,
+                        kv_offset_elements,
+                        self.model.kv_dimension,
+                    );
+                }
 
                 try metal_backend.attentionFused(
                     self.backend,

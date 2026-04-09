@@ -636,6 +636,40 @@ int ziggy_metal_run_matvec_q4k_dual_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q4k_k_half_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_k_half_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_q4k_dual_kv_half_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix_k,
