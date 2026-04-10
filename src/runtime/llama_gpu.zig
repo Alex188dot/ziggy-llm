@@ -1,5 +1,6 @@
 const std = @import("std");
 const backend_api = @import("backend.zig");
+const gguf = @import("../gguf.zig");
 const metal_backend = @import("metal_backend.zig");
 const metal_profile = @import("metal_profile.zig");
 
@@ -113,6 +114,14 @@ const FusedKvFallbackReason = enum(u8) {
 
 pub const max_shortlist_len: usize = 64;
 pub const max_draft_len: usize = 4;
+const ggml_type_count: usize = 41;
+const q4_k_tensor_type: u32 = @intFromEnum(gguf.TensorType.q4_k);
+const q6_k_tensor_type: u32 = @intFromEnum(gguf.TensorType.q6_k);
+
+const FusedKvKernel = enum {
+    q4k_q4k,
+    q4k_q6k,
+};
 
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
@@ -149,6 +158,8 @@ pub const Session = struct {
     fused_kv_successes: u64 = 0,
     fused_kv_fallback_counts: [@typeInfo(FusedKvFallbackReason).@"enum".fields.len]u64 =
         [_]u64{0} ** @typeInfo(FusedKvFallbackReason).@"enum".fields.len,
+    fused_kv_tensor_pair_counts: [ggml_type_count * ggml_type_count]u64 =
+        [_]u64{0} ** (ggml_type_count * ggml_type_count),
     fused_k_attempts: u64 = 0,
     fused_k_successes: u64 = 0,
     fused_k_fallback_counts: [@typeInfo(FusedKFallbackReason).@"enum".fields.len]u64 =
@@ -533,6 +544,15 @@ pub const Session = struct {
             try writer.print(
                 "fused_kv_half.profile.reason.{s}={d}\n",
                 .{ @tagName(reason), self.fused_kv_fallback_counts[@intFromEnum(reason)] },
+            );
+        }
+        for (self.fused_kv_tensor_pair_counts, 0..) |count, index| {
+            if (count == 0) continue;
+            const k_type: u32 = @intCast(index / ggml_type_count);
+            const v_type: u32 = @intCast(index % ggml_type_count);
+            try writer.print(
+                "fused_kv_half.profile.tensor_pair.{s}.{s}={d}\n",
+                .{ tensorTypeName(k_type), tensorTypeName(v_type), count },
             );
         }
         return try buffer.toOwnedSlice(allocator);
@@ -1009,10 +1029,11 @@ pub const Session = struct {
         input: metal_backend.BufferHandle,
     ) !bool {
         self.fused_kv_attempts += 1;
-        if (layer.attn_k.tensor_type != 12 or layer.attn_v.tensor_type != 12) {
+        self.recordFusedKvTensorPair(layer.attn_k.tensor_type, layer.attn_v.tensor_type);
+        const kernel = fusedKvKernelFor(layer.attn_k.tensor_type, layer.attn_v.tensor_type) orelse {
             self.recordFusedKvFallback(.tensor_type);
             return false;
-        }
+        };
         if (layer.attn_k.rows != layer.attn_v.rows or layer.attn_k.cols != layer.attn_v.cols) {
             self.recordFusedKvFallback(.shape);
             return false;
@@ -1042,47 +1063,51 @@ pub const Session = struct {
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
         const start = std.time.nanoTimestamp();
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            if (self.dense_lookup.getMoonQuant(layer.attn_v.offset)) |v_matrix| {
-                try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
-                    self.backend,
-                    k_matrix,
-                    v_matrix,
-                    input,
-                    self.k_cache,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.head_count_kv,
-                    self.model.head_dimension,
-                    self.model.rope_dimension_count,
-                    layer.attn_k.cols,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
-            } else if (layer.attn_v.tensor_type == 14) {
-                const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse {
-                    self.recordFusedKvFallback(.matrix_missing);
-                    return false;
-                };
-                try metal_backend.runMatVecMoonQuantQ4KQ6KDualKvHalf(
-                    self.backend,
-                    k_matrix,
-                    v_matrix,
-                    input,
-                    self.k_cache,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.head_count_kv,
-                    self.model.head_dimension,
-                    self.model.rope_dimension_count,
-                    layer.attn_k.cols,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
-            } else {
-                self.recordFusedKvFallback(.matrix_missing);
-                return false;
+            switch (kernel) {
+                .q4k_q4k => {
+                    const v_matrix = self.dense_lookup.getMoonQuant(layer.attn_v.offset) orelse {
+                        self.recordFusedKvFallback(.matrix_missing);
+                        return false;
+                    };
+                    try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
+                        self.backend,
+                        k_matrix,
+                        v_matrix,
+                        input,
+                        self.k_cache,
+                        self.v_cache,
+                        kv_offset_elements,
+                        self.model.head_count_kv,
+                        self.model.head_dimension,
+                        self.model.rope_dimension_count,
+                        layer.attn_k.cols,
+                        position,
+                        self.model.rope_freq_base,
+                        self.model.rope_style,
+                    );
+                },
+                .q4k_q6k => {
+                    const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse {
+                        self.recordFusedKvFallback(.matrix_missing);
+                        return false;
+                    };
+                    try metal_backend.runMatVecMoonQuantQ4KQ6KDualKvHalf(
+                        self.backend,
+                        k_matrix,
+                        v_matrix,
+                        input,
+                        self.k_cache,
+                        self.v_cache,
+                        kv_offset_elements,
+                        self.model.head_count_kv,
+                        self.model.head_dimension,
+                        self.model.rope_dimension_count,
+                        layer.attn_k.cols,
+                        position,
+                        self.model.rope_freq_base,
+                        self.model.rope_style,
+                    );
+                },
             }
             const shape = metal_profile.ShapeDesc{
                 .rows = layer.attn_k.rows,
@@ -1119,8 +1144,8 @@ pub const Session = struct {
             self.recordFusedKvFallback(.matrix_missing);
             return false;
         };
-        if (layer.attn_v.tensor_type == 12) {
-            try metal_backend.runMatVecQ4KDualKvHalf(
+        switch (kernel) {
+            .q4k_q4k => try metal_backend.runMatVecQ4KDualKvHalf(
                 self.backend,
                 k_matrix,
                 v_matrix,
@@ -1135,9 +1160,8 @@ pub const Session = struct {
                 position,
                 self.model.rope_freq_base,
                 self.model.rope_style,
-            );
-        } else if (layer.attn_v.tensor_type == 14) {
-            try metal_backend.runMatVecQ4KQ6KDualKvHalf(
+            ),
+            .q4k_q6k => try metal_backend.runMatVecQ4KQ6KDualKvHalf(
                 self.backend,
                 k_matrix,
                 v_matrix,
@@ -1152,10 +1176,7 @@ pub const Session = struct {
                 position,
                 self.model.rope_freq_base,
                 self.model.rope_style,
-            );
-        } else {
-            self.recordFusedKvFallback(.tensor_type);
-            return false;
+            ),
         }
         self.recordCategoryWithShape(.projection_quantized, start, .{
             .rows = layer.attn_k.rows,
@@ -1421,6 +1442,11 @@ pub const Session = struct {
         self.fused_kv_fallback_counts[@intFromEnum(reason)] += 1;
     }
 
+    fn recordFusedKvTensorPair(self: *Session, k_type: u32, v_type: u32) void {
+        if (k_type >= ggml_type_count or v_type >= ggml_type_count) return;
+        self.fused_kv_tensor_pair_counts[fusedKvTensorPairIndex(k_type, v_type)] += 1;
+    }
+
     fn projectionCategoryFor(tensor_type: u32) metal_profile.Category {
         return switch (tensor_type) {
             8, 12, 14 => .projection_quantized,
@@ -1432,6 +1458,58 @@ pub const Session = struct {
         return switch (tensor_type) {
             8, 12, 14 => .projection_add_quantized,
             else => .projection_add_dense,
+        };
+    }
+
+    fn fusedKvTensorPairIndex(k_type: u32, v_type: u32) usize {
+        return (@as(usize, @intCast(k_type)) * ggml_type_count) + @as(usize, @intCast(v_type));
+    }
+
+    fn fusedKvKernelFor(k_type: u32, v_type: u32) ?FusedKvKernel {
+        if (k_type != q4_k_tensor_type) return null;
+        return switch (v_type) {
+            q4_k_tensor_type => .q4k_q4k,
+            q6_k_tensor_type => .q4k_q6k,
+            else => null,
+        };
+    }
+
+    fn tensorTypeName(tensor_type: u32) []const u8 {
+        const parsed = std.meta.intToEnum(gguf.TensorType, tensor_type) catch return "unknown";
+        return switch (parsed) {
+            .f32 => "f32",
+            .f16 => "f16",
+            .q4_0 => "q4_0",
+            .q4_1 => "q4_1",
+            .q5_0 => "q5_0",
+            .q5_1 => "q5_1",
+            .q8_0 => "q8_0",
+            .q8_1 => "q8_1",
+            .q2_k => "q2_k",
+            .q3_k => "q3_k",
+            .q4_k => "q4_k",
+            .q5_k => "q5_k",
+            .q6_k => "q6_k",
+            .q8_k => "q8_k",
+            .iq2_xxs => "iq2_xxs",
+            .iq2_xs => "iq2_xs",
+            .iq3_xxs => "iq3_xxs",
+            .iq1_s => "iq1_s",
+            .iq4_nl => "iq4_nl",
+            .iq3_s => "iq3_s",
+            .iq2_s => "iq2_s",
+            .iq4_xs => "iq4_xs",
+            .i8 => "i8",
+            .i16 => "i16",
+            .i32 => "i32",
+            .i64 => "i64",
+            .f64 => "f64",
+            .iq1_m => "iq1_m",
+            .bf16 => "bf16",
+            .tq1_0 => "tq1_0",
+            .tq2_0 => "tq2_0",
+            .mxfp4 => "mxfp4",
+            .nvfp4 => "nvfp4",
         };
     }
 
@@ -1579,3 +1657,17 @@ pub const Session = struct {
         return accepted;
     }
 };
+
+test "fused kv selector accepts q4_k/q4_k and q4_k/q6_k only" {
+    try std.testing.expectEqual(FusedKvKernel.q4k_q4k, Session.fusedKvKernelFor(q4_k_tensor_type, q4_k_tensor_type).?);
+    try std.testing.expectEqual(FusedKvKernel.q4k_q6k, Session.fusedKvKernelFor(q4_k_tensor_type, q6_k_tensor_type).?);
+    try std.testing.expect(Session.fusedKvKernelFor(q6_k_tensor_type, q4_k_tensor_type) == null);
+    try std.testing.expect(Session.fusedKvKernelFor(q6_k_tensor_type, q6_k_tensor_type) == null);
+}
+
+test "fused kv tensor pair index is stable" {
+    try std.testing.expectEqual(
+        @as(usize, q4_k_tensor_type * ggml_type_count + q6_k_tensor_type),
+        Session.fusedKvTensorPairIndex(q4_k_tensor_type, q6_k_tensor_type),
+    );
+}
