@@ -288,14 +288,14 @@ pub const DenseTensorStore = struct {
             if (profiler) |active_profiler| {
                 active_profiler.recordTensor(.tensor_prepare_quant_raw, tensor, tensor_bytes.len, types.deltaNs(prepare_start, std.time.nanoTimestamp()));
             }
-            if (tensor.tensor_type == .q4_k and moon_quant_mode == .enabled) {
+            if (moon_quant_mode == .enabled and (tensor.tensor_type == .q4_k or tensor.tensor_type == .q6_k)) {
                 const pack_start = std.time.nanoTimestamp();
-                try self.moon_quant_tensors.put(tensor.offset, try moon_quant.packQ4KTensor(
-                    self.allocator,
-                    tensor_bytes,
-                    rows,
-                    cols,
-                ));
+                const packed_tensor_bytes = switch (tensor.tensor_type) {
+                    .q4_k => try moon_quant.packQ4KTensor(self.allocator, tensor_bytes, rows, cols),
+                    .q6_k => try moon_quant.packQ6KTensor(self.allocator, tensor_bytes, rows, cols),
+                    else => unreachable,
+                };
+                try self.moon_quant_tensors.put(tensor.offset, packed_tensor_bytes);
                 if (profiler) |active_profiler| {
                     const packed_tensor = self.moon_quant_tensors.get(tensor.offset).?;
                     active_profiler.recordTensor(.tensor_prepare_moon_quant_pack, tensor, packed_tensor.bytes.len, types.deltaNs(pack_start, std.time.nanoTimestamp()));
@@ -530,6 +530,39 @@ test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
     try llama_fixture.writeFixtureFile(tmp.dir, "llama-q4k.gguf", fixture);
 
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-q4k.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    var packed_store = DenseTensorStore.init(std.testing.allocator);
+    defer packed_store.deinit();
+    try packed_store.populate(&model, .enabled, null);
+    try std.testing.expect(packed_store.getRawByOffset(model.output.offset) != null);
+    try std.testing.expect(packed_store.getMoonQuantBytesByOffset(model.output.offset) != null);
+    const packed_plan = packed_store.prewarmPlan();
+    try std.testing.expectEqual(@as(usize, 0), packed_plan.raw_count);
+    try std.testing.expect(packed_plan.skipped_shadowed_raw_count > 0);
+
+    var generic_store = DenseTensorStore.init(std.testing.allocator);
+    defer generic_store.deinit();
+    try generic_store.populate(&model, .disabled, null);
+    try std.testing.expect(generic_store.getRawByOffset(model.output.offset) != null);
+    try std.testing.expect(generic_store.getMoonQuantBytesByOffset(model.output.offset) == null);
+    const generic_plan = generic_store.prewarmPlan();
+    try std.testing.expect(generic_plan.raw_count > 0);
+    try std.testing.expectEqual(@as(usize, 0), generic_plan.skipped_shadowed_raw_count);
+}
+
+test "dense tensor store packs q6_k tensors only when MoonQuant is enabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const fixture = try llama_fixture.makeLlamaQ6KFixture(std.testing.allocator);
+    defer std.testing.allocator.free(fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "llama-q6k.gguf", fixture);
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-q6k.gguf");
     defer std.testing.allocator.free(path);
 
     var model = try llama.loadModel(std.testing.allocator, path);

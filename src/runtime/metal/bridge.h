@@ -92,6 +92,16 @@ int ziggy_metal_read_buffer(
     size_t error_message_len
 );
 
+int ziggy_metal_rms_norm_scale_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_scale,
+    uint32_t count,
+    float eps,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
@@ -205,10 +215,36 @@ int ziggy_metal_run_matvec_q6k_argmax_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q6k_argmax_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *output_packed,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_q4k_argmax_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
     const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_packed,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_q4k_argmax_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
     ZiggyMetalBuffer *output_packed,
     uint32_t rows,
     uint32_t cols,
@@ -284,6 +320,40 @@ int ziggy_metal_run_matvec_moonq_q4k_add_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_moonq_q6k_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q6k_f32_to_dst(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    size_t output_offset_bytes,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q6k_add_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_q4k_q_rope_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
@@ -300,10 +370,46 @@ int ziggy_metal_run_matvec_q4k_q_rope_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q4k_q_rope_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_moonq_q4k_q_rope_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
     const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_q_rope_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
     ZiggyMetalBuffer *output,
     uint32_t head_count,
     uint32_t head_dim,
@@ -699,10 +805,48 @@ int ziggy_metal_run_matvec_q4k_k_half_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q4k_k_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *k_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_moonq_q4k_k_half_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix,
     const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_k_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
     ZiggyMetalBuffer *k_cache,
     size_t dst_offset_elements,
     uint32_t head_count,
@@ -721,6 +865,27 @@ int ziggy_metal_run_matvec_q4k_dual_kv_half_f32(
     const ZiggyMetalBuffer *matrix_k,
     const ZiggyMetalBuffer *matrix_v,
     const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *v_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_q4k_dual_kv_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_k,
+    const ZiggyMetalBuffer *matrix_v,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
     ZiggyMetalBuffer *k_cache,
     ZiggyMetalBuffer *v_cache,
     size_t dst_offset_elements,
@@ -754,6 +919,27 @@ int ziggy_metal_run_matvec_moonq_q4k_dual_kv_half_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_moonq_q4k_dual_kv_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_k,
+    const ZiggyMetalBuffer *matrix_v,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *v_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_q4k_q6k_dual_kv_half_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix_k,
@@ -773,11 +959,53 @@ int ziggy_metal_run_matvec_q4k_q6k_dual_kv_half_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_run_matvec_q4k_q6k_dual_kv_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_k,
+    const ZiggyMetalBuffer *matrix_v,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *v_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_run_matvec_moonq_q4k_q6k_dual_kv_half_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *matrix_k,
     const ZiggyMetalBuffer *matrix_v,
     const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *k_cache,
+    ZiggyMetalBuffer *v_cache,
+    size_t dst_offset_elements,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t cols,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_run_matvec_moonq_q4k_q6k_dual_kv_half_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_k,
+    const ZiggyMetalBuffer *matrix_v,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
     ZiggyMetalBuffer *k_cache,
     ZiggyMetalBuffer *v_cache,
     size_t dst_offset_elements,

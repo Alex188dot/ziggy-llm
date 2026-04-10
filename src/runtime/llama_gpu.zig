@@ -129,6 +129,7 @@ pub const Session = struct {
     model: ModelDesc,
     hidden: metal_backend.BufferHandle,
     normed: metal_backend.BufferHandle,
+    norm_scale: metal_backend.BufferHandle,
     q: metal_backend.BufferHandle,
     k: metal_backend.BufferHandle,
     v: metal_backend.BufferHandle,
@@ -181,6 +182,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(hidden);
         const normed = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(normed);
+        const norm_scale = try metal_backend.createGpuScratchBuffer(backend, 1);
+        errdefer metal_backend.destroyBuffer(norm_scale);
         const q = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
         const k = try metal_backend.createGpuScratchBuffer(backend, model.kv_dimension);
@@ -223,6 +226,7 @@ pub const Session = struct {
             .model = model,
             .hidden = hidden,
             .normed = normed,
+            .norm_scale = norm_scale,
             .q = q,
             .k = k,
             .v = v,
@@ -249,6 +253,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         metal_backend.destroyBuffer(self.hidden);
         metal_backend.destroyBuffer(self.normed);
+        metal_backend.destroyBuffer(self.norm_scale);
         metal_backend.destroyBuffer(self.q);
         metal_backend.destroyBuffer(self.k);
         metal_backend.destroyBuffer(self.v);
@@ -280,8 +285,10 @@ pub const Session = struct {
         layer_index: usize,
         position: usize,
     ) !void {
-        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
-        if (!try self.runFusedQProjectionRoPE(layer, self.normed, position)) {
+        var normed_ready = false;
+        if (!try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position)) {
+            try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+            normed_ready = true;
             try self.runProjection(layer.attn_q, self.normed, self.q);
             if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
             if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
@@ -308,9 +315,13 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-        if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.normed)) {
+        if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale)) {
+            if (!normed_ready) {
+                try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+                normed_ready = true;
+            }
             const kv_k_start = std.time.nanoTimestamp();
-            const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.normed);
+            const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale);
             if (fused_k_written) {
                 try self.runProjection(layer.attn_v, self.normed, self.v);
             } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
@@ -320,10 +331,13 @@ pub const Session = struct {
             if (!fused_k_written) {
                 if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
                 if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
-                try metal_backend.applyRoPEToHalfDst(
+                if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
+                try metal_backend.packKvHalf(
                     self.backend,
                     self.k,
+                    self.v,
                     self.k_cache,
+                    self.v_cache,
                     kv_offset_elements,
                     self.model.head_count_kv,
                     self.model.head_dimension,
@@ -344,23 +358,23 @@ pub const Session = struct {
                     .depth = layer_index,
                     .extra = position + 1,
                 });
+            } else {
+                const kv_v_start = std.time.nanoTimestamp();
+                if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
+                try metal_backend.storeKvHalf(
+                    self.backend,
+                    self.v,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.kv_dimension,
+                );
+                self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
+                    .rows = 1,
+                    .cols = self.model.kv_dimension,
+                    .depth = layer_index,
+                    .extra = position + 1,
+                });
             }
-
-            const kv_v_start = std.time.nanoTimestamp();
-            if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
-            try metal_backend.storeKvHalf(
-                self.backend,
-                self.v,
-                self.v_cache,
-                kv_offset_elements,
-                self.model.kv_dimension,
-            );
-            self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
-                .rows = 1,
-                .cols = self.model.kv_dimension,
-                .depth = layer_index,
-                .extra = position + 1,
-            });
         }
         const attention_start = std.time.nanoTimestamp();
         try metal_backend.attentionFused(
@@ -412,8 +426,15 @@ pub const Session = struct {
                 } else {
                     try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
                 }
-                const shape = metal_profile.ShapeDesc{ .rows = tensor.rows, .cols = tensor.cols, .tensor_type = tensor.tensor_type, .extra = 2 };
+                const shape = metal_profile.ShapeDesc{
+                    .rows = tensor.rows,
+                    .cols = tensor.cols,
+                    .tensor_type = tensor.tensor_type,
+                    .extra = 2,
+                    .layout_path = .moonq_q4_k,
+                };
                 self.recordCategoryWithShape(.projection_add_quantized, start, shape);
+                self.recordQuantizedLayoutProjection(start, shape);
                 handled_fused = true;
             } else {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -590,7 +611,6 @@ pub const Session = struct {
     }
 
     pub fn runOutputArgmax(self: *Session, norm: TensorDesc, tensor: TensorDesc) !u32 {
-        try self.runRmsNorm(norm, self.hidden, self.normed);
         const shape = metal_profile.ShapeDesc{
             .rows = 1,
             .cols = 1,
@@ -600,29 +620,36 @@ pub const Session = struct {
         const output_reduce_start = std.time.nanoTimestamp();
         const use_fused_output_argmax = tensor.tensor_type == 12 or tensor.tensor_type == 14;
         if (use_fused_output_argmax) {
+            const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
+            try self.runRmsNormScale(self.hidden, self.norm_scale);
             const initial_state = [_]u32{ 0, 0, std.math.maxInt(u32) };
             try metal_backend.writeBufferU32(self.sampled_token_packed, &initial_state);
             const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
             if (tensor.tensor_type == 12) {
-                try metal_backend.runMatVecQ4KArgmaxToBuffer(
+                try metal_backend.runMatVecQ4KArgmaxRmsToBuffer(
                     self.backend,
                     matrix,
-                    self.normed,
+                    self.hidden,
+                    norm_weights,
+                    self.norm_scale,
                     self.sampled_token_packed,
                     tensor.rows,
                     tensor.cols,
                 );
             } else {
-                try metal_backend.runMatVecQ6KArgmaxToBuffer(
+                try metal_backend.runMatVecQ6KArgmaxRmsToBuffer(
                     self.backend,
                     matrix,
-                    self.normed,
+                    self.hidden,
+                    norm_weights,
+                    self.norm_scale,
                     self.sampled_token_packed,
                     tensor.rows,
                     tensor.cols,
                 );
             }
         } else {
+            try self.runRmsNorm(norm, self.hidden, self.normed);
             try self.runProjection(tensor, self.normed, self.tmp);
             try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
         }
@@ -739,6 +766,26 @@ pub const Session = struct {
         });
     }
 
+    fn runRmsNormScale(
+        self: *Session,
+        input: metal_backend.BufferHandle,
+        output_scale: metal_backend.BufferHandle,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        try metal_backend.rmsNormScale(
+            self.backend,
+            input,
+            output_scale,
+            self.model.embedding_length,
+            self.model.rms_norm_eps,
+        );
+        self.recordCategoryWithShape(.normalization, start, .{
+            .rows = 1,
+            .cols = self.model.embedding_length,
+            .depth = 1,
+        });
+    }
+
     fn runRmsNormPerHead(
         self: *Session,
         tensor: TensorDesc,
@@ -772,20 +819,26 @@ pub const Session = struct {
         output: metal_backend.BufferHandle,
     ) !void {
         const start = std.time.nanoTimestamp();
-        var used_moon_quant = false;
+        var quant_layout_path: metal_profile.LayoutPath = .none;
         switch (tensor.tensor_type) {
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
-                    used_moon_quant = true;
+                    quant_layout_path = .moonq_q4_k;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                     try metal_backend.runMatVecQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
                 }
             },
             14 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    quant_layout_path = .packed_q6_k;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ6KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    quant_layout_path = .raw_q6_k;
+                }
             },
             8 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -807,12 +860,11 @@ pub const Session = struct {
             .rows = tensor.rows,
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
+            .layout_path = quant_layout_path,
         };
         self.recordCategoryWithShape(projectionCategoryFor(tensor.tensor_type), start, shape);
-        if (used_moon_quant) {
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
+        if (quant_layout_path != .none) {
+            self.recordQuantizedLayoutProjection(start, shape);
         }
     }
 
@@ -820,6 +872,8 @@ pub const Session = struct {
         self: *Session,
         layer: LayerDesc,
         input: metal_backend.BufferHandle,
+        norm: TensorDesc,
+        norm_scale: metal_backend.BufferHandle,
         position: usize,
     ) !bool {
         self.fused_q_attempts += 1;
@@ -845,12 +899,14 @@ pub const Session = struct {
         }
 
         const start = std.time.nanoTimestamp();
+        const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_q.offset)) |matrix| {
+            try self.runRmsNorm(norm, input, self.normed);
             try metal_backend.runMatVecMoonQuantQ4KQRope(
                 self.backend,
                 matrix,
-                input,
+                self.normed,
                 self.q,
                 self.model.head_count,
                 self.model.head_dimension,
@@ -862,10 +918,13 @@ pub const Session = struct {
             );
             used_moon_quant = true;
         } else if (self.dense_lookup.getRaw(layer.attn_q.offset)) |matrix| {
-            try metal_backend.runMatVecQ4KQRope(
+            try self.runRmsNormScale(input, norm_scale);
+            try metal_backend.runMatVecQ4KQRopeRms(
                 self.backend,
                 matrix,
                 input,
+                norm_weights,
+                norm_scale,
                 self.q,
                 self.model.head_count,
                 self.model.head_dimension,
@@ -884,6 +943,7 @@ pub const Session = struct {
             .rows = layer.attn_q.rows,
             .cols = layer.attn_q.cols,
             .tensor_type = layer.attn_q.tensor_type,
+            .layout_path = if (used_moon_quant) .moonq_q4_k else .none,
         };
         self.recordCategoryWithShape(.projection_quantized, start, projection_shape);
         self.recordCategoryWithShape(.rope, start, .{
@@ -892,11 +952,7 @@ pub const Session = struct {
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
-        if (used_moon_quant) {
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), projection_shape);
-            }
-        }
+        if (used_moon_quant) self.recordQuantizedLayoutProjection(start, projection_shape);
         self.fused_q_successes += 1;
         self.recordFusedQFallback(.success);
         return true;
@@ -931,11 +987,10 @@ pub const Session = struct {
                 .cols = gate_tensor.cols,
                 .tensor_type = gate_tensor.tensor_type,
                 .extra = 2,
+                .layout_path = .moonq_q4_k,
             };
             self.recordCategoryWithShape(.projection_quantized, start, shape);
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
+            self.recordQuantizedLayoutProjection(start, shape);
             return true;
         }
 
@@ -991,11 +1046,10 @@ pub const Session = struct {
                 .cols = k_tensor.cols,
                 .tensor_type = k_tensor.tensor_type,
                 .extra = 2,
+                .layout_path = .moonq_q4_k,
             };
             self.recordCategoryWithShape(.projection_quantized, start, shape);
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
+            self.recordQuantizedLayoutProjection(start, shape);
             return true;
         }
 
@@ -1027,6 +1081,8 @@ pub const Session = struct {
         layer_index: usize,
         position: usize,
         input: metal_backend.BufferHandle,
+        norm: TensorDesc,
+        norm_scale: metal_backend.BufferHandle,
     ) !bool {
         self.fused_kv_attempts += 1;
         self.recordFusedKvTensorPair(layer.attn_k.tensor_type, layer.attn_v.tensor_type);
@@ -1062,7 +1118,10 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
         const start = std.time.nanoTimestamp();
+        const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
+        var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
+            try self.runRmsNorm(norm, input, self.normed);
             switch (kernel) {
                 .q4k_q4k => {
                     const v_matrix = self.dense_lookup.getMoonQuant(layer.attn_v.offset) orelse {
@@ -1073,7 +1132,7 @@ pub const Session = struct {
                         self.backend,
                         k_matrix,
                         v_matrix,
-                        input,
+                        self.normed,
                         self.k_cache,
                         self.v_cache,
                         kv_offset_elements,
@@ -1095,7 +1154,7 @@ pub const Session = struct {
                         self.backend,
                         k_matrix,
                         v_matrix,
-                        input,
+                        self.normed,
                         self.k_cache,
                         self.v_cache,
                         kv_offset_elements,
@@ -1109,80 +1168,64 @@ pub const Session = struct {
                     );
                 },
             }
-            const shape = metal_profile.ShapeDesc{
-                .rows = layer.attn_k.rows,
-                .cols = layer.attn_k.cols,
-                .tensor_type = layer.attn_k.tensor_type,
-                .extra = 2,
-            };
-            self.recordCategoryWithShape(.projection_quantized, start, shape);
-            self.recordCategoryWithShape(.kv_writes, start, .{
-                .rows = 1,
-                .cols = self.model.kv_dimension,
-                .depth = layer_index,
-                .extra = position + 1,
-            });
-            self.recordCategoryWithShape(.rope, start, .{
-                .rows = self.model.head_count_kv,
-                .cols = self.model.head_dimension,
-                .depth = self.model.rope_dimension_count,
-                .extra = position + 1,
-            });
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
-            self.fused_kv_successes += 1;
-            self.recordFusedKvFallback(.success);
-            return true;
+            used_moon_quant = true;
         }
 
-        const k_matrix = self.dense_lookup.getRaw(layer.attn_k.offset) orelse {
-            self.recordFusedKvFallback(.matrix_missing);
-            return false;
-        };
-        const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse {
-            self.recordFusedKvFallback(.matrix_missing);
-            return false;
-        };
-        switch (kernel) {
-            .q4k_q4k => try metal_backend.runMatVecQ4KDualKvHalf(
-                self.backend,
-                k_matrix,
-                v_matrix,
-                input,
-                self.k_cache,
-                self.v_cache,
-                kv_offset_elements,
-                self.model.head_count_kv,
-                self.model.head_dimension,
-                self.model.rope_dimension_count,
-                layer.attn_k.cols,
-                position,
-                self.model.rope_freq_base,
-                self.model.rope_style,
-            ),
-            .q4k_q6k => try metal_backend.runMatVecQ4KQ6KDualKvHalf(
-                self.backend,
-                k_matrix,
-                v_matrix,
-                input,
-                self.k_cache,
-                self.v_cache,
-                kv_offset_elements,
-                self.model.head_count_kv,
-                self.model.head_dimension,
-                self.model.rope_dimension_count,
-                layer.attn_k.cols,
-                position,
-                self.model.rope_freq_base,
-                self.model.rope_style,
-            ),
+        if (!used_moon_quant) {
+            try self.runRmsNormScale(input, norm_scale);
+            const k_matrix = self.dense_lookup.getRaw(layer.attn_k.offset) orelse {
+                self.recordFusedKvFallback(.matrix_missing);
+                return false;
+            };
+            const v_matrix = self.dense_lookup.getRaw(layer.attn_v.offset) orelse {
+                self.recordFusedKvFallback(.matrix_missing);
+                return false;
+            };
+            switch (kernel) {
+                .q4k_q4k => try metal_backend.runMatVecQ4KDualKvHalfRms(
+                    self.backend,
+                    k_matrix,
+                    v_matrix,
+                    input,
+                    norm_weights,
+                    norm_scale,
+                    self.k_cache,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    layer.attn_k.cols,
+                    position,
+                    self.model.rope_freq_base,
+                    self.model.rope_style,
+                ),
+                .q4k_q6k => try metal_backend.runMatVecQ4KQ6KDualKvHalfRms(
+                    self.backend,
+                    k_matrix,
+                    v_matrix,
+                    input,
+                    norm_weights,
+                    norm_scale,
+                    self.k_cache,
+                    self.v_cache,
+                    kv_offset_elements,
+                    self.model.head_count_kv,
+                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
+                    layer.attn_k.cols,
+                    position,
+                    self.model.rope_freq_base,
+                    self.model.rope_style,
+                ),
+            }
         }
         self.recordCategoryWithShape(.projection_quantized, start, .{
             .rows = layer.attn_k.rows,
             .cols = layer.attn_k.cols,
             .tensor_type = layer.attn_k.tensor_type,
             .extra = 2,
+            .layout_path = if (used_moon_quant) .moonq_q4_k else .none,
         });
         self.recordCategoryWithShape(.kv_writes, start, .{
             .rows = 1,
@@ -1196,6 +1239,13 @@ pub const Session = struct {
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
+        if (used_moon_quant) self.recordQuantizedLayoutProjection(start, .{
+            .rows = layer.attn_k.rows,
+            .cols = layer.attn_k.cols,
+            .tensor_type = layer.attn_k.tensor_type,
+            .extra = 2,
+            .layout_path = .moonq_q4_k,
+        });
         self.fused_kv_successes += 1;
         self.recordFusedKvFallback(.success);
         return true;
@@ -1207,6 +1257,8 @@ pub const Session = struct {
         layer_index: usize,
         position: usize,
         input: metal_backend.BufferHandle,
+        norm: TensorDesc,
+        norm_scale: metal_backend.BufferHandle,
     ) !bool {
         self.fused_k_attempts += 1;
         if (layer.attn_k.tensor_type != 12) {
@@ -1233,12 +1285,14 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
         const start = std.time.nanoTimestamp();
+        const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
+            try self.runRmsNorm(norm, input, self.normed);
             try metal_backend.runMatVecMoonQuantQ4KKHalf(
                 self.backend,
                 k_matrix,
-                input,
+                self.normed,
                 self.k_cache,
                 kv_offset_elements,
                 self.model.head_count_kv,
@@ -1251,10 +1305,13 @@ pub const Session = struct {
             );
             used_moon_quant = true;
         } else if (self.dense_lookup.getRaw(layer.attn_k.offset)) |k_matrix| {
-            try metal_backend.runMatVecQ4KKHalf(
+            try self.runRmsNormScale(input, norm_scale);
+            try metal_backend.runMatVecQ4KKHalfRms(
                 self.backend,
                 k_matrix,
                 input,
+                norm_weights,
+                norm_scale,
                 self.k_cache,
                 kv_offset_elements,
                 self.model.head_count_kv,
@@ -1274,16 +1331,16 @@ pub const Session = struct {
             .cols = layer.attn_k.cols,
             .tensor_type = layer.attn_k.tensor_type,
             .extra = 1,
+            .layout_path = if (used_moon_quant) .moonq_q4_k else .none,
         });
         if (used_moon_quant) {
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), .{
-                    .rows = layer.attn_k.rows,
-                    .cols = layer.attn_k.cols,
-                    .tensor_type = layer.attn_k.tensor_type,
-                    .extra = 1,
-                });
-            }
+            self.recordQuantizedLayoutProjection(start, .{
+                .rows = layer.attn_k.rows,
+                .cols = layer.attn_k.cols,
+                .tensor_type = layer.attn_k.tensor_type,
+                .extra = 1,
+                .layout_path = .moonq_q4_k,
+            });
         }
         self.fused_k_successes += 1;
         self.recordFusedKFallback(.success);
@@ -1298,20 +1355,26 @@ pub const Session = struct {
         output_offset_bytes: usize,
     ) !void {
         const start = std.time.nanoTimestamp();
-        var used_moon_quant = false;
+        var quant_layout_path: metal_profile.LayoutPath = .none;
         switch (tensor.tensor_type) {
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
-                    used_moon_quant = true;
+                    quant_layout_path = .moonq_q4_k;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                     try metal_backend.runMatVecQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
                 }
             },
             14 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                    quant_layout_path = .packed_q6_k;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ6KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                    quant_layout_path = .raw_q6_k;
+                }
             },
             8 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1326,12 +1389,11 @@ pub const Session = struct {
             .rows = tensor.rows,
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
+            .layout_path = quant_layout_path,
         };
         self.recordCategoryWithShape(projectionCategoryFor(tensor.tensor_type), start, shape);
-        if (used_moon_quant) {
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
+        if (quant_layout_path != .none) {
+            self.recordQuantizedLayoutProjection(start, shape);
         }
     }
 
@@ -1342,20 +1404,26 @@ pub const Session = struct {
         output: metal_backend.BufferHandle,
     ) !void {
         const start = std.time.nanoTimestamp();
-        var used_moon_quant = false;
+        var quant_layout_path: metal_profile.LayoutPath = .none;
         switch (tensor.tensor_type) {
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
-                    used_moon_quant = true;
+                    quant_layout_path = .moonq_q4_k;
                 } else {
                     const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
                     try metal_backend.runMatVecQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
                 }
             },
             14 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    quant_layout_path = .packed_q6_k;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ6KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                    quant_layout_path = .raw_q6_k;
+                }
             },
             8 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1371,12 +1439,11 @@ pub const Session = struct {
             .cols = tensor.cols,
             .tensor_type = tensor.tensor_type,
             .extra = 1,
+            .layout_path = quant_layout_path,
         };
         self.recordCategoryWithShape(projectionAddCategoryFor(tensor.tensor_type), start, shape);
-        if (used_moon_quant) {
-            if (self.profiler) |profiler| {
-                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
-            }
+        if (quant_layout_path != .none) {
+            self.recordQuantizedLayoutProjection(start, shape);
         }
     }
 
@@ -1445,6 +1512,13 @@ pub const Session = struct {
     fn recordFusedKvTensorPair(self: *Session, k_type: u32, v_type: u32) void {
         if (k_type >= ggml_type_count or v_type >= ggml_type_count) return;
         self.fused_kv_tensor_pair_counts[fusedKvTensorPairIndex(k_type, v_type)] += 1;
+    }
+
+    fn recordQuantizedLayoutProjection(self: *Session, start_ns: i128, shape: metal_profile.ShapeDesc) void {
+        if (shape.layout_path == .raw_q6_k or shape.layout_path == .none) return;
+        if (self.profiler) |profiler| {
+            profiler.recordMoonQuantProjection(elapsedSince(start_ns), shape);
+        }
     }
 
     fn projectionCategoryFor(tensor_type: u32) metal_profile.Category {
@@ -1537,8 +1611,10 @@ pub const Session = struct {
             try metal_backend.writeBufferF32(self.hidden, values[0..emb_rows]);
 
             for (layers, 0..) |layer, layer_index| {
-                try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
-                if (!try self.runFusedQProjectionRoPE(layer, self.normed, position)) {
+                var normed_ready = false;
+                if (!try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position)) {
+                    try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+                    normed_ready = true;
                     try self.runProjection(layer.attn_q, self.normed, self.q);
 
                     try metal_backend.applyRoPE(
@@ -1556,8 +1632,12 @@ pub const Session = struct {
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
                 const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-                if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.normed)) {
-                    const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.normed);
+                if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale)) {
+                    if (!normed_ready) {
+                        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+                        normed_ready = true;
+                    }
+                    const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale);
                     if (fused_k_written) {
                         try self.runProjection(layer.attn_v, self.normed, self.v);
                     } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
@@ -1565,10 +1645,12 @@ pub const Session = struct {
                         try self.runProjection(layer.attn_v, self.normed, self.v);
                     }
                     if (!fused_k_written) {
-                        try metal_backend.applyRoPEToHalfDst(
+                        try metal_backend.packKvHalf(
                             self.backend,
                             self.k,
+                            self.v,
                             self.k_cache,
+                            self.v_cache,
                             kv_offset_elements,
                             self.model.head_count_kv,
                             self.model.head_dimension,
@@ -1577,15 +1659,15 @@ pub const Session = struct {
                             self.model.rope_freq_base,
                             self.model.rope_style,
                         );
+                    } else {
+                        try metal_backend.storeKvHalf(
+                            self.backend,
+                            self.v,
+                            self.v_cache,
+                            kv_offset_elements,
+                            self.model.kv_dimension,
+                        );
                     }
-
-                    try metal_backend.storeKvHalf(
-                        self.backend,
-                        self.v,
-                        self.v_cache,
-                        kv_offset_elements,
-                        self.model.kv_dimension,
-                    );
                 }
 
                 try metal_backend.attentionFused(

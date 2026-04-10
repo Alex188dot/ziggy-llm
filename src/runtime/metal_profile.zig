@@ -95,6 +95,23 @@ pub const ShapeDesc = struct {
     depth: usize = 0,
     extra: usize = 0,
     tensor_type: u32 = 0,
+    layout_path: LayoutPath = .none,
+};
+
+pub const LayoutPath = enum(u8) {
+    none,
+    moonq_q4_k,
+    packed_q6_k,
+    raw_q6_k,
+
+    pub fn label(self: LayoutPath) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .moonq_q4_k => "moonq_q4_k",
+            .packed_q6_k => "packed_q6_k",
+            .raw_q6_k => "raw_q6_k",
+        };
+    }
 };
 
 pub const TokenBreakdown = struct {
@@ -117,6 +134,7 @@ const ShapeKey = struct {
     depth: usize,
     extra: usize,
     tensor_type: u32,
+    layout_path: LayoutPath,
 };
 
 const ShapeStats = struct {
@@ -248,6 +266,7 @@ pub const Profiler = struct {
             .depth = shape.depth,
             .extra = shape.extra,
             .tensor_type = shape.tensor_type,
+            .layout_path = shape.layout_path,
         };
         const entry = self.shapes.getOrPut(key) catch {
             self.dropped_shape_samples = true;
@@ -271,6 +290,7 @@ pub const Profiler = struct {
             .depth = shape.depth,
             .extra = shape.extra,
             .tensor_type = shape.tensor_type,
+            .layout_path = shape.layout_path,
         };
         const entry = self.moon_quant_shapes.getOrPut(key) catch {
             self.dropped_moon_quant_shape_samples = true;
@@ -385,6 +405,10 @@ pub const Profiler = struct {
                     entry.stats.total_ns,
                 },
             );
+            try writer.print(
+                "profile.shape_{d}.layout_path={s}\n",
+                .{ index + 1, entry.key.layout_path.label() },
+            );
         }
         if (self.dropped_shape_samples) {
             try writer.print("profile.shape_samples_dropped=true\n", .{});
@@ -407,6 +431,10 @@ pub const Profiler = struct {
                     entry.stats.calls,
                     entry.stats.total_ns,
                 },
+            );
+            try writer.print(
+                "moon_quant.profile.shape_{d}.layout_path={s}\n",
+                .{ index + 1, entry.key.layout_path.label() },
             );
         }
         if (self.dropped_moon_quant_shape_samples) {
