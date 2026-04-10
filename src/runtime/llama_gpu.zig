@@ -402,8 +402,17 @@ pub const Session = struct {
     }
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc, layer_index: usize) !void {
-        try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-        if (!try self.runFusedFfnFanout(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+        const fused_ffn_fanout = try self.runFusedFfnFanout(
+            layer.ffn_gate,
+            layer.ffn_up,
+            self.hidden,
+            layer.ffn_norm,
+            self.norm_scale,
+            self.gate,
+            self.up,
+        );
+        if (!fused_ffn_fanout) {
+            try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
             try self.runProjection(layer.ffn_gate, self.normed, self.gate);
             try self.runProjection(layer.ffn_up, self.normed, self.up);
         }
@@ -965,20 +974,26 @@ pub const Session = struct {
         gate_tensor: TensorDesc,
         up_tensor: TensorDesc,
         input: metal_backend.BufferHandle,
+        norm: TensorDesc,
+        norm_scale: metal_backend.BufferHandle,
         gate_output: metal_backend.BufferHandle,
         up_output: metal_backend.BufferHandle,
     ) !bool {
         if (gate_tensor.tensor_type != 12 or up_tensor.tensor_type != 12) return false;
         if (gate_tensor.rows != up_tensor.rows or gate_tensor.cols != up_tensor.cols) return false;
+        const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
 
         if (self.dense_lookup.getMoonQuant(gate_tensor.offset)) |gate_matrix| {
             const up_matrix = self.dense_lookup.getMoonQuant(up_tensor.offset) orelse return false;
             const start = std.time.nanoTimestamp();
-            try metal_backend.runMatVecMoonQuantQ4KDualToBuffers(
+            try self.runRmsNormScale(input, norm_scale);
+            try metal_backend.runMatVecMoonQuantQ4KDualRmsToBuffers(
                 self.backend,
                 gate_matrix,
                 up_matrix,
                 input,
+                norm_weights,
+                norm_scale,
                 gate_output,
                 up_output,
                 gate_tensor.rows,
@@ -1000,11 +1015,14 @@ pub const Session = struct {
         const up_matrix = self.dense_lookup.getRaw(up_tensor.offset) orelse return false;
 
         const start = std.time.nanoTimestamp();
-        try metal_backend.runMatVecQ4KDualToBuffers(
+        try self.runRmsNormScale(input, norm_scale);
+        try metal_backend.runMatVecQ4KDualRmsToBuffers(
             self.backend,
             gate_matrix,
             up_matrix,
             input,
+            norm_weights,
+            norm_scale,
             gate_output,
             up_output,
             gate_tensor.rows,
@@ -1698,8 +1716,16 @@ pub const Session = struct {
             }
 
             for (layers) |layer| {
-                try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-                if (!try self.runFusedFfnFanout(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+                if (!try self.runFusedFfnFanout(
+                    layer.ffn_gate,
+                    layer.ffn_up,
+                    self.hidden,
+                    layer.ffn_norm,
+                    self.norm_scale,
+                    self.gate,
+                    self.up,
+                )) {
+                    try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
                     try self.runProjection(layer.ffn_gate, self.normed, self.gate);
                     try self.runProjection(layer.ffn_up, self.normed, self.up);
                 }

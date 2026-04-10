@@ -18,6 +18,9 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDualPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDual2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDual5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDualRmsPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDualRms2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KDualRms5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KKHalfPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KKHalf2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KKHalf5632Pipeline;
@@ -73,6 +76,9 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDual2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDual5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualRmsPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualRms2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualRms5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualKvHalfPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualKvHalf2048Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KDualKvHalf5632Pipeline;
@@ -401,6 +407,15 @@ static id<MTLComputePipelineState> ziggy_select_moonq_q4k_dual_pipeline(
     return state.matvecMoonQ4KDualPipeline;
 }
 
+static id<MTLComputePipelineState> ziggy_select_moonq_q4k_dual_rms_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecMoonQ4KDualRms2048Pipeline;
+    if (cols == 5632) return state.matvecMoonQ4KDualRms5632Pipeline;
+    return state.matvecMoonQ4KDualRmsPipeline;
+}
+
 static id<MTLComputePipelineState> ziggy_select_moonq_q4k_k_half_pipeline(
     ZiggyMetalState *state,
     uint32_t cols
@@ -498,6 +513,15 @@ static id<MTLComputePipelineState> ziggy_select_q4k_dual_pipeline(
     if (cols == 2048) return state.matvecQ4KDual2048Pipeline;
     if (cols == 5632) return state.matvecQ4KDual5632Pipeline;
     return state.matvecQ4KDualPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_q4k_dual_rms_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecQ4KDualRms2048Pipeline;
+    if (cols == 5632) return state.matvecQ4KDualRms5632Pipeline;
+    return state.matvecQ4KDualRmsPipeline;
 }
 
 static id<MTLComputePipelineState> ziggy_select_q4k_k_half_pipeline(
@@ -856,6 +880,13 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k dual 5632 pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> matvec_q4k_dual_rms_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_dual_rms_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_q4k_dual_rms_2048_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_dual_rms_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_q4k_dual_rms_5632_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_dual_rms_5632_f32", &pipeline_error);
+        if (matvec_q4k_dual_rms_pipeline == nil || matvec_q4k_dual_rms_2048_pipeline == nil || matvec_q4k_dual_rms_5632_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k dual rms pipelines");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
         id<MTLComputePipelineState> matvec_q4k_k_half_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_k_half_f32", &pipeline_error);
         if (matvec_q4k_k_half_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k k-half pipeline");
@@ -1038,6 +1069,13 @@ int ziggy_metal_create_context(
         id<MTLComputePipelineState> matvec_moon_q4k_dual_5632_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_dual_5632_f32", &pipeline_error);
         if (matvec_moon_q4k_dual_5632_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal MoonQuant q4k dual 5632 pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_moon_q4k_dual_rms_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_dual_rms_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_moon_q4k_dual_rms_2048_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_dual_rms_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_moon_q4k_dual_rms_5632_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_dual_rms_5632_f32", &pipeline_error);
+        if (matvec_moon_q4k_dual_rms_pipeline == nil || matvec_moon_q4k_dual_rms_2048_pipeline == nil || matvec_moon_q4k_dual_rms_5632_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal MoonQuant q4k dual rms pipelines");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
         id<MTLComputePipelineState> matvec_moon_q4k_k_half_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_k_half_f32", &pipeline_error);
@@ -1345,6 +1383,9 @@ int ziggy_metal_create_context(
         state.matvecQ4KDualPipeline = matvec_q4k_dual_pipeline;
         state.matvecQ4KDual2048Pipeline = matvec_q4k_dual_2048_pipeline;
         state.matvecQ4KDual5632Pipeline = matvec_q4k_dual_5632_pipeline;
+        state.matvecQ4KDualRmsPipeline = matvec_q4k_dual_rms_pipeline;
+        state.matvecQ4KDualRms2048Pipeline = matvec_q4k_dual_rms_2048_pipeline;
+        state.matvecQ4KDualRms5632Pipeline = matvec_q4k_dual_rms_5632_pipeline;
         state.matvecQ4KKHalfPipeline = matvec_q4k_k_half_pipeline;
         state.matvecQ4KKHalf2048Pipeline = matvec_q4k_k_half_2048_pipeline;
         state.matvecQ4KKHalf5632Pipeline = matvec_q4k_k_half_5632_pipeline;
@@ -1400,6 +1441,9 @@ int ziggy_metal_create_context(
         state.matvecMoonQ4KDual2048Pipeline = matvec_moon_q4k_dual_2048_pipeline;
         state.matvecMoonQ4K5632Pipeline = matvec_moon_q4k_5632_pipeline;
         state.matvecMoonQ4KDual5632Pipeline = matvec_moon_q4k_dual_5632_pipeline;
+        state.matvecMoonQ4KDualRmsPipeline = matvec_moon_q4k_dual_rms_pipeline;
+        state.matvecMoonQ4KDualRms2048Pipeline = matvec_moon_q4k_dual_rms_2048_pipeline;
+        state.matvecMoonQ4KDualRms5632Pipeline = matvec_moon_q4k_dual_rms_5632_pipeline;
         state.matvecMoonQ4KDualKvHalfPipeline = matvec_moon_q4k_dual_kv_half_pipeline;
         state.matvecMoonQ4KDualKvHalf2048Pipeline = matvec_moon_q4k_dual_kv_half_2048_pipeline;
         state.matvecMoonQ4KDualKvHalf5632Pipeline = matvec_moon_q4k_dual_kv_half_5632_pipeline;
@@ -1993,6 +2037,75 @@ int ziggy_metal_run_matvec_q4k_dual_f32(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q4k dual matvec command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q4k_dual_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix0,
+    const ZiggyMetalBuffer *matrix1,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *output0,
+    ZiggyMetalBuffer *output1,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix0 == NULL || matrix1 == NULL || input == NULL || norm_weights == NULL || norm_scale == NULL || output0 == NULL || output1 == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q4k dual rms matvec request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix0_buffer = ziggy_const_buffer(matrix0);
+        const ZiggyMetalBufferState *matrix1_buffer = ziggy_const_buffer(matrix1);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(norm_weights);
+        const ZiggyMetalBufferState *scale_buffer = ziggy_const_buffer(norm_scale);
+        ZiggyMetalBufferState *output0_buffer = ziggy_buffer(output0);
+        ZiggyMetalBufferState *output1_buffer = ziggy_buffer(output1);
+        if (input_buffer.length < (size_t)cols * sizeof(float) || weights_buffer.length < (size_t)cols * sizeof(float) || scale_buffer.length < sizeof(float) || output0_buffer.length < (size_t)rows * sizeof(float) || output1_buffer.length < (size_t)rows * sizeof(float)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal q4k dual rms matvec exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = ziggy_acquire_compute_encoder(state, command_buffer, has_pending, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_q4k_dual_rms_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix0_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:matrix1_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:2];
+        [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:3];
+        [encoder setBuffer:scale_buffer.buffer offset:0 atIndex:4];
+        [encoder setBuffer:output0_buffer.buffer offset:0 atIndex:5];
+        [encoder setBuffer:output1_buffer.buffer offset:0 atIndex:6];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:7];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:8];
+        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+        ziggy_record_dispatch(state);
+        ziggy_finish_compute_encoder(state, encoder, has_pending);
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q4k dual rms matvec command failed");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         return ZIGGY_METAL_OK;
@@ -3322,6 +3435,75 @@ int ziggy_metal_run_matvec_moonq_q4k_dual_f32(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal MoonQuant q4k dual matvec command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_moonq_q4k_dual_rms_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix0,
+    const ZiggyMetalBuffer *matrix1,
+    const ZiggyMetalBuffer *input,
+    const ZiggyMetalBuffer *norm_weights,
+    const ZiggyMetalBuffer *norm_scale,
+    ZiggyMetalBuffer *output0,
+    ZiggyMetalBuffer *output1,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix0 == NULL || matrix1 == NULL || input == NULL || norm_weights == NULL || norm_scale == NULL || output0 == NULL || output1 == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal MoonQuant q4k dual rms matvec request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix0_buffer = ziggy_const_buffer(matrix0);
+        const ZiggyMetalBufferState *matrix1_buffer = ziggy_const_buffer(matrix1);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        const ZiggyMetalBufferState *weights_buffer = ziggy_const_buffer(norm_weights);
+        const ZiggyMetalBufferState *scale_buffer = ziggy_const_buffer(norm_scale);
+        ZiggyMetalBufferState *output0_buffer = ziggy_buffer(output0);
+        ZiggyMetalBufferState *output1_buffer = ziggy_buffer(output1);
+        if (input_buffer.length < (size_t)cols * sizeof(float) || weights_buffer.length < (size_t)cols * sizeof(float) || scale_buffer.length < sizeof(float) || output0_buffer.length < (size_t)rows * sizeof(float) || output1_buffer.length < (size_t)rows * sizeof(float)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal MoonQuant q4k dual rms matvec exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = ziggy_acquire_compute_encoder(state, command_buffer, has_pending, error_message, error_message_len);
+        if (encoder == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_dual_rms_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix0_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:matrix1_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:2];
+        [encoder setBuffer:weights_buffer.buffer offset:0 atIndex:3];
+        [encoder setBuffer:scale_buffer.buffer offset:0 atIndex:4];
+        [encoder setBuffer:output0_buffer.buffer offset:0 atIndex:5];
+        [encoder setBuffer:output1_buffer.buffer offset:0 atIndex:6];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:7];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:8];
+        ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
+        ziggy_record_dispatch(state);
+        ziggy_finish_compute_encoder(state, encoder, has_pending);
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal MoonQuant q4k dual rms matvec command failed");
             return ZIGGY_METAL_EXECUTION_FAILED;
         }
         return ZIGGY_METAL_OK;
