@@ -902,11 +902,13 @@ pub const Session = struct {
         const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_q.offset)) |matrix| {
-            try self.runRmsNorm(norm, input, self.normed);
-            try metal_backend.runMatVecMoonQuantQ4KQRope(
+            try self.runRmsNormScale(input, norm_scale);
+            try metal_backend.runMatVecMoonQuantQ4KQRopeRms(
                 self.backend,
                 matrix,
-                self.normed,
+                input,
+                norm_weights,
+                norm_scale,
                 self.q,
                 self.model.head_count,
                 self.model.head_dimension,
@@ -1121,18 +1123,20 @@ pub const Session = struct {
         const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            try self.runRmsNorm(norm, input, self.normed);
+            try self.runRmsNormScale(input, norm_scale);
             switch (kernel) {
                 .q4k_q4k => {
                     const v_matrix = self.dense_lookup.getMoonQuant(layer.attn_v.offset) orelse {
                         self.recordFusedKvFallback(.matrix_missing);
                         return false;
                     };
-                    try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
+                    try metal_backend.runMatVecMoonQuantQ4KDualKvHalfRms(
                         self.backend,
                         k_matrix,
                         v_matrix,
-                        self.normed,
+                        input,
+                        norm_weights,
+                        norm_scale,
                         self.k_cache,
                         self.v_cache,
                         kv_offset_elements,
@@ -1150,11 +1154,13 @@ pub const Session = struct {
                         self.recordFusedKvFallback(.matrix_missing);
                         return false;
                     };
-                    try metal_backend.runMatVecMoonQuantQ4KQ6KDualKvHalf(
+                    try metal_backend.runMatVecMoonQuantQ4KQ6KDualKvHalfRms(
                         self.backend,
                         k_matrix,
                         v_matrix,
-                        self.normed,
+                        input,
+                        norm_weights,
+                        norm_scale,
                         self.k_cache,
                         self.v_cache,
                         kv_offset_elements,
@@ -1288,11 +1294,13 @@ pub const Session = struct {
         const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            try self.runRmsNorm(norm, input, self.normed);
-            try metal_backend.runMatVecMoonQuantQ4KKHalf(
+            try self.runRmsNormScale(input, norm_scale);
+            try metal_backend.runMatVecMoonQuantQ4KKHalfRms(
                 self.backend,
                 k_matrix,
-                self.normed,
+                input,
+                norm_weights,
+                norm_scale,
                 self.k_cache,
                 kv_offset_elements,
                 self.model.head_count_kv,
