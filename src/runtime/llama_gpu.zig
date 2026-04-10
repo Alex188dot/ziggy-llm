@@ -286,7 +286,8 @@ pub const Session = struct {
         position: usize,
     ) !void {
         var normed_ready = false;
-        if (!try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position)) {
+        const fused_q = try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position);
+        if (!fused_q) {
             try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
             normed_ready = true;
             try self.runProjection(layer.attn_q, self.normed, self.q);
@@ -315,13 +316,13 @@ pub const Session = struct {
         const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
         const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-        if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale)) {
+        if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, fused_q)) {
             if (!normed_ready) {
                 try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                 normed_ready = true;
             }
             const kv_k_start = std.time.nanoTimestamp();
-            const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale);
+            const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, fused_q);
             if (fused_k_written) {
                 try self.runProjection(layer.attn_v, self.normed, self.v);
             } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
@@ -1103,6 +1104,7 @@ pub const Session = struct {
         input: metal_backend.BufferHandle,
         norm: TensorDesc,
         norm_scale: metal_backend.BufferHandle,
+        norm_scale_ready: bool,
     ) !bool {
         self.fused_kv_attempts += 1;
         self.recordFusedKvTensorPair(layer.attn_k.tensor_type, layer.attn_v.tensor_type);
@@ -1141,7 +1143,7 @@ pub const Session = struct {
         const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            try self.runRmsNormScale(input, norm_scale);
+            if (!norm_scale_ready) try self.runRmsNormScale(input, norm_scale);
             switch (kernel) {
                 .q4k_q4k => {
                     const v_matrix = self.dense_lookup.getMoonQuant(layer.attn_v.offset) orelse {
@@ -1196,7 +1198,7 @@ pub const Session = struct {
         }
 
         if (!used_moon_quant) {
-            try self.runRmsNormScale(input, norm_scale);
+            if (!norm_scale_ready) try self.runRmsNormScale(input, norm_scale);
             const k_matrix = self.dense_lookup.getRaw(layer.attn_k.offset) orelse {
                 self.recordFusedKvFallback(.matrix_missing);
                 return false;
@@ -1283,6 +1285,7 @@ pub const Session = struct {
         input: metal_backend.BufferHandle,
         norm: TensorDesc,
         norm_scale: metal_backend.BufferHandle,
+        norm_scale_ready: bool,
     ) !bool {
         self.fused_k_attempts += 1;
         if (layer.attn_k.tensor_type != 12) {
@@ -1312,7 +1315,7 @@ pub const Session = struct {
         const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
         var used_moon_quant = false;
         if (self.dense_lookup.getMoonQuant(layer.attn_k.offset)) |k_matrix| {
-            try self.runRmsNormScale(input, norm_scale);
+            if (!norm_scale_ready) try self.runRmsNormScale(input, norm_scale);
             try metal_backend.runMatVecMoonQuantQ4KKHalfRms(
                 self.backend,
                 k_matrix,
@@ -1331,7 +1334,7 @@ pub const Session = struct {
             );
             used_moon_quant = true;
         } else if (self.dense_lookup.getRaw(layer.attn_k.offset)) |k_matrix| {
-            try self.runRmsNormScale(input, norm_scale);
+            if (!norm_scale_ready) try self.runRmsNormScale(input, norm_scale);
             try metal_backend.runMatVecQ4KKHalfRms(
                 self.backend,
                 k_matrix,
@@ -1638,10 +1641,13 @@ pub const Session = struct {
 
             for (layers, 0..) |layer, layer_index| {
                 var normed_ready = false;
-                if (!try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position)) {
+                const fused_q = try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, position);
+                if (!fused_q) {
                     try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                     normed_ready = true;
                     try self.runProjection(layer.attn_q, self.normed, self.q);
+                    if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
+                    if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
 
                     try metal_backend.applyRoPE(
                         self.backend,
@@ -1658,12 +1664,12 @@ pub const Session = struct {
                 const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
                 const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-                if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale)) {
+                if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, fused_q)) {
                     if (!normed_ready) {
                         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                         normed_ready = true;
                     }
-                    const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale);
+                    const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, fused_q);
                     if (fused_k_written) {
                         try self.runProjection(layer.attn_v, self.normed, self.v);
                     } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {
@@ -1734,16 +1740,12 @@ pub const Session = struct {
             }
 
             try self.runRmsNorm(self.model.output_norm, self.hidden, self.normed);
-            try self.runProjection(self.model.output, self.normed, self.tmp);
-
-            const logits_offset = i * self.model.vocab_size;
-            try metal_backend.copyBufferRegion(
-                self.backend,
-                self.tmp,
-                0,
+            const logits_offset_bytes = i * self.model.vocab_size * @sizeOf(f32);
+            try self.runProjectionToDst(
+                self.model.output,
+                self.normed,
                 self.batch_logits,
-                logits_offset * @sizeOf(f32),
-                self.model.vocab_size * @sizeOf(f32),
+                logits_offset_bytes,
             );
         }
 

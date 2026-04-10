@@ -1456,7 +1456,7 @@ pub fn generateLoadedStreaming(
     const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
-    const max_draft_len = 3;
+    const max_draft_len = llama_gpu.max_draft_len - 1;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;
 
     const decode_begin = std.time.nanoTimestamp();
@@ -1672,7 +1672,7 @@ pub fn generateLoadedStreamingCached(
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
     const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
-    const max_draft_len = 3;
+    const max_draft_len = llama_gpu.max_draft_len - 1;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;
 
     const decode_begin = std.time.nanoTimestamp();
