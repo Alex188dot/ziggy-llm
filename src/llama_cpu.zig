@@ -1556,19 +1556,23 @@ pub fn generateLoadedStreaming(
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
     const fused_q_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQSummary(allocator) else null;
+    const fused_qk_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQkSummary(allocator) else null;
     const fused_kv_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKvSummary(allocator) else null;
     const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
     const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
     const base_plus_fused_q = try combineOptionalSummaries(allocator, base_plus_gated, fused_q_summary);
-    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_kv_summary);
+    const base_plus_fused_qk = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_qk_summary);
+    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_qk, fused_kv_summary);
     const profile_summary = try combineOptionalSummaries(allocator, base_plus_fused_kv, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
     if (fused_q_summary) |summary| allocator.free(summary);
+    if (fused_qk_summary) |summary| allocator.free(summary);
     if (fused_kv_summary) |summary| allocator.free(summary);
     if (fused_k_summary) |summary| allocator.free(summary);
     if (base_plus_gated) |summary| allocator.free(summary);
     if (base_plus_fused_q) |summary| allocator.free(summary);
+    if (base_plus_fused_qk) |summary| allocator.free(summary);
     if (base_plus_fused_kv) |summary| allocator.free(summary);
 
     return .{
@@ -1772,19 +1776,23 @@ pub fn generateLoadedStreamingCached(
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
     const fused_q_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQSummary(allocator) else null;
+    const fused_qk_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQkSummary(allocator) else null;
     const fused_kv_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKvSummary(allocator) else null;
     const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
     const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
     const base_plus_fused_q = try combineOptionalSummaries(allocator, base_plus_gated, fused_q_summary);
-    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_kv_summary);
+    const base_plus_fused_qk = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_qk_summary);
+    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_qk, fused_kv_summary);
     const profile_summary = try combineOptionalSummaries(allocator, base_plus_fused_kv, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
     if (fused_q_summary) |summary| allocator.free(summary);
+    if (fused_qk_summary) |summary| allocator.free(summary);
     if (fused_kv_summary) |summary| allocator.free(summary);
     if (fused_k_summary) |summary| allocator.free(summary);
     if (base_plus_gated) |summary| allocator.free(summary);
     if (base_plus_fused_q) |summary| allocator.free(summary);
+    if (base_plus_fused_qk) |summary| allocator.free(summary);
     if (base_plus_fused_kv) |summary| allocator.free(summary);
 
     return .{

@@ -100,6 +100,19 @@ const FusedQFallbackReason = enum(u8) {
     matrix_missing,
 };
 
+const FusedQkFallbackReason = enum(u8) {
+    success,
+    tensor_type,
+    shape,
+    q_bias,
+    q_norm,
+    k_bias,
+    k_norm,
+    rope_style,
+    rope_dim,
+    matrix_missing,
+};
+
 const FusedKvFallbackReason = enum(u8) {
     success,
     tensor_type,
@@ -155,6 +168,10 @@ pub const Session = struct {
     fused_q_successes: u64 = 0,
     fused_q_fallback_counts: [@typeInfo(FusedQFallbackReason).@"enum".fields.len]u64 =
         [_]u64{0} ** @typeInfo(FusedQFallbackReason).@"enum".fields.len,
+    fused_qk_attempts: u64 = 0,
+    fused_qk_successes: u64 = 0,
+    fused_qk_fallback_counts: [@typeInfo(FusedQkFallbackReason).@"enum".fields.len]u64 =
+        [_]u64{0} ** @typeInfo(FusedQkFallbackReason).@"enum".fields.len,
     fused_kv_attempts: u64 = 0,
     fused_kv_successes: u64 = 0,
     fused_kv_fallback_counts: [@typeInfo(FusedKvFallbackReason).@"enum".fields.len]u64 =
@@ -289,7 +306,8 @@ pub const Session = struct {
         var norm_scale_ready = false;
 
         if (!try self.runFusedQKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
-            if (!try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready, position)) {
+            const fused_qk_written = try self.runFusedQKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready);
+            if (!fused_qk_written and !try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready, position)) {
                 try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                 normed_ready = true;
                 try self.runProjection(layer.attn_q, self.normed, self.q);
@@ -318,7 +336,7 @@ pub const Session = struct {
             const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
             const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-            if (!try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
+            if (!fused_qk_written and !try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
                 if (!normed_ready) {
                     try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                     normed_ready = true;
@@ -617,6 +635,40 @@ pub const Session = struct {
             try writer.print(
                 "fused_q_rope.profile.reason.{s}={d}\n",
                 .{ @tagName(reason), self.fused_q_fallback_counts[@intFromEnum(reason)] },
+            );
+        }
+        return try buffer.toOwnedSlice(allocator);
+    }
+
+    pub fn renderFusedQkSummary(self: *const Session, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.fused_qk_attempts == 0) return null;
+
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
+        const writer = buffer.writer(allocator);
+        try writer.print(
+            "fused_qk_half.profile.attempts={d}\nfused_qk_half.profile.successes={d}\nfused_qk_half.profile.success_pct={d:.3}\n",
+            .{
+                self.fused_qk_attempts,
+                self.fused_qk_successes,
+                percent(self.fused_qk_successes, self.fused_qk_attempts),
+            },
+        );
+        inline for ([_]FusedQkFallbackReason{
+            .success,
+            .tensor_type,
+            .shape,
+            .q_bias,
+            .q_norm,
+            .k_bias,
+            .k_norm,
+            .rope_style,
+            .rope_dim,
+            .matrix_missing,
+        }) |reason| {
+            try writer.print(
+                "fused_qk_half.profile.reason.{s}={d}\n",
+                .{ @tagName(reason), self.fused_qk_fallback_counts[@intFromEnum(reason)] },
             );
         }
         return try buffer.toOwnedSlice(allocator);
@@ -1099,6 +1151,105 @@ pub const Session = struct {
         return true;
     }
 
+    fn runFusedQKCacheWrite(
+        self: *Session,
+        layer: LayerDesc,
+        layer_index: usize,
+        position: usize,
+        input: metal_backend.BufferHandle,
+        norm: TensorDesc,
+        norm_scale: metal_backend.BufferHandle,
+        norm_scale_ready: *bool,
+    ) !bool {
+        self.fused_qk_attempts += 1;
+        if (layer.attn_q.tensor_type != 12 or layer.attn_k.tensor_type != 12) {
+            self.recordFusedQkFallback(.tensor_type);
+            return false;
+        }
+        if (layer.attn_q.rows != layer.attn_k.rows or layer.attn_q.cols != layer.attn_k.cols or self.model.head_count != self.model.head_count_kv) {
+            self.recordFusedQkFallback(.shape);
+            return false;
+        }
+        if (layer.attn_q_bias != null) {
+            self.recordFusedQkFallback(.q_bias);
+            return false;
+        }
+        if (layer.attn_q_norm != null) {
+            self.recordFusedQkFallback(.q_norm);
+            return false;
+        }
+        if (layer.attn_k_bias != null) {
+            self.recordFusedQkFallback(.k_bias);
+            return false;
+        }
+        if (layer.attn_k_norm != null) {
+            self.recordFusedQkFallback(.k_norm);
+            return false;
+        }
+        if (self.model.rope_style != 0) {
+            self.recordFusedQkFallback(.rope_style);
+            return false;
+        }
+        if (self.model.rope_dimension_count != self.model.head_dimension) {
+            self.recordFusedQkFallback(.rope_dim);
+            return false;
+        }
+
+        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+        const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+        const q_matrix = self.dense_lookup.getRaw(layer.attn_q.offset) orelse {
+            self.recordFusedQkFallback(.matrix_missing);
+            return false;
+        };
+        const k_matrix = self.dense_lookup.getRaw(layer.attn_k.offset) orelse {
+            self.recordFusedQkFallback(.matrix_missing);
+            return false;
+        };
+        const norm_weights = self.dense_lookup.getDense(norm.offset) orelse return error.InvalidTensorMetadata;
+        try self.ensureNormScale(input, norm_scale, norm_scale_ready);
+
+        const start = std.time.nanoTimestamp();
+        try metal_backend.runMatVecQ4KQKKHalfRms(
+            self.backend,
+            q_matrix,
+            k_matrix,
+            input,
+            norm_weights,
+            norm_scale,
+            self.q,
+            self.k_cache,
+            kv_offset_elements,
+            self.model.head_count,
+            self.model.head_dimension,
+            self.model.rope_dimension_count,
+            layer.attn_q.cols,
+            position,
+            self.model.rope_freq_base,
+            self.model.rope_style,
+        );
+        self.recordCategoryWithShape(.projection_quantized, start, .{
+            .rows = layer.attn_q.rows,
+            .cols = layer.attn_q.cols,
+            .tensor_type = layer.attn_q.tensor_type,
+            .extra = 2,
+        });
+        self.recordCategoryWithShape(.rope, start, .{
+            .rows = self.model.head_count,
+            .cols = self.model.head_dimension,
+            .depth = self.model.rope_dimension_count,
+            .extra = position + 1,
+        });
+        self.recordCategoryWithShape(.kv_writes, start, .{
+            .rows = 1,
+            .cols = self.model.kv_dimension,
+            .depth = layer_index,
+            .extra = position + 1,
+        });
+        self.fused_qk_successes += 1;
+        self.recordFusedQkFallback(.success);
+        return true;
+    }
+
     fn runFusedKvCacheWrite(
         self: *Session,
         layer: LayerDesc,
@@ -1555,6 +1706,10 @@ pub const Session = struct {
 
     fn recordFusedQFallback(self: *Session, reason: FusedQFallbackReason) void {
         self.fused_q_fallback_counts[@intFromEnum(reason)] += 1;
+    }
+
+    fn recordFusedQkFallback(self: *Session, reason: FusedQkFallbackReason) void {
+        self.fused_qk_fallback_counts[@intFromEnum(reason)] += 1;
     }
 
     fn recordFusedKvFallback(self: *Session, reason: FusedKvFallbackReason) void {

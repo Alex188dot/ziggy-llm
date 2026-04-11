@@ -1069,6 +1069,52 @@ pub fn runMatVecQ4KQRopeRms(
     ), &error_buf);
 }
 
+pub fn runMatVecQ4KQKKHalfRms(
+    backend: backend_api.MatVecBackend,
+    q_matrix_bytes: []const u8,
+    k_matrix_bytes: []const u8,
+    input: BufferHandle,
+    norm_weights: []const f32,
+    norm_scale: BufferHandle,
+    q_output: BufferHandle,
+    k_cache: BufferHandle,
+    dst_offset_elements: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    cols: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    const q_matrix_buffer = try state.rawBuffer(q_matrix_bytes);
+    const k_matrix_buffer = try state.rawBuffer(k_matrix_bytes);
+    const weights_buffer = try state.matrixBuffer(norm_weights[0..cols]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_run_matvec_q4k_qk_half_rms_f32(
+        state.context,
+        q_matrix_buffer.raw,
+        k_matrix_buffer.raw,
+        input.raw,
+        weights_buffer.raw,
+        norm_scale.raw,
+        q_output.raw,
+        k_cache.raw,
+        dst_offset_elements,
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(cols),
+        @intCast(position),
+        freq_base,
+        rope_style,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn runMatVecMoonQuantQ4KQRope(
     backend: backend_api.MatVecBackend,
     matrix_bytes: []const u8,
