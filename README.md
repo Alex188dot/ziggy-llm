@@ -39,33 +39,48 @@ Note: ZINC's supported models are limited to the models listed in their document
 
 Getting up and running takes just a few seconds. Ensure you have Zig 0.15.2 or newer installed, clone the repository, and build the release binary. 🛠️
 
+## Quick Start
+
+Prerequisite:
+
+- Zig 0.15.2 or newer
+
+Clone:
+
 ```bash
 git clone https://github.com/Alex188dot/ziggy-llm.git
 cd ziggy-llm
+```
+
+Build:
+
+```bash
 zig build -Doptimize=ReleaseFast
 ```
 
-Once built, you can immediately dive into a chat session or run a single prompt. Just point the CLI to your standard `.gguf` file and let ziggy-llm do the rest! 💬
+Chat:
 
 ```bash
-# Start an interactive chat
 ./zig-out/bin/ziggy-llm chat \
   --model path/to/model.gguf \
   --backend metal \
   --temperature 0 \
   --seed 42
+```
 
-# Run a single prompt
+Run a single prompt:
+
+```bash
 ./zig-out/bin/ziggy-llm run \
   --model path/to/model.gguf \
   --prompt "Write one short paragraph about Zig." \
   --backend metal \
   --max-tokens 128 \
-  --temperature 0 \
+  --temperature 0.7 \
   --seed 42
 ```
 
-We also include built-in tools for benchmarking your models locally. Use the `--bench-runs` flag to automatically separate cold startup times from warm, resident-runtime measurements. ⏱️
+Benchmark:
 
 ```bash
 ./zig-out/bin/ziggy-llm bench \
@@ -73,7 +88,7 @@ We also include built-in tools for benchmarking your models locally. Use the `--
   --prompt "Write one short paragraph about Zig." \
   --backend metal \
   --max-tokens 128 \
-  --temperature 0 \
+  --temperature 0.7 \
   --seed 42 \
   --bench-runs 5
 ```

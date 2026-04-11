@@ -773,9 +773,7 @@ const Session = struct {
     ) !void {
         if (prompt_tokens.len == 0) return error.EmptyPrompt;
         if (prompt_tokens.len > 1) {
-            for (prompt_tokens[0 .. prompt_tokens.len - 1]) |token_id| {
-                try self.stepNoOutput(token_id);
-            }
+            try self.runPromptPrefixNoOutput(prompt_tokens[0 .. prompt_tokens.len - 1]);
         }
 
         const last_token = prompt_tokens[prompt_tokens.len - 1];
@@ -784,6 +782,41 @@ const Session = struct {
             .gpu_topk_sampler => unreachable,
             .gpu_shortlist_cpu_sampler => _ = try self.stepShortlist(last_token, shortlist_len),
             .cpu_logits => _ = try self.step(last_token),
+        }
+    }
+
+    fn runPromptPrefixNoOutput(self: *Session, prompt_tokens: []const u32) !void {
+        if (prompt_tokens.len == 0) return;
+        if (self.gpu_session == null or prompt_tokens.len == 1) {
+            for (prompt_tokens) |token_id| try self.stepNoOutput(token_id);
+            return;
+        }
+
+        const gpu_session = &self.gpu_session.?;
+        var layers: [64]llama_gpu.LayerDesc = undefined;
+        for (self.model.layers, 0..) |layer, i| {
+            layers[i] = adaptLayerDesc(layer);
+        }
+
+        var consumed: usize = 0;
+        while (consumed < prompt_tokens.len) {
+            const batch_count = @min(llama_gpu.max_prompt_prefill_batch_len, prompt_tokens.len - consumed);
+            for (0..batch_count) |i| {
+                const token_id = prompt_tokens[consumed + i];
+                try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
+                try gpu_session.stagePromptPrefillEmbedding(i, self.hidden);
+            }
+            try gpu_session.runPromptPrefillChunk(
+                layers[0..self.model.layers.len],
+                batch_count,
+                self.position,
+            );
+            for (prompt_tokens[consumed .. consumed + batch_count]) |token_id| {
+                self.pending_greedy_token = null;
+                self.pending_shortlist_len = 0;
+                self.finishToken(token_id);
+            }
+            consumed += batch_count;
         }
     }
 
@@ -1433,9 +1466,7 @@ pub fn generateLoadedStreaming(
         .gpu_topk_sampler => {
             if (prompt_token_count == 0) return error.EmptyPrompt;
             if (prompt_token_count > 1) {
-                for (session.token_buffer[0 .. prompt_token_count - 1]) |token_id| {
-                    try session.stepNoOutput(token_id);
-                }
+                try session.runPromptPrefixNoOutput(session.token_buffer[0 .. prompt_token_count - 1]);
             }
             _ = try session.stepGpuTopK(session.token_buffer[prompt_token_count - 1], gpu_top_k, options.temperature, random.float(f32));
         },
@@ -1647,9 +1678,7 @@ pub fn generateLoadedStreamingCached(
         if (sampling_path == .gpu_topk_sampler) {
             const remaining = prompt_tokens[session.position..prompt_token_count];
             if (remaining.len > 1) {
-                for (remaining[0 .. remaining.len - 1]) |token_id| {
-                    try session.stepNoOutput(token_id);
-                }
+                try session.runPromptPrefixNoOutput(remaining[0 .. remaining.len - 1]);
             }
             _ = try session.stepGpuTopK(remaining[remaining.len - 1], gpu_top_k, options.temperature, random.float(f32));
         } else {

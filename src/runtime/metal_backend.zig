@@ -276,10 +276,15 @@ pub fn destroyBuffer(buffer: BufferHandle) void {
 }
 
 pub fn writeBufferF32(buffer: BufferHandle, values: []const f32) !void {
+    try writeBufferF32At(buffer, 0, values);
+}
+
+pub fn writeBufferF32At(buffer: BufferHandle, element_offset: usize, values: []const f32) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (!buffer.host_visible) return error.MetalBufferError;
-    if (values.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
-    try writeBuffer(buffer.raw, values);
+    const byte_offset = element_offset * @sizeOf(f32);
+    if (byte_offset + values.len * @sizeOf(f32) > buffer.byte_len) return error.MetalBufferError;
+    try writeBufferAtBytes(buffer.raw, byte_offset, std.mem.sliceAsBytes(values));
 }
 
 pub fn writeBufferF16(buffer: BufferHandle, values: []const f16) !void {
@@ -2600,12 +2605,16 @@ fn writeBuffer(buffer: *c.ZiggyMetalBuffer, values: []const f32) !void {
 }
 
 fn writeBufferBytes(buffer: *c.ZiggyMetalBuffer, values: []const u8) !void {
+    try writeBufferAtBytes(buffer, 0, values);
+}
+
+fn writeBufferAtBytes(buffer: *c.ZiggyMetalBuffer, byte_offset: usize, values: []const u8) !void {
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     const status = c.ziggy_metal_write_buffer(
         buffer,
         values.ptr,
         values.len,
-        0,
+        byte_offset,
         &error_buf,
         error_buf.len,
     );

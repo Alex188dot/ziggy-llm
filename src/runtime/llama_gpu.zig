@@ -127,6 +127,7 @@ const FusedKvFallbackReason = enum(u8) {
 
 pub const max_shortlist_len: usize = 64;
 pub const max_draft_len: usize = 4;
+pub const max_prompt_prefill_batch_len: usize = 32;
 const ggml_type_count: usize = 41;
 const q4_k_tensor_type: u32 = @intFromEnum(gguf.TensorType.q4_k);
 const q6_k_tensor_type: u32 = @intFromEnum(gguf.TensorType.q6_k);
@@ -158,6 +159,7 @@ pub const Session = struct {
     v_cache: metal_backend.BufferHandle,
     batch_logits: metal_backend.BufferHandle,
     batch_tokens: metal_backend.BufferHandle,
+    prompt_prefill_inputs: metal_backend.BufferHandle,
     ffn_block_mask: metal_backend.BufferHandle,
     ffn_gate_stats: metal_backend.BufferHandle,
     gated_ffn_policies: []const GatedFfnLayerPolicy,
@@ -231,6 +233,8 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(batch_logits);
         const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(batch_tokens);
+        const prompt_prefill_inputs = try metal_backend.createScratchBuffer(backend, max_prompt_prefill_batch_len * model.embedding_length);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_inputs);
         const ffn_block_count = std.math.divCeil(usize, model.feed_forward_length, 256) catch unreachable;
         const ffn_block_mask = try metal_backend.createGpuByteScratchBuffer(backend, ffn_block_count * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(ffn_block_mask);
@@ -259,6 +263,7 @@ pub const Session = struct {
             .v_cache = v_cache,
             .batch_logits = batch_logits,
             .batch_tokens = batch_tokens,
+            .prompt_prefill_inputs = prompt_prefill_inputs,
             .ffn_block_mask = ffn_block_mask,
             .ffn_gate_stats = ffn_gate_stats,
             .gated_ffn_policies = gated_ffn_policies,
@@ -286,6 +291,7 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.v_cache);
         metal_backend.destroyBuffer(self.batch_logits);
         metal_backend.destroyBuffer(self.batch_tokens);
+        metal_backend.destroyBuffer(self.prompt_prefill_inputs);
         metal_backend.destroyBuffer(self.ffn_block_mask);
         metal_backend.destroyBuffer(self.ffn_gate_stats);
         self.* = undefined;
@@ -294,6 +300,64 @@ pub const Session = struct {
     pub fn beginToken(self: *Session, input: []const f32) !void {
         try metal_backend.writeBufferF32(self.hidden, input);
         try metal_backend.beginSequence(self.backend);
+    }
+
+    pub fn stagePromptPrefillEmbedding(self: *Session, batch_index: usize, input: []const f32) !void {
+        if (batch_index >= max_prompt_prefill_batch_len) return error.InvalidTensorMetadata;
+        if (input.len != self.model.embedding_length) return error.InvalidTensorMetadata;
+        try metal_backend.writeBufferF32At(
+            self.prompt_prefill_inputs,
+            batch_index * self.model.embedding_length,
+            input,
+        );
+    }
+
+    pub fn runPromptPrefillChunk(
+        self: *Session,
+        layers: []const LayerDesc,
+        batch_count: usize,
+        base_position: usize,
+    ) !void {
+        if (batch_count == 0 or batch_count > max_prompt_prefill_batch_len) return error.InvalidTensorMetadata;
+
+        try metal_backend.beginSequence(self.backend);
+
+        const embedding_bytes = self.model.embedding_length * @sizeOf(f32);
+        for (0..batch_count) |i| {
+            const position = base_position + i;
+            try metal_backend.copyBufferRegion(
+                self.backend,
+                self.prompt_prefill_inputs,
+                i * embedding_bytes,
+                self.hidden,
+                0,
+                embedding_bytes,
+            );
+
+            for (layers, 0..) |layer, layer_index| {
+                try self.runAttentionBlock(layer, layer_index, position);
+            }
+
+            for (layers) |layer| {
+                if (!try self.runFusedFfnFanout(
+                    layer.ffn_gate,
+                    layer.ffn_up,
+                    self.hidden,
+                    layer.ffn_norm,
+                    self.norm_scale,
+                    self.gate,
+                    self.up,
+                )) {
+                    try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
+                    try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+                    try self.runProjection(layer.ffn_up, self.normed, self.up);
+                }
+                try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+                try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+            }
+        }
+
+        try metal_backend.commitSequence(self.backend);
     }
 
     pub fn runAttentionBlock(
