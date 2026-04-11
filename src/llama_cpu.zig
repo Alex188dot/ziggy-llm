@@ -986,7 +986,10 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             if (self.gpu_session) |*gpu_session| {
-                if (layer_index == 0) try gpu_session.beginToken(self.hidden);
+                if (layer_index == 0) {
+                    const token_norm_scale = rmsNormScaleValue(self.hidden, self.model.rms_norm_eps);
+                    try gpu_session.beginTokenWithNormScale(self.hidden, token_norm_scale);
+                }
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
@@ -1235,7 +1238,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDes
         .head_dimension = model.head_dimension,
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
-        .vocab_size = model.tokenizer.tokens.len,
+        .vocab_size = model.token_embd.rowCount() catch model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
         .rope_style = @intFromEnum(model.rope_style),
@@ -2652,14 +2655,18 @@ fn embeddingLookup(out: []f32, model: *const Model, tensor: TensorRef, token_id:
     try dequantizeRow(out, tensor.tensor_type, row, row_len);
 }
 
+fn rmsNormScaleValue(input: []const f32, eps: f32) f32 {
+    var mean_square = dot(input, input);
+    mean_square /= @as(f32, @floatFromInt(input.len));
+    return @as(f32, 1.0) / @sqrt(mean_square + eps);
+}
+
 fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRef) !void {
     const weights = try tensorBytes(model, tensor);
     if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
     if (try tensor.rowLen() != input.len) return error.InvalidTensorMetadata;
 
-    var mean_square = dot(input, input);
-    mean_square /= @as(f32, @floatFromInt(input.len));
-    const scale = @as(f32, 1.0) / @sqrt(mean_square + model.rms_norm_eps);
+    const scale = rmsNormScaleValue(input, model.rms_norm_eps);
 
     var i: usize = 0;
     while (i + simd_lane_count <= input.len) : (i += simd_lane_count) {

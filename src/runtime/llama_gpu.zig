@@ -166,6 +166,7 @@ pub const Session = struct {
     gated_ffn_enabled: bool,
     gated_ffn_total_blocks: u64 = 0,
     gated_ffn_active_blocks: u64 = 0,
+    token_norm_scale_ready: bool = false,
     fused_q_attempts: u64 = 0,
     fused_q_successes: u64 = 0,
     fused_q_fallback_counts: [@typeInfo(FusedQFallbackReason).@"enum".fields.len]u64 =
@@ -201,7 +202,7 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(hidden);
         const normed = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(normed);
-        const norm_scale = try metal_backend.createGpuScratchBuffer(backend, 1);
+        const norm_scale = try metal_backend.createScratchBuffer(backend, 1);
         errdefer metal_backend.destroyBuffer(norm_scale);
         const q = try metal_backend.createGpuScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(q);
@@ -299,7 +300,16 @@ pub const Session = struct {
 
     pub fn beginToken(self: *Session, input: []const f32) !void {
         try metal_backend.writeBufferF32(self.hidden, input);
+        self.token_norm_scale_ready = false;
         try metal_backend.beginSequence(self.backend);
+    }
+
+    pub fn beginTokenWithNormScale(self: *Session, input: []const f32, norm_scale_value: f32) !void {
+        var scale = [_]f32{norm_scale_value};
+        try metal_backend.writeBufferF32(self.hidden, input);
+        try metal_backend.writeBufferF32(self.norm_scale, &scale);
+        try metal_backend.beginSequence(self.backend);
+        self.token_norm_scale_ready = true;
     }
 
     pub fn stagePromptPrefillEmbedding(self: *Session, batch_index: usize, input: []const f32) !void {
@@ -367,7 +377,8 @@ pub const Session = struct {
         position: usize,
     ) !void {
         var normed_ready = false;
-        var norm_scale_ready = false;
+        var norm_scale_ready = layer_index == 0 and self.token_norm_scale_ready;
+        if (layer_index == 0 and norm_scale_ready) self.token_norm_scale_ready = false;
 
         if (!try self.runFusedQKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
             const fused_qk_written = try self.runFusedQKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready);
@@ -1799,6 +1810,14 @@ pub const Session = struct {
         };
     }
 
+    fn rmsNormScaleValue(values: []const f32, eps: f32) f32 {
+        var sum: f32 = 0;
+        for (values) |value| {
+            sum += value * value;
+        }
+        return @as(f32, 1.0) / @sqrt(sum / @as(f32, @floatFromInt(values.len)) + eps);
+    }
+
     fn projectionAddCategoryFor(tensor_type: u32) metal_profile.Category {
         return switch (tensor_type) {
             8, 12, 14 => .projection_add_quantized,
@@ -1869,7 +1888,6 @@ pub const Session = struct {
         const batch_count = draft_tokens.len;
 
         try metal_backend.beginSequence(self.backend);
-
         for (draft_tokens, 0..) |draft_token, i| {
             const position = base_position + i;
 
@@ -1879,7 +1897,7 @@ pub const Session = struct {
             var values: [2048]f32 = undefined;
             if (emb_rows > values.len) return error.InvalidTensorMetadata;
             @memcpy(values[0..emb_rows], src);
-            try metal_backend.writeBufferF32(self.hidden, values[0..emb_rows]);
+            try self.beginTokenWithNormScale(values[0..emb_rows], rmsNormScaleValue(values[0..emb_rows], self.model.rms_norm_eps));
 
             for (layers, 0..) |layer, layer_index| {
                 try self.runAttentionBlock(layer, layer_index, position);
