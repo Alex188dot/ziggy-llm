@@ -1892,6 +1892,158 @@ pub fn batchMatvecQ4K(
     ), &error_buf);
 }
 
+pub fn batchMatvecAll(
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < batch_count * cols * @sizeOf(f32) or output.byte_len < batch_count * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_f32_all(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchMatvecQ4KAll(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < batch_count * cols * @sizeOf(f32) or output.byte_len < batch_count * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_q4k_f32_all(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchMatvecQ6KAll(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < batch_count * cols * @sizeOf(f32) or output.byte_len < batch_count * rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_matvec_q6k_f32_all(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchSiluMulAll(
+    backend: backend_api.MatVecBackend,
+    gate: BufferHandle,
+    up: BufferHandle,
+    count: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (gate.byte_len < batch_count * count * @sizeOf(f32) or up.byte_len < batch_count * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_silu_mul_f32_all(
+        state.context,
+        gate.raw,
+        up.raw,
+        @intCast(count),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchAddInPlaceAll(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    src: BufferHandle,
+    count: usize,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (dst.byte_len < batch_count * count * @sizeOf(f32) or src.byte_len < batch_count * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_add_in_place_f32_all(
+        state.context,
+        dst.raw,
+        src.raw,
+        @intCast(count),
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn batchRmsNormAll(
+    backend: backend_api.MatVecBackend,
+    input: BufferHandle,
+    weights: []const f32,
+    output: BufferHandle,
+    count: usize,
+    eps: f32,
+    batch_count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < batch_count * count * @sizeOf(f32) or output.byte_len < batch_count * count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const weights_buffer = try state.matrixBuffer(weights[0..count]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_batch_rms_norm_f32_all(
+        state.context,
+        input.raw,
+        weights_buffer.raw,
+        output.raw,
+        @intCast(count),
+        eps,
+        @intCast(batch_count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn runMatVecQ4KDualToBuffers(
     backend: backend_api.MatVecBackend,
     matrix0_bytes: []const u8,

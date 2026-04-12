@@ -160,6 +160,12 @@ pub const Session = struct {
     batch_logits: metal_backend.BufferHandle,
     batch_tokens: metal_backend.BufferHandle,
     prompt_prefill_inputs: metal_backend.BufferHandle,
+    prompt_prefill_normed: metal_backend.BufferHandle,
+    prompt_prefill_q: metal_backend.BufferHandle,
+    prompt_prefill_k: metal_backend.BufferHandle,
+    prompt_prefill_v: metal_backend.BufferHandle,
+    prompt_prefill_gate: metal_backend.BufferHandle,
+    prompt_prefill_up: metal_backend.BufferHandle,
     ffn_block_mask: metal_backend.BufferHandle,
     ffn_gate_stats: metal_backend.BufferHandle,
     gated_ffn_policies: []const GatedFfnLayerPolicy,
@@ -236,6 +242,18 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(batch_tokens);
         const prompt_prefill_inputs = try metal_backend.createScratchBuffer(backend, max_prompt_prefill_batch_len * model.embedding_length);
         errdefer metal_backend.destroyBuffer(prompt_prefill_inputs);
+        const prompt_prefill_normed = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.embedding_length);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_normed);
+        const prompt_prefill_q = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.embedding_length);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_q);
+        const prompt_prefill_k = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_k);
+        const prompt_prefill_v = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.kv_dimension);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_v);
+        const prompt_prefill_gate = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.feed_forward_length);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_gate);
+        const prompt_prefill_up = try metal_backend.createGpuScratchBuffer(backend, max_prompt_prefill_batch_len * model.feed_forward_length);
+        errdefer metal_backend.destroyBuffer(prompt_prefill_up);
         const ffn_block_count = std.math.divCeil(usize, model.feed_forward_length, 256) catch unreachable;
         const ffn_block_mask = try metal_backend.createGpuByteScratchBuffer(backend, ffn_block_count * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(ffn_block_mask);
@@ -265,6 +283,12 @@ pub const Session = struct {
             .batch_logits = batch_logits,
             .batch_tokens = batch_tokens,
             .prompt_prefill_inputs = prompt_prefill_inputs,
+            .prompt_prefill_normed = prompt_prefill_normed,
+            .prompt_prefill_q = prompt_prefill_q,
+            .prompt_prefill_k = prompt_prefill_k,
+            .prompt_prefill_v = prompt_prefill_v,
+            .prompt_prefill_gate = prompt_prefill_gate,
+            .prompt_prefill_up = prompt_prefill_up,
             .ffn_block_mask = ffn_block_mask,
             .ffn_gate_stats = ffn_gate_stats,
             .gated_ffn_policies = gated_ffn_policies,
@@ -293,6 +317,12 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.batch_logits);
         metal_backend.destroyBuffer(self.batch_tokens);
         metal_backend.destroyBuffer(self.prompt_prefill_inputs);
+        metal_backend.destroyBuffer(self.prompt_prefill_normed);
+        metal_backend.destroyBuffer(self.prompt_prefill_q);
+        metal_backend.destroyBuffer(self.prompt_prefill_k);
+        metal_backend.destroyBuffer(self.prompt_prefill_v);
+        metal_backend.destroyBuffer(self.prompt_prefill_gate);
+        metal_backend.destroyBuffer(self.prompt_prefill_up);
         metal_backend.destroyBuffer(self.ffn_block_mask);
         metal_backend.destroyBuffer(self.ffn_gate_stats);
         self.* = undefined;
@@ -329,7 +359,18 @@ pub const Session = struct {
         base_position: usize,
     ) !void {
         if (batch_count == 0 or batch_count > max_prompt_prefill_batch_len) return error.InvalidTensorMetadata;
+        if (self.canRunTrueBatchPromptPrefill(layers)) {
+            return self.runPromptPrefillChunkBatched(layers, batch_count, base_position);
+        }
+        return self.runPromptPrefillChunkSequential(layers, batch_count, base_position);
+    }
 
+    fn runPromptPrefillChunkSequential(
+        self: *Session,
+        layers: []const LayerDesc,
+        batch_count: usize,
+        base_position: usize,
+    ) !void {
         try metal_backend.beginSequence(self.backend);
 
         const embedding_bytes = self.model.embedding_length * @sizeOf(f32);
@@ -365,6 +406,47 @@ pub const Session = struct {
                 try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
                 try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
             }
+        }
+
+        try metal_backend.commitSequence(self.backend);
+    }
+
+    fn canRunTrueBatchPromptPrefill(self: *Session, layers: []const LayerDesc) bool {
+        if (self.model.rope_style != 0) return false;
+        if (self.model.rope_dimension_count != self.model.head_dimension) return false;
+        for (layers) |layer| {
+            if (layer.attn_q_bias != null or layer.attn_q_norm != null) return false;
+            if (layer.attn_k_bias != null or layer.attn_k_norm != null) return false;
+            if (layer.attn_v_bias != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.attn_q.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.attn_k.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.attn_v.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.attn_output.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.ffn_gate.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.ffn_up.offset) != null) return false;
+            if (self.dense_lookup.getMoonQuant(layer.ffn_down.offset) != null) return false;
+            if (!supportsBatchProjectionTensor(layer.attn_q.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.attn_k.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.attn_v.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.attn_output.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.ffn_gate.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.ffn_up.tensor_type)) return false;
+            if (!supportsBatchProjectionTensor(layer.ffn_down.tensor_type)) return false;
+        }
+        return true;
+    }
+
+    fn runPromptPrefillChunkBatched(
+        self: *Session,
+        layers: []const LayerDesc,
+        batch_count: usize,
+        base_position: usize,
+    ) !void {
+        try metal_backend.beginSequence(self.backend);
+
+        for (layers, 0..) |layer, layer_index| {
+            try self.runPromptAttentionLayerBatched(layer, layer_index, batch_count, base_position);
+            try self.runPromptFfnLayerBatched(layer, batch_count);
         }
 
         try metal_backend.commitSequence(self.backend);
@@ -1725,6 +1807,179 @@ pub const Session = struct {
         }
     }
 
+    fn runBatchProjection(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        batch_count: usize,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        var quant_layout_path: metal_profile.LayoutPath = .none;
+        switch (tensor.tensor_type) {
+            12 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.batchMatvecQ4KAll(self.backend, matrix, input, output, tensor.rows, tensor.cols, batch_count);
+            },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.batchMatvecQ6KAll(self.backend, matrix, input, output, tensor.rows, tensor.cols, batch_count);
+                quant_layout_path = .raw_q6_k;
+            },
+            else => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.batchMatvecAll(self.backend, matrix, input, output, tensor.rows, tensor.cols, batch_count);
+            },
+        }
+        const shape = metal_profile.ShapeDesc{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .depth = batch_count,
+            .tensor_type = tensor.tensor_type,
+            .layout_path = quant_layout_path,
+        };
+        self.recordCategoryWithShape(projectionCategoryFor(tensor.tensor_type), start, shape);
+        if (quant_layout_path != .none) self.recordQuantizedLayoutProjection(start, shape);
+    }
+
+    fn runBatchRmsNorm(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        batch_count: usize,
+    ) !void {
+        const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
+        try metal_backend.batchRmsNormAll(
+            self.backend,
+            input,
+            weights,
+            output,
+            self.model.embedding_length,
+            self.model.rms_norm_eps,
+            batch_count,
+        );
+        self.recordCategoryWithShape(.normalization, start, .{
+            .rows = batch_count,
+            .cols = self.model.embedding_length,
+        });
+    }
+
+    fn runPromptAttentionLayerBatched(
+        self: *Session,
+        layer: LayerDesc,
+        layer_index: usize,
+        batch_count: usize,
+        base_position: usize,
+    ) !void {
+        try self.runBatchRmsNorm(layer.attn_norm, self.prompt_prefill_inputs, self.prompt_prefill_normed, batch_count);
+        try self.runBatchProjection(layer.attn_q, self.prompt_prefill_normed, self.prompt_prefill_q, batch_count);
+        try self.runBatchProjection(layer.attn_k, self.prompt_prefill_normed, self.prompt_prefill_k, batch_count);
+        try self.runBatchProjection(layer.attn_v, self.prompt_prefill_normed, self.prompt_prefill_v, batch_count);
+
+        const q_bytes = self.model.embedding_length * @sizeOf(f32);
+        const kv_bytes = self.model.kv_dimension * @sizeOf(f32);
+        const attn_bytes = self.model.embedding_length * @sizeOf(f32);
+        for (0..batch_count) |i| {
+            const position = base_position + i;
+            try metal_backend.copyBufferRegion(self.backend, self.prompt_prefill_q, i * q_bytes, self.q, 0, q_bytes);
+            try metal_backend.copyBufferRegion(self.backend, self.prompt_prefill_k, i * kv_bytes, self.k, 0, kv_bytes);
+            try metal_backend.copyBufferRegion(self.backend, self.prompt_prefill_v, i * kv_bytes, self.v, 0, kv_bytes);
+
+            if (self.model.rope_style != 0 or self.model.rope_dimension_count != self.model.head_dimension) {
+                return error.InvalidTensorMetadata;
+            }
+            const q_rope_start = std.time.nanoTimestamp();
+            try metal_backend.applyRoPE(
+                self.backend,
+                self.q,
+                self.model.head_count,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+            self.recordCategoryWithShape(.rope, q_rope_start, .{
+                .rows = self.model.head_count,
+                .cols = self.model.head_dimension,
+                .depth = self.model.rope_dimension_count,
+                .extra = position + 1,
+            });
+
+            const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
+            const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+            const kv_start = std.time.nanoTimestamp();
+            try metal_backend.packKvHalf(
+                self.backend,
+                self.k,
+                self.v,
+                self.k_cache,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.rope_dimension_count,
+                position,
+                self.model.rope_freq_base,
+                self.model.rope_style,
+            );
+            self.recordCategoryWithShape(.kv_writes, kv_start, .{
+                .rows = 1,
+                .cols = self.model.kv_dimension,
+                .depth = layer_index,
+                .extra = position + 1,
+            });
+
+            const attention_start = std.time.nanoTimestamp();
+            try metal_backend.attentionFused(
+                self.backend,
+                self.q,
+                self.k_cache,
+                self.v_cache,
+                self.attn,
+                self.model.head_count,
+                self.model.head_count_kv,
+                self.model.head_dimension,
+                self.model.kv_dimension,
+                self.model.context_length,
+                position,
+                layer_base,
+                @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
+            );
+            self.recordCategoryWithShape(.attention, attention_start, .{
+                .rows = self.model.head_count,
+                .cols = self.model.head_dimension,
+                .depth = position + 1,
+                .extra = self.model.head_count_kv,
+            });
+            try metal_backend.copyBufferRegion(self.backend, self.attn, 0, self.prompt_prefill_q, i * attn_bytes, attn_bytes);
+        }
+
+        try self.runBatchProjection(layer.attn_output, self.prompt_prefill_q, self.prompt_prefill_normed, batch_count);
+        try metal_backend.batchAddInPlaceAll(self.backend, self.prompt_prefill_inputs, self.prompt_prefill_normed, self.model.embedding_length, batch_count);
+    }
+
+    fn runPromptFfnLayerBatched(
+        self: *Session,
+        layer: LayerDesc,
+        batch_count: usize,
+    ) !void {
+        try self.runBatchRmsNorm(layer.ffn_norm, self.prompt_prefill_inputs, self.prompt_prefill_normed, batch_count);
+        try self.runBatchProjection(layer.ffn_gate, self.prompt_prefill_normed, self.prompt_prefill_gate, batch_count);
+        try self.runBatchProjection(layer.ffn_up, self.prompt_prefill_normed, self.prompt_prefill_up, batch_count);
+        const silu_start = std.time.nanoTimestamp();
+        try metal_backend.batchSiluMulAll(self.backend, self.prompt_prefill_gate, self.prompt_prefill_up, self.model.feed_forward_length, batch_count);
+        self.recordCategoryWithShape(.ffn_activation, silu_start, .{
+            .rows = batch_count,
+            .cols = self.model.feed_forward_length,
+            .depth = 2,
+        });
+        try self.runBatchProjection(layer.ffn_down, self.prompt_prefill_gate, self.prompt_prefill_normed, batch_count);
+        try metal_backend.batchAddInPlaceAll(self.backend, self.prompt_prefill_inputs, self.prompt_prefill_normed, self.model.embedding_length, batch_count);
+    }
+
     fn runBiasAdd(self: *Session, tensor: TensorDesc, target: metal_backend.BufferHandle) !void {
         const start = std.time.nanoTimestamp();
         const bias_weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1822,6 +2077,13 @@ pub const Session = struct {
         return switch (tensor_type) {
             8, 12, 14 => .projection_add_quantized,
             else => .projection_add_dense,
+        };
+    }
+
+    fn supportsBatchProjectionTensor(tensor_type: u32) bool {
+        return switch (tensor_type) {
+            8 => false,
+            else => true,
         };
     }
 
