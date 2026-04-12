@@ -106,6 +106,10 @@ fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOp
     };
 }
 
+fn hasGpuGreedyAcceleration(session: *const Session) bool {
+    return session.gpu_session != null or session.canUseHybridMetalGreedy();
+}
+
 const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
@@ -688,6 +692,8 @@ const Session = struct {
     v_cache: []f32,
     metal_input_buffer: ?metal_backend.BufferHandle = null,
     metal_output_buffer: ?metal_backend.BufferHandle = null,
+    metal_norm_scale_buffer: ?metal_backend.BufferHandle = null,
+    metal_sampled_token_packed: ?metal_backend.BufferHandle = null,
     moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
@@ -730,16 +736,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                if (std.mem.startsWith(u8, model.architecture, "qwen")) {
-                    const max_input_elems = @max(model.embedding_length, model.feed_forward_length);
-                    const max_output_elems = model.tokenizer.tokens.len;
-                    session.metal_input_buffer = try metal_backend.createScratchBuffer(selected_backend, max_input_elems);
-                    errdefer if (session.metal_input_buffer) |buffer| metal_backend.destroyBuffer(buffer);
-                    session.metal_output_buffer = try metal_backend.createScratchBuffer(selected_backend, max_output_elems);
-                    errdefer if (session.metal_output_buffer) |buffer| metal_backend.destroyBuffer(buffer);
-                } else {
-                    session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
-                }
+                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
             }
         }
 
@@ -758,6 +755,8 @@ const Session = struct {
         if (self.gpu_session) |*gpu_session| gpu_session.deinit();
         if (self.metal_input_buffer) |buffer| metal_backend.destroyBuffer(buffer);
         if (self.metal_output_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+        if (self.metal_norm_scale_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+        if (self.metal_sampled_token_packed) |buffer| metal_backend.destroyBuffer(buffer);
         if (self.matvec_workers) |workers| {
             workers.deinit(allocator);
             allocator.destroy(workers);
@@ -801,7 +800,10 @@ const Session = struct {
 
     fn runPromptPrefixNoOutput(self: *Session, prompt_tokens: []const u32) !void {
         if (prompt_tokens.len == 0) return;
-        if (self.gpu_session == null or prompt_tokens.len == 1) {
+        if (self.gpu_session == null or
+            prompt_tokens.len == 1 or
+            std.mem.startsWith(u8, self.model.architecture, "qwen"))
+        {
             for (prompt_tokens) |token_id| try self.stepNoOutput(token_id);
             return;
         }
@@ -875,6 +877,13 @@ const Session = struct {
     }
 
     fn stepGreedy(self: *Session, token_id: u32) !u32 {
+        if (self.canUseHybridMetalGreedy()) {
+            try self.runTokenCore(token_id);
+            const next_token = try self.runOutputArgmaxHybridMetal();
+            self.pending_greedy_token = next_token;
+            self.finishToken(token_id);
+            return next_token;
+        }
         if (self.gpu_session == null) {
             _ = try self.step(token_id);
             return argmax(self.logits);
@@ -1011,15 +1020,17 @@ const Session = struct {
                 try self.recordCalibration(layer.attn_k, .attn_k, self.normed);
                 try self.recordCalibration(layer.attn_v, .attn_v, self.normed);
 
-                try self.matVec(self.q, layer.attn_q, self.normed);
+                if (self.canUseHybridMetalBatching()) {
+                    try self.runHybridMetalQkvFanout(layer, self.normed);
+                } else {
+                    try self.matVec(self.q, layer.attn_q, self.normed);
+                    try self.matVec(self.k, layer.attn_k, self.normed);
+                    try self.matVec(self.v, layer.attn_v, self.normed);
+                }
                 if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
                 if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.head_dimension);
-
-                try self.matVec(self.k, layer.attn_k, self.normed);
                 if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
                 if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.head_dimension);
-
-                try self.matVec(self.v, layer.attn_v, self.normed);
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
                 applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
@@ -1037,8 +1048,12 @@ const Session = struct {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
                 try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
                 try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
-                try self.matVec(self.gate, layer.ffn_gate, self.normed);
-                try self.matVec(self.up, layer.ffn_up, self.normed);
+                if (self.canUseHybridMetalBatching()) {
+                    try self.runHybridMetalFfnFanout(layer, self.normed);
+                } else {
+                    try self.matVec(self.gate, layer.ffn_gate, self.normed);
+                    try self.matVec(self.up, layer.ffn_up, self.normed);
+                }
                 siluInPlace(self.gate);
                 for (self.gate, self.up) |*gate, up| {
                     gate.* *= up;
@@ -1205,6 +1220,153 @@ const Session = struct {
         }
 
         try metal_backend.readBufferF32(output_buffer, out);
+    }
+
+    fn canUseHybridMetalBatching(self: *const Session) bool {
+        _ = self;
+        return false;
+    }
+
+    fn runHybridMetalProjectionToDst(
+        self: *Session,
+        backend: backend_api.MatVecBackend,
+        tensor: TensorRef,
+        input_buffer: metal_backend.BufferHandle,
+        output_buffer: metal_backend.BufferHandle,
+        output_offset_elems: usize,
+    ) !usize {
+        const lookup = self.dense_tensors orelse return error.InvalidTensorMetadata;
+        const row_len = try tensor.rowLen();
+        const row_count = try tensor.rowCount();
+        const output_offset_bytes = output_offset_elems * @sizeOf(f32);
+
+        switch (tensor.tensor_type) {
+            .f32, .f16 => {
+                const matrix = lookup.getByOffset(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+            },
+            .q4_k => {
+                if (lookup.getMoonQuantByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+                } else if (lookup.getRawByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ4KToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+                } else return error.InvalidTensorMetadata;
+            },
+            .q6_k => {
+                if (lookup.getMoonQuantByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ6KToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+                } else if (lookup.getRawByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ6KToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+                } else return error.InvalidTensorMetadata;
+            },
+            .q8_0 => {
+                const matrix = lookup.getRawByOffset(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToDstBuffer(backend, matrix, input_buffer, output_buffer, output_offset_bytes, row_count, row_len);
+            },
+        }
+
+        return row_count;
+    }
+
+    fn runHybridMetalQkvFanout(self: *Session, layer: LayerRefs, input: []const f32) !void {
+        const backend = self.backend orelse return error.InvalidTensorMetadata;
+        const input_buffer = self.metal_input_buffer orelse return error.InvalidTensorMetadata;
+        const output_buffer = self.metal_output_buffer orelse return error.InvalidTensorMetadata;
+
+        try metal_backend.writeBufferF32(input_buffer, input);
+        try metal_backend.beginSequence(backend);
+
+        var output_offset_elems: usize = 0;
+        const q_len = try self.runHybridMetalProjectionToDst(backend, layer.attn_q, input_buffer, output_buffer, output_offset_elems);
+        output_offset_elems += q_len;
+        const k_len = try self.runHybridMetalProjectionToDst(backend, layer.attn_k, input_buffer, output_buffer, output_offset_elems);
+        output_offset_elems += k_len;
+        const v_len = try self.runHybridMetalProjectionToDst(backend, layer.attn_v, input_buffer, output_buffer, output_offset_elems);
+        output_offset_elems += v_len;
+
+        try metal_backend.commitSequence(backend);
+        try metal_backend.readBufferF32(output_buffer, self.logits[0..output_offset_elems]);
+        @memcpy(self.q, self.logits[0..q_len]);
+        @memcpy(self.k, self.logits[q_len .. q_len + k_len]);
+        @memcpy(self.v, self.logits[q_len + k_len .. output_offset_elems]);
+    }
+
+    fn runHybridMetalFfnFanout(self: *Session, layer: LayerRefs, input: []const f32) !void {
+        const backend = self.backend orelse return error.InvalidTensorMetadata;
+        const input_buffer = self.metal_input_buffer orelse return error.InvalidTensorMetadata;
+        const output_buffer = self.metal_output_buffer orelse return error.InvalidTensorMetadata;
+
+        try metal_backend.writeBufferF32(input_buffer, input);
+        try metal_backend.beginSequence(backend);
+
+        var output_offset_elems: usize = 0;
+        const gate_len = try self.runHybridMetalProjectionToDst(backend, layer.ffn_gate, input_buffer, output_buffer, output_offset_elems);
+        output_offset_elems += gate_len;
+        const up_len = try self.runHybridMetalProjectionToDst(backend, layer.ffn_up, input_buffer, output_buffer, output_offset_elems);
+        output_offset_elems += up_len;
+
+        try metal_backend.commitSequence(backend);
+        try metal_backend.readBufferF32(output_buffer, self.logits[0..output_offset_elems]);
+        @memcpy(self.gate, self.logits[0..gate_len]);
+        @memcpy(self.up, self.logits[gate_len .. gate_len + up_len]);
+    }
+
+    fn canUseHybridMetalGreedy(self: *const Session) bool {
+        return self.backend != null and
+            self.backend.?.label == .metal and
+            self.gpu_session == null and
+            self.metal_input_buffer != null and
+            self.metal_norm_scale_buffer != null and
+            self.metal_sampled_token_packed != null;
+    }
+
+    fn runOutputArgmaxHybridMetal(self: *Session) !u32 {
+        const backend = self.backend orelse return error.InvalidTensorMetadata;
+        const lookup = self.dense_tensors orelse return error.InvalidTensorMetadata;
+        const input_buffer = self.metal_input_buffer orelse return error.InvalidTensorMetadata;
+        const norm_scale_buffer = self.metal_norm_scale_buffer orelse return error.InvalidTensorMetadata;
+        const packed_buffer = self.metal_sampled_token_packed orelse return error.InvalidTensorMetadata;
+        const norm_weights = lookup.getByOffset(self.model.output_norm.offset) orelse return error.InvalidTensorMetadata;
+        const initial_state = [_]u32{ 0, 0, std.math.maxInt(u32) };
+        const scale = [_]f32{rmsNormScaleValue(self.hidden, self.model.rms_norm_eps)};
+
+        try metal_backend.writeBufferF32(input_buffer, self.hidden);
+        try metal_backend.writeBufferF32(norm_scale_buffer, &scale);
+        try metal_backend.writeBufferU32(packed_buffer, &initial_state);
+
+        switch (self.model.output.tensor_type) {
+            .q4_k => {
+                const matrix = lookup.getRawByOffset(self.model.output.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ4KArgmaxRmsToBuffer(
+                    backend,
+                    matrix,
+                    input_buffer,
+                    norm_weights,
+                    norm_scale_buffer,
+                    packed_buffer,
+                    try self.model.output.rowCount(),
+                    try self.model.output.rowLen(),
+                );
+            },
+            .q6_k => {
+                const matrix = lookup.getRawByOffset(self.model.output.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KArgmaxRmsToBuffer(
+                    backend,
+                    matrix,
+                    input_buffer,
+                    norm_weights,
+                    norm_scale_buffer,
+                    packed_buffer,
+                    try self.model.output.rowCount(),
+                    try self.model.output.rowLen(),
+                );
+            },
+            else => return error.UnsupportedTensorType,
+        }
+
+        var argmax_state: [3]u32 = .{ 0, 0, 0 };
+        try metal_backend.readBufferU32(packed_buffer, &argmax_state);
+        return argmax_state[2];
     }
 
     fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
@@ -1521,7 +1683,7 @@ pub fn generateLoadedStreaming(
     const startup_end = std.time.nanoTimestamp();
     spinner.stop();
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
-    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+    const sampling_path = chooseSamplingPath(hasGpuGreedyAcceleration(&session), options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
     const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
@@ -1737,7 +1899,7 @@ pub fn generateLoadedStreamingCached(
     }
 
     if (session.position < prompt_token_count) {
-        const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+        const sampling_path = chooseSamplingPath(hasGpuGreedyAcceleration(session), options);
         const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
         const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
         if (sampling_path == .gpu_topk_sampler) {
@@ -1755,7 +1917,7 @@ pub fn generateLoadedStreamingCached(
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
-    const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
+    const sampling_path = chooseSamplingPath(hasGpuGreedyAcceleration(session), options);
     const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
     const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
     const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
@@ -2268,6 +2430,8 @@ pub fn detectChatTemplateStyleInMetadataBlob(
     metadata_bytes: []const u8,
 ) !gguf.ChatTemplateStyle {
     var parser = Parser{ .bytes = metadata_bytes };
+    var architecture: ?[]u8 = null;
+    defer if (architecture) |value| allocator.free(value);
 
     var kv_index: u64 = 0;
     while (kv_index < metadata_count) : (kv_index += 1) {
@@ -2283,9 +2447,17 @@ pub fn detectChatTemplateStyleInMetadataBlob(
             return gguf.detectChatTemplateStyle(template);
         }
 
+        if (std.mem.eql(u8, key, "general.architecture")) {
+            architecture = try readExpectedString(allocator, &parser, value_type);
+            continue;
+        }
+
         try skipValue(&parser, value_type);
     }
 
+    if (architecture) |value| {
+        if (std.mem.startsWith(u8, value, "qwen")) return .qwen;
+    }
     return .generic;
 }
 

@@ -126,7 +126,10 @@ pub const InspectReport = struct {
     }
 
     pub fn chatTemplateStyle(self: InspectReport) ChatTemplateStyle {
-        return detectChatTemplateStyle(self.chat_template);
+        const detected = detectChatTemplateStyle(self.chat_template);
+        if (detected != .generic) return detected;
+        if (std.mem.startsWith(u8, self.architecture, "qwen")) return .qwen;
+        return .generic;
     }
 };
 

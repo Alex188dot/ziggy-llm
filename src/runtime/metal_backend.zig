@@ -331,6 +331,7 @@ pub fn packKvHalf(
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
+    const rope_pair_count = rope_dim / 2;
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     try mapStatus(c.ziggy_metal_pack_kv_half_f32(
         state.context,
@@ -341,7 +342,7 @@ pub fn packKvHalf(
         @intCast(dst_offset_elements),
         @intCast(head_count),
         @intCast(head_dim),
-        @intCast(rope_dim),
+        @intCast(rope_pair_count),
         @intCast(position),
         freq_base,
         rope_style,

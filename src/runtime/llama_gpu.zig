@@ -469,7 +469,14 @@ pub const Session = struct {
                 normed_ready = true;
                 try self.runProjection(layer.attn_q, self.normed, self.q);
                 if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
-                if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
+                if (layer.attn_q_norm) |n| {
+                    if (self.model.rope_style != 0 and self.model.head_count != self.model.head_count_kv) {
+                        try self.runRmsNormPerHead(n, self.q, self.attn, self.model.head_count, self.model.head_dimension);
+                        try metal_backend.copyBufferRegion(self.backend, self.attn, 0, self.q, 0, self.model.embedding_length * @sizeOf(f32));
+                    } else {
+                        try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
+                    }
+                }
 
                 const q_rope_start = std.time.nanoTimestamp();
                 try metal_backend.applyRoPE(
@@ -510,7 +517,14 @@ pub const Session = struct {
 
                 if (!fused_k_written) {
                     if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
-                    if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
+                    if (layer.attn_k_norm) |n| {
+                        if (self.model.rope_style != 0 and self.model.head_count != self.model.head_count_kv) {
+                            try self.runRmsNormPerHead(n, self.k, self.gate, self.model.head_count_kv, self.model.head_dimension);
+                            try metal_backend.copyBufferRegion(self.backend, self.gate, 0, self.k, 0, self.model.kv_dimension * @sizeOf(f32));
+                        } else {
+                            try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
+                        }
+                    }
                 }
                 if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
 
