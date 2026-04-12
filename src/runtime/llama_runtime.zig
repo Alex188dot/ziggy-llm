@@ -341,11 +341,12 @@ fn createMetalExecution(
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
-    const gated_ffn_policies = try buildGatedFfnPolicies(allocator, model, compiled_model);
+    const effective_compiled_model = if (std.mem.startsWith(u8, model.architecture, "qwen")) null else compiled_model;
+    const gated_ffn_policies = try buildGatedFfnPolicies(allocator, model, effective_compiled_model);
     errdefer allocator.free(gated_ffn_policies);
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    if (compiled_model) |compiled| {
+    if (effective_compiled_model) |compiled| {
         try dense_tensors.populateFromCompiled(model, compiled, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     } else {
         try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);

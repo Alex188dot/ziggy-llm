@@ -3,6 +3,7 @@ const gguf = @import("gguf.zig");
 const terminal = @import("terminal.zig");
 const backend_api = @import("runtime/backend.zig");
 const llama_gpu = @import("runtime/llama_gpu.zig");
+const metal_backend = @import("runtime/metal_backend.zig");
 const metal_profile = @import("runtime/metal_profile.zig");
 const moon_quant_calibration = @import("moon_quant_calibration.zig");
 const runtime_types = @import("runtime/types.zig");
@@ -685,6 +686,8 @@ const Session = struct {
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
+    metal_input_buffer: ?metal_backend.BufferHandle = null,
+    metal_output_buffer: ?metal_backend.BufferHandle = null,
     moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
@@ -727,7 +730,16 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
+                if (std.mem.startsWith(u8, model.architecture, "qwen")) {
+                    const max_input_elems = @max(model.embedding_length, model.feed_forward_length);
+                    const max_output_elems = model.tokenizer.tokens.len;
+                    session.metal_input_buffer = try metal_backend.createScratchBuffer(selected_backend, max_input_elems);
+                    errdefer if (session.metal_input_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+                    session.metal_output_buffer = try metal_backend.createScratchBuffer(selected_backend, max_output_elems);
+                    errdefer if (session.metal_output_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+                } else {
+                    session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
+                }
             }
         }
 
@@ -744,6 +756,8 @@ const Session = struct {
 
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         if (self.gpu_session) |*gpu_session| gpu_session.deinit();
+        if (self.metal_input_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+        if (self.metal_output_buffer) |buffer| metal_backend.destroyBuffer(buffer);
         if (self.matvec_workers) |workers| {
             workers.deinit(allocator);
             allocator.destroy(workers);
@@ -1113,6 +1127,10 @@ const Session = struct {
         if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
 
         if (self.backend) |backend| {
+            if (backend.label == .metal and self.gpu_session == null) {
+                try self.matVecHybridMetal(backend, tensor, input, out);
+                return;
+            }
             const dense_tensors = self.dense_tensors orelse return error.InvalidTensorMetadata;
             const matrix = dense_tensors.get(tensor) orelse return error.InvalidTensorMetadata;
             try backend.matVec(out, matrix, input, row_count, row_len);
@@ -1143,6 +1161,50 @@ const Session = struct {
             const row = bytes[row_index * row_size ..][0..row_size];
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
+    }
+
+    fn matVecHybridMetal(
+        self: *Session,
+        backend: backend_api.MatVecBackend,
+        tensor: TensorRef,
+        input: []const f32,
+        out: []f32,
+    ) !void {
+        const lookup = self.dense_tensors orelse return error.InvalidTensorMetadata;
+        const input_buffer = self.metal_input_buffer orelse return error.InvalidTensorMetadata;
+        const output_buffer = self.metal_output_buffer orelse return error.InvalidTensorMetadata;
+        const row_len = try tensor.rowLen();
+        const row_count = try tensor.rowCount();
+
+        try metal_backend.writeBufferF32(input_buffer, input);
+
+        switch (tensor.tensor_type) {
+            .f32, .f16 => {
+                const matrix = lookup.getByOffset(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try backend.matVec(out, matrix, input, row_count, row_len);
+                return;
+            },
+            .q4_k => {
+                if (lookup.getMoonQuantByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ4KToBuffer(backend, matrix, input_buffer, output_buffer, row_count, row_len);
+                } else if (lookup.getRawByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ4KToBuffer(backend, matrix, input_buffer, output_buffer, row_count, row_len);
+                } else return error.InvalidTensorMetadata;
+            },
+            .q6_k => {
+                if (lookup.getMoonQuantByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQuantQ6KToBuffer(backend, matrix, input_buffer, output_buffer, row_count, row_len);
+                } else if (lookup.getRawByOffset(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ6KToBuffer(backend, matrix, input_buffer, output_buffer, row_count, row_len);
+                } else return error.InvalidTensorMetadata;
+            },
+            .q8_0 => {
+                const matrix = lookup.getRawByOffset(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0ToBuffer(backend, matrix, input_buffer, output_buffer, row_count, row_len);
+            },
+        }
+
+        try metal_backend.readBufferF32(output_buffer, out);
     }
 
     fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
