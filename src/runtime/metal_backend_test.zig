@@ -153,6 +153,87 @@ test "metal q4k fused add matches cpu dequantized reference for dominant llama s
     }
 }
 
+test "metal q4k dual matvec matches cpu dequantized references for dominant llama shape" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q4_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q4k-dual.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q4k-dual.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const rows = model.feed_forward_length;
+    const cols = model.embedding_length;
+    const gate_tensor = model.layers[0].ffn_gate;
+    const up_tensor = model.layers[0].ffn_up;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    const gate_matrix = try llama_cpu.tensorBytes(&model, gate_tensor);
+    const up_matrix = try llama_cpu.tensorBytes(&model, up_tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 31)) - 15)) * 0.03125) + 0.02;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const gate_output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(gate_output_buffer);
+    const up_output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(up_output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.runMatVecQ4KDualToBuffers(
+        backend,
+        gate_matrix,
+        up_matrix,
+        input_buffer,
+        gate_output_buffer,
+        up_output_buffer,
+        rows,
+        cols,
+    );
+
+    const gate_actual = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(gate_actual);
+    const up_actual = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(up_actual);
+    try metal_backend.readBufferF32(gate_output_buffer, gate_actual);
+    try metal_backend.readBufferF32(up_output_buffer, up_actual);
+
+    const gate_expected = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(gate_expected);
+    const up_expected = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(up_expected);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+
+    for (0..rows) |row| {
+        const gate_row_bytes = gate_matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, gate_row_bytes, cols);
+        gate_expected[row] = dot(dequantized_row, input);
+
+        const up_row_bytes = up_matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, up_row_bytes, cols);
+        up_expected[row] = dot(dequantized_row, input);
+
+        try std.testing.expectApproxEqAbs(gate_expected[row], gate_actual[row], 0.05);
+        try std.testing.expectApproxEqAbs(up_expected[row], up_actual[row], 0.05);
+    }
+}
+
 test "metal MoonQuant q4k matvec matches cpu dequantized reference" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -445,6 +526,92 @@ test "metal q6k fused add matches cpu dequantized reference for dominant llama s
     }
 }
 
+test "metal MoonQuant q6k matvec matches cpu dequantized reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const rows = 3;
+    const cols = 512;
+    var raw_matrix: [rows * (cols / 256) * 210]u8 = undefined;
+    fillQ6KMatrix(&raw_matrix, rows, cols);
+    var packed_matrix = try moon_quant.packQ6KTensor(std.testing.allocator, &raw_matrix, rows, cols);
+    defer packed_matrix.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.125) + 0.1;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.runMatVecMoonQuantQ6KToBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, rows, cols);
+
+    var actual: [rows]f32 = undefined;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected: [rows]f32 = undefined;
+    var dequantized_row: [cols]f32 = undefined;
+    const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
+    for (0..rows) |row| {
+        const row_bytes = raw_matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(&dequantized_row, .q6_k, row_bytes, cols);
+        expected[row] = dot(&dequantized_row, &input);
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.01);
+    }
+}
+
+test "metal MoonQuant q6k fused add matches cpu reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const rows = 3;
+    const cols = 512;
+    var raw_matrix: [rows * (cols / 256) * 210]u8 = undefined;
+    fillQ6KMatrix(&raw_matrix, rows, cols);
+    var packed_matrix = try moon_quant.packQ6KTensor(std.testing.allocator, &raw_matrix, rows, cols);
+    defer packed_matrix.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    var base: [rows]f32 = .{ 0.5, -1.25, 2.0 };
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) * 0.125) + 0.1;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.runMatVecMoonQuantQ6KAddToBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, rows, cols);
+
+    var actual: [rows]f32 = undefined;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected: [rows]f32 = base;
+    var dequantized_row: [cols]f32 = undefined;
+    const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
+    for (0..rows) |row| {
+        const row_bytes = raw_matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(&dequantized_row, .q6_k, row_bytes, cols);
+        expected[row] += dot(&dequantized_row, &input);
+        try std.testing.expectApproxEqAbs(expected[row], actual[row], 0.01);
+    }
+}
+
 test "metal q6k fused argmax matches cpu dequantized reference for output projection" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -464,7 +631,7 @@ test "metal q6k fused argmax matches cpu dequantized reference for output projec
 
     const tensor = model.output;
     const rows = try tensor.rowCount();
-    const cols = model.embedding_length;
+    const cols = 512;
     const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
     const matrix = try llama_cpu.tensorBytes(&model, tensor);
 
@@ -493,16 +660,77 @@ test "metal q6k fused argmax matches cpu dequantized reference for output projec
 
     const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
     defer metal_backend.destroyBuffer(input_buffer);
-    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 2 * @sizeOf(u32));
+    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(u32));
     defer metal_backend.destroyBuffer(packed_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, input);
-    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, std.math.maxInt(u32) });
+    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, 0, std.math.maxInt(u32) });
     try metal_backend.runMatVecQ6KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
 
-    var argmax_state: [2]u32 = .{ 0, 0 };
+    var argmax_state: [3]u32 = .{ 0, 0, 0 };
     try metal_backend.readBufferU32(packed_buffer, &argmax_state);
-    const actual_token = argmax_state[1];
+    const actual_token = argmax_state[2];
+    try std.testing.expectEqual(expected_best_token, actual_token);
+}
+
+test "metal q4k fused argmax matches cpu dequantized reference for output projection" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q4_k);
+    defer std.testing.allocator.free(fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "q4k-argmax.gguf", fixture);
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "q4k-argmax.gguf");
+    defer std.testing.allocator.free(path);
+
+    var model = try llama_cpu.loadModel(std.testing.allocator, path);
+    defer model.deinit(std.testing.allocator);
+
+    const tensor = model.output;
+    const rows = try tensor.rowCount();
+    const cols = 512;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    const matrix = try llama_cpu.tensorBytes(&model, tensor);
+
+    const input = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 41)) - 20)) * 0.015625) + 0.02;
+    }
+
+    var expected_best_token: u32 = 0;
+    var expected_best_logit = -std.math.inf(f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        const row_bytes = matrix[row * row_size ..][0..row_size];
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, row_bytes, cols);
+        const logit = dot(dequantized_row, input);
+        if (logit > expected_best_logit) {
+            expected_best_logit = logit;
+            expected_best_token = @intCast(row);
+        }
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const packed_buffer = try metal_backend.createByteScratchBuffer(backend, 3 * @sizeOf(u32));
+    defer metal_backend.destroyBuffer(packed_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, input);
+    try metal_backend.writeBufferU32(packed_buffer, &.{ 0, 0, std.math.maxInt(u32) });
+    try metal_backend.runMatVecQ4KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
+
+    var argmax_state: [3]u32 = .{ 0, 0, 0 };
+    try metal_backend.readBufferU32(packed_buffer, &argmax_state);
+    const actual_token = argmax_state[2];
     try std.testing.expectEqual(expected_best_token, actual_token);
 }
 
@@ -813,6 +1041,629 @@ test "metal rope-to-dst writes rotated kv slice directly" {
     }
 }
 
+test "metal rope-to-half-dst writes rotated kv slice directly" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 6;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+
+    var src: [head_count * head_dim]f32 = undefined;
+    for (&src, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index)) - 7)) * 0.125) + 0.05;
+    }
+
+    var expected_f32 = [_]f32{-9.0} ** (dst_prefix + src.len + 3);
+    applyRoPEReference(expected_f32[dst_prefix .. dst_prefix + src.len], &src, head_count, head_dim, rope_dim, position, freq_base, 0);
+    var expected = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + src.len + 3);
+    for (expected_f32, 0..) |value, index| expected[index] = @floatCast(value);
+    var actual = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + src.len + 3);
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const src_buffer = try metal_backend.createScratchBuffer(backend, src.len);
+    defer metal_backend.destroyBuffer(src_buffer);
+    const dst_buffer = try metal_backend.createByteScratchBuffer(backend, actual.len * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(dst_buffer);
+
+    try metal_backend.writeBufferF32(src_buffer, &src);
+    try metal_backend.writeBufferF16(dst_buffer, &actual);
+    try metal_backend.applyRoPEToHalfDst(
+        backend,
+        src_buffer,
+        dst_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(dst_buffer, &actual);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.001);
+    }
+}
+
+test "metal q4k k-half matches separate matvec rope reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&matrix, rows, cols);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const k_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(k_cache_buffer);
+
+    var actual = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF16(k_cache_buffer, &actual);
+
+    try metal_backend.runMatVecQ4KKHalf(
+        backend,
+        &matrix,
+        input_buffer,
+        k_cache_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(k_cache_buffer, &actual);
+
+    const expected_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, matrix[row * row_size ..][0..row_size], cols);
+        expected_f32[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected_f32, expected_f32, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    var expected = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    for (0..rows) |index| expected[dst_prefix + index] = @floatCast(expected_f32[index]);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+}
+
+test "metal q4k q-rope matches separate matvec rope reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&matrix, rows, cols);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.runMatVecQ4KQRope(
+        backend,
+        &matrix,
+        input_buffer,
+        output_buffer,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+
+    var actual = [_]f32{0} ** rows;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    var expected = [_]f32{0} ** rows;
+    var dequantized_row: [cols]f32 = undefined;
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(&dequantized_row, .q4_k, matrix[row * row_size ..][0..row_size], cols);
+        expected[row] = dot(&dequantized_row, &input);
+    }
+    applyRoPEReference(&expected, &expected, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.03);
+    }
+}
+
+test "metal MoonQuant q4k k-half matches separate matvec rope reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var raw_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&raw_matrix, rows, cols);
+    var packed_matrix = try moon_quant.packQ4KTensor(std.testing.allocator, &raw_matrix, rows, cols);
+    defer packed_matrix.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const k_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(k_cache_buffer);
+
+    var actual = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF16(k_cache_buffer, &actual);
+
+    try metal_backend.runMatVecMoonQuantQ4KKHalf(
+        backend,
+        packed_matrix.bytes,
+        input_buffer,
+        k_cache_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(k_cache_buffer, &actual);
+
+    const expected_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, raw_matrix[row * row_size ..][0..row_size], cols);
+        expected_f32[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected_f32, expected_f32, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    var expected = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    for (0..rows) |index| expected[dst_prefix + index] = @floatCast(expected_f32[index]);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+}
+
+test "metal MoonQuant q4k q-rope matches separate matvec rope reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var raw_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&raw_matrix, rows, cols);
+    var packed_matrix = try moon_quant.packQ4KTensor(std.testing.allocator, &raw_matrix, rows, cols);
+    defer packed_matrix.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const output_buffer = try metal_backend.createScratchBuffer(backend, rows);
+    defer metal_backend.destroyBuffer(output_buffer);
+
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.runMatVecMoonQuantQ4KQRope(
+        backend,
+        packed_matrix.bytes,
+        input_buffer,
+        output_buffer,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+
+    var actual = [_]f32{0} ** rows;
+    try metal_backend.readBufferF32(output_buffer, &actual);
+
+    const expected = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, raw_matrix[row * row_size ..][0..row_size], cols);
+        expected[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected, expected, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 0.03);
+    }
+}
+
+test "metal q4k dual kv-half matches separate matvec rope and store reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var k_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    var v_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&k_matrix, rows, cols);
+    fillQ4KMatrix(&v_matrix, rows, cols);
+    for (&v_matrix, 0..) |*byte, index| {
+        byte.* ^=
+            @as(u8, @intCast((index * 7 + 11) & 0x0F)) |
+            (@as(u8, @intCast((index * 5 + 3) & 0x0F)) << 4);
+    }
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const k_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(k_cache_buffer);
+    const v_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(v_cache_buffer);
+
+    var actual_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var actual_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.writeBufferF16(v_cache_buffer, &actual_v);
+
+    try metal_backend.runMatVecQ4KDualKvHalf(
+        backend,
+        &k_matrix,
+        &v_matrix,
+        input_buffer,
+        k_cache_buffer,
+        v_cache_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.readBufferF16(v_cache_buffer, &actual_v);
+
+    const expected_k_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_k_f32);
+    const expected_v_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_v_f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, k_matrix[row * row_size ..][0..row_size], cols);
+        expected_k_f32[row] = dot(dequantized_row, &input);
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, v_matrix[row * row_size ..][0..row_size], cols);
+        expected_v_f32[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected_k_f32, expected_k_f32, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    var expected_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var expected_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    for (0..rows) |index| {
+        expected_k[dst_prefix + index] = @floatCast(expected_k_f32[index]);
+        expected_v[dst_prefix + index] = @floatCast(expected_v_f32[index]);
+    }
+
+    for (expected_k, actual_k) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+    for (expected_v, actual_v) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+}
+
+test "metal MoonQuant q4k dual kv-half matches separate matvec rope and store reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+    const row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+
+    var raw_k_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    var raw_v_matrix: [rows * (cols / 256) * 144]u8 = undefined;
+    fillQ4KMatrix(&raw_k_matrix, rows, cols);
+    fillQ4KMatrix(&raw_v_matrix, rows, cols);
+    for (&raw_v_matrix, 0..) |*byte, index| {
+        byte.* ^=
+            @as(u8, @intCast((index * 7 + 11) & 0x0F)) |
+            (@as(u8, @intCast((index * 5 + 3) & 0x0F)) << 4);
+    }
+
+    var packed_k = try moon_quant.packQ4KTensor(std.testing.allocator, &raw_k_matrix, rows, cols);
+    defer packed_k.deinit(std.testing.allocator);
+    var packed_v = try moon_quant.packQ4KTensor(std.testing.allocator, &raw_v_matrix, rows, cols);
+    defer packed_v.deinit(std.testing.allocator);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const k_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(k_cache_buffer);
+    const v_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(v_cache_buffer);
+
+    var actual_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var actual_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.writeBufferF16(v_cache_buffer, &actual_v);
+
+    try metal_backend.runMatVecMoonQuantQ4KDualKvHalf(
+        backend,
+        packed_k.bytes,
+        packed_v.bytes,
+        input_buffer,
+        k_cache_buffer,
+        v_cache_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.readBufferF16(v_cache_buffer, &actual_v);
+
+    const expected_k_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_k_f32);
+    const expected_v_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_v_f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, raw_k_matrix[row * row_size ..][0..row_size], cols);
+        expected_k_f32[row] = dot(dequantized_row, &input);
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, raw_v_matrix[row * row_size ..][0..row_size], cols);
+        expected_v_f32[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected_k_f32, expected_k_f32, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    var expected_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var expected_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    for (0..rows) |index| {
+        expected_k[dst_prefix + index] = @floatCast(expected_k_f32[index]);
+        expected_v[dst_prefix + index] = @floatCast(expected_v_f32[index]);
+    }
+
+    for (expected_k, actual_k) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+    for (expected_v, actual_v) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+}
+
+test "metal q4k/q6k dual kv-half matches separate matvec rope and store reference" {
+    if (!metal_backend.buildEnabled()) return error.SkipZigTest;
+    const supported = try metal_backend.canInitialize(std.testing.allocator);
+    if (!supported) return error.SkipZigTest;
+
+    const head_count = 2;
+    const head_dim = 8;
+    const rope_dim = 8;
+    const rows = head_count * head_dim;
+    const cols = 512;
+    const position = 3;
+    const freq_base: f32 = 10000;
+    const dst_prefix = 5;
+
+    const q4_fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q4_k);
+    defer std.testing.allocator.free(q4_fixture);
+    const q6_fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, .q6_k);
+    defer std.testing.allocator.free(q6_fixture);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try llama_fixture.writeFixtureFile(tmp.dir, "mixed-k-q4.gguf", q4_fixture);
+    try llama_fixture.writeFixtureFile(tmp.dir, "mixed-v-q6.gguf", q6_fixture);
+    const q4_path = try tmp.dir.realpathAlloc(std.testing.allocator, "mixed-k-q4.gguf");
+    defer std.testing.allocator.free(q4_path);
+    const q6_path = try tmp.dir.realpathAlloc(std.testing.allocator, "mixed-v-q6.gguf");
+    defer std.testing.allocator.free(q6_path);
+
+    var q4_model = try llama_cpu.loadModel(std.testing.allocator, q4_path);
+    defer q4_model.deinit(std.testing.allocator);
+    var q6_model = try llama_cpu.loadModel(std.testing.allocator, q6_path);
+    defer q6_model.deinit(std.testing.allocator);
+
+    const k_tensor = q4_model.layers[0].attn_k;
+    const v_tensor = q6_model.layers[0].attn_v;
+    const k_row_size = try llama_cpu.tensorRowByteSize(.q4_k, cols);
+    const v_row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
+    const k_matrix = try llama_cpu.tensorBytes(&q4_model, k_tensor);
+    const v_matrix = try llama_cpu.tensorBytes(&q6_model, v_tensor);
+
+    var input: [cols]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) * 0.09375) - 0.15;
+    }
+
+    const backend = try metal_backend.create(std.testing.allocator);
+    defer backend.deinit(std.testing.allocator);
+
+    const input_buffer = try metal_backend.createScratchBuffer(backend, cols);
+    defer metal_backend.destroyBuffer(input_buffer);
+    const k_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(k_cache_buffer);
+    const v_cache_buffer = try metal_backend.createByteScratchBuffer(backend, (dst_prefix + rows + 3) * @sizeOf(f16));
+    defer metal_backend.destroyBuffer(v_cache_buffer);
+
+    var actual_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var actual_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.writeBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.writeBufferF16(v_cache_buffer, &actual_v);
+
+    try metal_backend.runMatVecQ4KQ6KDualKvHalf(
+        backend,
+        k_matrix[0 .. rows * k_row_size],
+        v_matrix[0 .. rows * v_row_size],
+        input_buffer,
+        k_cache_buffer,
+        v_cache_buffer,
+        dst_prefix,
+        head_count,
+        head_dim,
+        rope_dim,
+        cols,
+        position,
+        freq_base,
+        0,
+    );
+    try metal_backend.readBufferF16(k_cache_buffer, &actual_k);
+    try metal_backend.readBufferF16(v_cache_buffer, &actual_v);
+
+    const expected_k_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_k_f32);
+    const expected_v_f32 = try std.testing.allocator.alloc(f32, rows);
+    defer std.testing.allocator.free(expected_v_f32);
+    const dequantized_row = try std.testing.allocator.alloc(f32, cols);
+    defer std.testing.allocator.free(dequantized_row);
+
+    for (0..rows) |row| {
+        try llama_cpu.dequantizeRow(dequantized_row, .q4_k, k_matrix[row * k_row_size ..][0..k_row_size], cols);
+        expected_k_f32[row] = dot(dequantized_row, &input);
+        try llama_cpu.dequantizeRow(dequantized_row, .q6_k, v_matrix[row * v_row_size ..][0..v_row_size], cols);
+        expected_v_f32[row] = dot(dequantized_row, &input);
+    }
+    applyRoPEReference(expected_k_f32, expected_k_f32, head_count, head_dim, rope_dim, position, freq_base, 0);
+
+    var expected_k = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    var expected_v = [_]f16{@as(f16, @floatCast(-9.0))} ** (dst_prefix + rows + 3);
+    for (0..rows) |index| {
+        expected_k[dst_prefix + index] = @floatCast(expected_k_f32[index]);
+        expected_v[dst_prefix + index] = @floatCast(expected_v_f32[index]);
+    }
+
+    for (expected_k, actual_k) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.03);
+    }
+    for (expected_v, actual_v) |want, got| {
+        try std.testing.expectApproxEqAbs(@as(f32, want), @as(f32, got), 0.05);
+    }
+}
+
 test "metal rope at offset rotates kv slice in place" {
     if (!metal_backend.buildEnabled()) return error.SkipZigTest;
     const supported = try metal_backend.canInitialize(std.testing.allocator);
@@ -903,6 +1754,50 @@ fn fillQ4KMatrix(buffer: []u8, rows: usize, cols: usize) void {
                 buffer[base + 16 + index] = low | (high << 4);
             }
         }
+    }
+}
+
+fn fillQ6KMatrix(buffer: []u8, rows: usize, cols: usize) void {
+    const row_size = cols / 256 * 210;
+    for (0..rows) |row| {
+        for (0..cols / 256) |block| {
+            const base = row * row_size + block * 210;
+            @memset(buffer[base .. base + 210], 0);
+            @memset(buffer[base + 128 .. base + 192], 0xAA);
+            @memset(buffer[base + 192 .. base + 208], 1);
+            writeHalf(buffer[base + 208 ..][0..2], 1);
+            for (0..256) |index| {
+                const nibble: u8 = @intCast((row + block + index) & 1);
+                setQ6KNibble(buffer[base .. base + 210], index, nibble);
+            }
+        }
+    }
+}
+
+fn setQ6KNibble(block: []u8, index: usize, nibble: u8) void {
+    if (index < 32) {
+        block[index] = (block[index] & 0xF0) | nibble;
+    } else if (index < 64) {
+        const offset = 32 + (index - 32);
+        block[offset] = (block[offset] & 0xF0) | nibble;
+    } else if (index < 96) {
+        const offset = index - 64;
+        block[offset] = (block[offset] & 0x0F) | (nibble << 4);
+    } else if (index < 128) {
+        const offset = 32 + (index - 96);
+        block[offset] = (block[offset] & 0x0F) | (nibble << 4);
+    } else if (index < 160) {
+        const offset = 64 + (index - 128);
+        block[offset] = (block[offset] & 0xF0) | nibble;
+    } else if (index < 192) {
+        const offset = 96 + (index - 160);
+        block[offset] = (block[offset] & 0xF0) | nibble;
+    } else if (index < 224) {
+        const offset = 64 + (index - 192);
+        block[offset] = (block[offset] & 0x0F) | (nibble << 4);
+    } else {
+        const offset = 96 + (index - 224);
+        block[offset] = (block[offset] & 0x0F) | (nibble << 4);
     }
 }
 

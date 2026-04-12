@@ -1,35 +1,43 @@
-# ziggy-llm
+# ⚡️ ziggy-llm
 
 ![ziggy-llm logo](assets/ziggy-llm-logo.png)
 
-A Mac-first, Zig-native GGUF inference engine with first-class Apple Metal support.
+Welcome to **ziggy-llm** — a Mac-first, Zig-native GGUF inference engine built specifically for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
 
-`ziggy-llm` is a deliberately narrow local LLM inference engine:
+We don't try to do everything for everyone; instead, we do one thing exceptionally well. By focusing exclusively on Apple Metal and GGUF files, we deliver a single-binary, highly optimized CLI experience 💎
 
 - Apple Silicon first
 - Metal first
 - GGUF only
-- single binary
+- Single binary
 - CLI first
-- tiny OpenAI-compatible server second
-
-The goal is to build a small, understandable, high-performance inference engine that feels native to Apple hardware and is easy to benchmark honestly.
+- Tiny OpenAI-compatible server (coming soon!)
 
 ziggy-llm is currently the fastest Zig GGUF inference engine on Apple Silicon.
 
-## Performance Comparison
+## Meet MoonQuant 🌕
 
-The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC, another Zig GGUF inference engine (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown.
+To squeeze every last drop of performance out of Apple hardware, we built **MoonQuant**, our proprietary quantization and layout engine. It takes standard weights and repacks them into a highly optimized, Metal-friendly memory layout designed for maximum memory bandwidth reduction during the decode phase. 🔋
+
+As a user, your workflow doesn't change: your input is always a standard `.gguf` model file. Under the hood, ziggy-llm automatically compiles your model into our custom `.ziggy` execution format on its first run, ensuring lightning-fast loading and blazing execution speeds on all subsequent runs. ✨
+
+## Blazing Fast Performance 🏎️
+
+We benchmark honestly and optimize ruthlessly for single-user, local text generation on Macs. The following table compares end-to-end decode throughput on Apple Silicon (MacBook Pro M3 18GB) across ziggy-llm and llama.cpp using identical prompts and generation parameters. ZINC, another Zig GGUF inference engine (tested on M1 Max 32 GB, according to their docs) is also included for reference, although the prompt used is unknown. 📊
 
 | Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
 | ------------------ | ------ | ----------------- | ------------ | ----------------- |
-| **TinyLlama 1.1B** | Q4_K_M | ~123 tok/s        | —            | 151.4 tok/s       |
+| **TinyLlama 1.1B** | Q4_K_M | ~133 tok/s        | —            | 151.4 tok/s       |
 | **Llama 3.2 3B**   | Q4_K_M | ~40 tok/s         | —            | 53.5 tok/s        |
 | **Llama 3.1 8B**   | Q4_K_M | ~18 tok/s         | ~10 tok/s    | 23.1 tok/s        |
 | **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
 | **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
 
 Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
+
+## Quick Start 🏁
+
+Getting up and running takes just a few seconds. Ensure you have Zig 0.15.2 or newer installed, clone the repository, and build the release binary. 🛠️
 
 ## Quick Start
 
@@ -60,7 +68,7 @@ Chat:
   --seed 42
 ```
 
-Run 1 prompt:
+Run a single prompt:
 
 ```bash
 ./zig-out/bin/ziggy-llm run \
@@ -99,29 +107,11 @@ Update:
 ./zig-out/bin/ziggy-llm update
 ```
 
-## Product Shape
+## Supported Models & Quants 🧠
 
-Planned first version:
+Our goal is to support a deliberately narrow, highly-optimized matrix of popular models. Currently, we focus on the Qwen (2 and 3) and LLaMA (3.1, 3.2, TinyLlama) architectures. 🎯
 
-- GGUF-only model loading
-- Metal backend for Apple Silicon
-- Apple Silicon CPU fallback for validation and correctness
-- single-binary CLI
-- optional tiny HTTP server
-- narrow supported model matrix
-- narrow supported quantization matrix
-- benchmark-friendly workflow
-
-## Current models and quantizations support
-
-Qwen (2 and 3) and LLama model families, in particular these have been tested:
-
-- Qwen 3
-- Llama 3.1
-- Llama 3.2
-- TinyLlama
-
-Quantization support: Q4_K_M, Q6_K, Q8_0, F16, F32.
+For quantizations, we recommend our specialized MoonQuant targets: `Q4_K_M`, `Q6_K`, and `Q8_0`. We also fully support `F16` and `F32` formats as reference paths. 📉
 
 ## CLI
 
@@ -152,7 +142,7 @@ Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve`
 - tokenizer model and pre-tokenizer metadata when present
 - tokenizer token count and common special-token ids when present
 
-## Planned HTTP API
+## Planned HTTP API 🔌
 
 The server should stay small.
 
@@ -164,7 +154,7 @@ Initial target endpoints:
 
 The API exists to make testing and integration easy. It should not drag the project into becoming a giant orchestration platform.
 
-## Architecture Direction
+## Architecture Direction 🏗️
 
 Core technical choices:
 
@@ -197,7 +187,9 @@ Initial implementation order:
 
 Please note ziggy-llm is still in active development, things may change, could break or be unstable.
 
-## Want to participate? Here is a TODO list of things that need immediate attention:
+## Join the Community 🤝
+
+ziggy-llm is open source and in active development, and we would love your help to make it even better. Check out our issue tracker for things that need immediate attention: 🏗️
 
 - [ ] Implement OpenAI compatible server
 - [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants), Gemma and Mistral model families
@@ -205,10 +197,8 @@ Please note ziggy-llm is still in active development, things may change, could b
 - [ ] Test all quants (currently tested only Q4_K_M)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
 
-## Support
+If you find this project interesting, please consider starring the repo ⭐️. It genuinely helps us grow and reach more developers in the local AI ecosystem!
 
-Found the repo interesting? Star it ⭐️, it will help us grow! 🌱
+## License 📜
 
-## License
-
-Apache-2.0
+This project is licensed under the Apache-2.0 License. Feel free to use it, modify it, and build awesome native local AI tools with it. ⚖️

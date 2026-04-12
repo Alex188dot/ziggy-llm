@@ -3,6 +3,7 @@ const gguf = @import("../gguf.zig");
 const ziggy_format = @import("../ziggy_format.zig");
 const bench_runner = @import("bench_runner.zig");
 const llama_runtime = @import("llama_runtime.zig");
+const metal_profile = @import("metal_profile.zig");
 const types = @import("types.zig");
 
 pub const primary_target = types.primary_target;
@@ -122,17 +123,21 @@ pub fn benchCommand(
     options: GenerationOptions,
     bench_runs: usize,
 ) !void {
-    if (options.experimental_gated_ffn and bench_runs > 1) {
-        var baseline_options = options;
+    const requested_profile = options.metal_profile;
+    var effective_options = options;
+    if (effective_options.backend != .cpu) effective_options.metal_profile = true;
+
+    if (effective_options.experimental_gated_ffn and bench_runs > 1) {
+        var baseline_options = effective_options;
         baseline_options.experimental_gated_ffn = false;
         var baseline = try bench_runner.runWarmBench(allocator, model_path, prompt, baseline_options, bench_runs);
         defer baseline.deinit(allocator);
 
-        var gated = try bench_runner.runWarmBench(allocator, model_path, prompt, options, bench_runs);
+        var gated = try bench_runner.runWarmBench(allocator, model_path, prompt, effective_options, bench_runs);
         defer gated.deinit(allocator);
 
         const baseline_ppl = try llama_runtime.promptPerplexity(allocator, model_path, prompt, baseline_options);
-        const gated_ppl = try llama_runtime.promptPerplexity(allocator, model_path, prompt, options);
+        const gated_ppl = try llama_runtime.promptPerplexity(allocator, model_path, prompt, effective_options);
         const throughput_change_pct = percentDelta(baseline.warmDecodeTokensPerSecond(), gated.warmDecodeTokensPerSecond());
         const perplexity_delta_pct = percentDelta(baseline_ppl, gated_ppl);
         const baseline_skip_pct = parseMetricF64(baseline.warm_metal_profile_summary, "gated_ffn.profile.estimated_weight_skip_pct=");
@@ -172,7 +177,7 @@ pub fn benchCommand(
     }
 
     if (bench_runs > 1) {
-        var summary = try bench_runner.runWarmBench(allocator, model_path, prompt, options, bench_runs);
+        var summary = try bench_runner.runWarmBench(allocator, model_path, prompt, effective_options, bench_runs);
         defer summary.deinit(allocator);
 
         try writer.print(
@@ -255,13 +260,38 @@ pub fn benchCommand(
                 summary.warmDecodeTokensPerSecond(),
             },
         );
-        if (summary.cold.metal_profile_summary) |summary_text| {
-            try writer.print("cold.metal_profile:\n{s}", .{summary_text});
+        if (try metal_profile.renderBenchStageSummary(
+            allocator,
+            "cold",
+            metal_profile.parseSummary(summary.cold.metal_profile_summary),
+            summary.cold.generated_token_count,
+        )) |stage_summary| {
+            defer allocator.free(stage_summary);
+            try writer.print("{s}", .{stage_summary});
+        }
+        if (try metal_profile.renderBenchStageSummary(
+            allocator,
+            "warm",
+            summary.warm_metal_profile_stats,
+            summary.warm_generated_token_count_avg,
+        )) |stage_summary| {
+            defer allocator.free(stage_summary);
+            try writer.print("{s}", .{stage_summary});
+        }
+        try printBenchAuxProfiles(writer, summary.cold.metal_profile_summary, "cold");
+        try printBenchAuxProfiles(writer, summary.warm_metal_profile_summary, "warm");
+        if (requested_profile) {
+            if (summary.cold.metal_profile_summary) |summary_text| {
+                try writer.print("cold.metal_profile:\n{s}", .{summary_text});
+            }
+            if (summary.warm_metal_profile_summary) |summary_text| {
+                try writer.print("warm.metal_profile.sample:\n{s}", .{summary_text});
+            }
         }
         return;
     }
 
-    var report = try generate(allocator, model_path, prompt, options);
+    var report = try generate(allocator, model_path, prompt, effective_options);
     defer report.deinit(allocator);
 
     try writer.print(
@@ -314,8 +344,34 @@ pub fn benchCommand(
             report.decodeTokensPerSecond(),
         },
     );
-    if (report.metal_profile_summary) |summary| {
-        try writer.print("{s}", .{summary});
+    if (try metal_profile.renderBenchStageSummary(
+        allocator,
+        "bench",
+        metal_profile.parseSummary(report.metal_profile_summary),
+        report.generated_token_count,
+    )) |stage_summary| {
+        defer allocator.free(stage_summary);
+        try writer.print("{s}", .{stage_summary});
+    }
+    try printBenchAuxProfiles(writer, report.metal_profile_summary, "bench");
+    if (requested_profile) {
+        if (report.metal_profile_summary) |summary| {
+            try writer.print("{s}", .{summary});
+        }
+    }
+}
+
+fn printBenchAuxProfiles(writer: *std.Io.Writer, summary: ?[]const u8, stage: []const u8) !void {
+    const text = summary orelse return;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "fused_q_rope.profile.") or
+            std.mem.startsWith(u8, line, "fused_kv_half.profile.") or
+            std.mem.startsWith(u8, line, "fused_k.profile."))
+        {
+            try writer.print("{s}.{s}\n", .{ stage, line });
+        }
     }
 }
 

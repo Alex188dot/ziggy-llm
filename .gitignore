@@ -4,3 +4,4 @@ zig-out/
 .DS_Store
 models
 IDEAS.md
+autotuner

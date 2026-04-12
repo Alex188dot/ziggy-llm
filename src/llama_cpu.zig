@@ -773,9 +773,7 @@ const Session = struct {
     ) !void {
         if (prompt_tokens.len == 0) return error.EmptyPrompt;
         if (prompt_tokens.len > 1) {
-            for (prompt_tokens[0 .. prompt_tokens.len - 1]) |token_id| {
-                try self.stepNoOutput(token_id);
-            }
+            try self.runPromptPrefixNoOutput(prompt_tokens[0 .. prompt_tokens.len - 1]);
         }
 
         const last_token = prompt_tokens[prompt_tokens.len - 1];
@@ -784,6 +782,41 @@ const Session = struct {
             .gpu_topk_sampler => unreachable,
             .gpu_shortlist_cpu_sampler => _ = try self.stepShortlist(last_token, shortlist_len),
             .cpu_logits => _ = try self.step(last_token),
+        }
+    }
+
+    fn runPromptPrefixNoOutput(self: *Session, prompt_tokens: []const u32) !void {
+        if (prompt_tokens.len == 0) return;
+        if (self.gpu_session == null or prompt_tokens.len == 1) {
+            for (prompt_tokens) |token_id| try self.stepNoOutput(token_id);
+            return;
+        }
+
+        const gpu_session = &self.gpu_session.?;
+        var layers: [64]llama_gpu.LayerDesc = undefined;
+        for (self.model.layers, 0..) |layer, i| {
+            layers[i] = adaptLayerDesc(layer);
+        }
+
+        var consumed: usize = 0;
+        while (consumed < prompt_tokens.len) {
+            const batch_count = @min(llama_gpu.max_prompt_prefill_batch_len, prompt_tokens.len - consumed);
+            for (0..batch_count) |i| {
+                const token_id = prompt_tokens[consumed + i];
+                try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
+                try gpu_session.stagePromptPrefillEmbedding(i, self.hidden);
+            }
+            try gpu_session.runPromptPrefillChunk(
+                layers[0..self.model.layers.len],
+                batch_count,
+                self.position,
+            );
+            for (prompt_tokens[consumed .. consumed + batch_count]) |token_id| {
+                self.pending_greedy_token = null;
+                self.pending_shortlist_len = 0;
+                self.finishToken(token_id);
+            }
+            consumed += batch_count;
         }
     }
 
@@ -953,7 +986,10 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             if (self.gpu_session) |*gpu_session| {
-                if (layer_index == 0) try gpu_session.beginToken(self.hidden);
+                if (layer_index == 0) {
+                    const token_norm_scale = rmsNormScaleValue(self.hidden, self.model.rms_norm_eps);
+                    try gpu_session.beginTokenWithNormScale(self.hidden, token_norm_scale);
+                }
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
@@ -1202,7 +1238,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDes
         .head_dimension = model.head_dimension,
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
-        .vocab_size = model.tokenizer.tokens.len,
+        .vocab_size = model.token_embd.rowCount() catch model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
         .rope_style = @intFromEnum(model.rope_style),
@@ -1433,9 +1469,7 @@ pub fn generateLoadedStreaming(
         .gpu_topk_sampler => {
             if (prompt_token_count == 0) return error.EmptyPrompt;
             if (prompt_token_count > 1) {
-                for (session.token_buffer[0 .. prompt_token_count - 1]) |token_id| {
-                    try session.stepNoOutput(token_id);
-                }
+                try session.runPromptPrefixNoOutput(session.token_buffer[0 .. prompt_token_count - 1]);
             }
             _ = try session.stepGpuTopK(session.token_buffer[prompt_token_count - 1], gpu_top_k, options.temperature, random.float(f32));
         },
@@ -1456,7 +1490,7 @@ pub fn generateLoadedStreaming(
     const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
-    const max_draft_len = 3;
+    const max_draft_len = llama_gpu.max_draft_len - 1;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;
 
     const decode_begin = std.time.nanoTimestamp();
@@ -1536,34 +1570,6 @@ pub fn generateLoadedStreaming(
                     }
                 }
                 greedy_next_token = accepted_tokens[i];
-            } else if (draft_tokens.len > 0) {
-                const accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
-                var i: usize = 0;
-                while (i < accepted_count - 1) : (i += 1) {
-                    const t = accepted_tokens[i];
-                    if (model.tokenizer.eos_token_id != null and t == model.tokenizer.eos_token_id.?) {
-                        greedy_next_token = t;
-                        break;
-                    }
-                    if (generated_token_count + 1 >= options.max_tokens) {
-                        greedy_next_token = t;
-                        break;
-                    }
-                    generated_token_count += 1;
-                    const inner_chunk_start = output.items.len;
-                    try model.tokenizer.appendDecodedToken(&output, allocator, t);
-                    if (stream_callback) |inner_cb| {
-                        const chunk = output.items[inner_chunk_start..];
-                        if (chunk.len > 0) inner_cb(stream_ctx, chunk) catch |err| switch (err) {
-                            error.StopStreaming => {
-                                greedy_next_token = model.tokenizer.eos_token_id orelse 0;
-                                break;
-                            },
-                            else => return err,
-                        };
-                    }
-                }
-                greedy_next_token = accepted_tokens[i];
             } else {
                 greedy_next_token = try session.stepGreedy(next_token);
             }
@@ -1583,9 +1589,25 @@ pub fn generateLoadedStreaming(
     const decode_end = std.time.nanoTimestamp();
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
-    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const fused_q_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQSummary(allocator) else null;
+    const fused_qk_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQkSummary(allocator) else null;
+    const fused_kv_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKvSummary(allocator) else null;
+    const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
+    const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const base_plus_fused_q = try combineOptionalSummaries(allocator, base_plus_gated, fused_q_summary);
+    const base_plus_fused_qk = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_qk_summary);
+    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_qk, fused_kv_summary);
+    const profile_summary = try combineOptionalSummaries(allocator, base_plus_fused_kv, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
+    if (fused_q_summary) |summary| allocator.free(summary);
+    if (fused_qk_summary) |summary| allocator.free(summary);
+    if (fused_kv_summary) |summary| allocator.free(summary);
+    if (fused_k_summary) |summary| allocator.free(summary);
+    if (base_plus_gated) |summary| allocator.free(summary);
+    if (base_plus_fused_q) |summary| allocator.free(summary);
+    if (base_plus_fused_qk) |summary| allocator.free(summary);
+    if (base_plus_fused_kv) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -1659,9 +1681,7 @@ pub fn generateLoadedStreamingCached(
         if (sampling_path == .gpu_topk_sampler) {
             const remaining = prompt_tokens[session.position..prompt_token_count];
             if (remaining.len > 1) {
-                for (remaining[0 .. remaining.len - 1]) |token_id| {
-                    try session.stepNoOutput(token_id);
-                }
+                try session.runPromptPrefixNoOutput(remaining[0 .. remaining.len - 1]);
             }
             _ = try session.stepGpuTopK(remaining[remaining.len - 1], gpu_top_k, options.temperature, random.float(f32));
         } else {
@@ -1688,7 +1708,7 @@ pub fn generateLoadedStreamingCached(
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
     const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
-    const max_draft_len = 3;
+    const max_draft_len = llama_gpu.max_draft_len - 1;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;
 
     const decode_begin = std.time.nanoTimestamp();
@@ -1787,9 +1807,25 @@ pub fn generateLoadedStreamingCached(
     const decode_end = std.time.nanoTimestamp();
     const base_profile_summary = if (profiler.enabled) try profiler.renderSummary(allocator) else null;
     const gated_ffn_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderGatedFfnSummary(allocator) else null;
-    const profile_summary = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const fused_q_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQSummary(allocator) else null;
+    const fused_qk_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedQkSummary(allocator) else null;
+    const fused_kv_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKvSummary(allocator) else null;
+    const fused_k_summary = if (session.gpu_session) |*gpu_session| try gpu_session.renderFusedKSummary(allocator) else null;
+    const base_plus_gated = try combineOptionalSummaries(allocator, base_profile_summary, gated_ffn_summary);
+    const base_plus_fused_q = try combineOptionalSummaries(allocator, base_plus_gated, fused_q_summary);
+    const base_plus_fused_qk = try combineOptionalSummaries(allocator, base_plus_fused_q, fused_qk_summary);
+    const base_plus_fused_kv = try combineOptionalSummaries(allocator, base_plus_fused_qk, fused_kv_summary);
+    const profile_summary = try combineOptionalSummaries(allocator, base_plus_fused_kv, fused_k_summary);
     if (base_profile_summary) |summary| allocator.free(summary);
     if (gated_ffn_summary) |summary| allocator.free(summary);
+    if (fused_q_summary) |summary| allocator.free(summary);
+    if (fused_qk_summary) |summary| allocator.free(summary);
+    if (fused_kv_summary) |summary| allocator.free(summary);
+    if (fused_k_summary) |summary| allocator.free(summary);
+    if (base_plus_gated) |summary| allocator.free(summary);
+    if (base_plus_fused_q) |summary| allocator.free(summary);
+    if (base_plus_fused_qk) |summary| allocator.free(summary);
+    if (base_plus_fused_kv) |summary| allocator.free(summary);
 
     return .{
         .generated_text = try output.toOwnedSlice(allocator),
@@ -2619,14 +2655,18 @@ fn embeddingLookup(out: []f32, model: *const Model, tensor: TensorRef, token_id:
     try dequantizeRow(out, tensor.tensor_type, row, row_len);
 }
 
+fn rmsNormScaleValue(input: []const f32, eps: f32) f32 {
+    var mean_square = dot(input, input);
+    mean_square /= @as(f32, @floatFromInt(input.len));
+    return @as(f32, 1.0) / @sqrt(mean_square + eps);
+}
+
 fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRef) !void {
     const weights = try tensorBytes(model, tensor);
     if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
     if (try tensor.rowLen() != input.len) return error.InvalidTensorMetadata;
 
-    var mean_square = dot(input, input);
-    mean_square /= @as(f32, @floatFromInt(input.len));
-    const scale = @as(f32, 1.0) / @sqrt(mean_square + model.rms_norm_eps);
+    const scale = rmsNormScaleValue(input, model.rms_norm_eps);
 
     var i: usize = 0;
     while (i + simd_lane_count <= input.len) : (i += simd_lane_count) {
