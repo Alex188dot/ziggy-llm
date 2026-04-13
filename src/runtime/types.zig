@@ -4,8 +4,26 @@ const moon_quant = @import("../moon_quant.zig");
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "llama";
-pub const supported_architecture = "llama, qwen2 (native CPU + Metal)";
-pub const supported_model_family = "llama and qwen2 family GGUF models through the native CPU or Metal runtime";
+pub const supported_architecture = "llama, qwen, qwen2, qwen3";
+pub const supported_model_family = "llama-family and qwen-family GGUF models through family-specific native CPU or Metal runtimes";
+
+pub const ModelFamily = enum {
+    llama,
+    qwen,
+
+    pub fn label(self: ModelFamily) []const u8 {
+        return switch (self) {
+            .llama => "llama",
+            .qwen => "qwen",
+        };
+    }
+};
+
+pub fn modelFamilyFromArchitecture(architecture: []const u8) RuntimeError!ModelFamily {
+    if (std.mem.eql(u8, architecture, "llama")) return .llama;
+    if (std.mem.startsWith(u8, architecture, "qwen")) return .qwen;
+    return error.UnsupportedArchitecture;
+}
 pub const supported_quantization = moon_quant.supported_quantization;
 pub const default_context_length: usize = 8192;
 

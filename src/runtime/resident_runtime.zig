@@ -56,18 +56,49 @@ fn loadZiggyFile(
 }
 
 fn loadRuntimeModelForPath(allocator: std.mem.Allocator, model_path: []const u8) !llama_cpu.Model {
-    if (!std.mem.endsWith(u8, model_path, ".ziggy")) {
-        return try llama_cpu.loadModel(allocator, model_path);
+    const family = try detectModelFamilyForPath(allocator, model_path);
+
+    return switch (family) {
+        .llama => blk: {
+            if (!std.mem.endsWith(u8, model_path, ".ziggy")) {
+                break :blk try llama_cpu.loadModel(allocator, model_path);
+            }
+
+            const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
+            defer allocator.free(gguf_path);
+
+            if (std.fs.accessAbsolute(gguf_path, .{})) {
+                break :blk try llama_cpu.loadModel(allocator, gguf_path);
+            } else |_| {
+                break :blk try ziggy_format.loadExecutionModel(allocator, model_path);
+            }
+        },
+
+        .qwen => blk: {
+            if (!std.mem.endsWith(u8, model_path, ".ziggy")) {
+                break :blk try llama_cpu.loadModel(allocator, model_path);
+            }
+
+            const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
+            defer allocator.free(gguf_path);
+
+            if (std.fs.accessAbsolute(gguf_path, .{})) {
+                break :blk try llama_cpu.loadModel(allocator, gguf_path);
+            } else |_| {
+                break :blk try ziggy_format.loadExecutionModel(allocator, model_path);
+            }
+        },
+    };
+}
+
+fn detectModelFamilyForPath(allocator: std.mem.Allocator, model_path: []const u8) !types.ModelFamily {
+    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
+        const report = try ziggy_format.inspectFile(allocator, model_path);
+        return try types.modelFamilyFromArchitecture(report.architecture);
     }
 
-    const gguf_path = try ziggy_format.deriveSourceGgufPath(allocator, model_path);
-    defer allocator.free(gguf_path);
-
-    if (std.fs.accessAbsolute(gguf_path, .{})) {
-        return try llama_cpu.loadModel(allocator, gguf_path);
-    } else |_| {
-        return try ziggy_format.loadExecutionModel(allocator, model_path);
-    }
+    const report = try gguf.inspectFile(allocator, model_path);
+    return try types.modelFamilyFromArchitecture(report.architecture);
 }
 
 // GGUF-only initialization path
@@ -165,33 +196,63 @@ pub const ResidentRuntime = struct {
         const force_fresh_session = options.sampling_strategy == .gpu_topk_sample and
             types.canUseGpuTopKSampling(options);
 
-        var report = if (options.metal_profile or force_fresh_session)
-            try llama_cpu.generateLoadedStreaming(
-                self.allocator,
-                &loaded.model,
-                prompt,
-                options,
-                loaded.execution.backend,
-                lookup,
-                loaded.execution.gated_ffn_policies,
-                stream_ctx,
-                stream_callback,
-            )
-        else
-            llama_cpu.generateLoadedStreamingCached(
-                self.allocator,
-                &loaded.model,
-                prompt,
-                options,
-                loaded.execution.backend,
-                lookup,
-                &loaded.reusable_session,
-                stream_ctx,
-                stream_callback,
-            ) catch |err| {
-                loaded.reusable_session.reset();
-                return err;
-            };
+        var report = switch (loaded.family) {
+            .llama => if (options.metal_profile or force_fresh_session)
+                try llama_cpu.generateLoadedStreaming(
+                    self.allocator,
+                    &loaded.model,
+                    prompt,
+                    options,
+                    loaded.execution.backend,
+                    lookup,
+                    loaded.execution.gated_ffn_policies,
+                    stream_ctx,
+                    stream_callback,
+                )
+            else
+                llama_cpu.generateLoadedStreamingCached(
+                    self.allocator,
+                    &loaded.model,
+                    prompt,
+                    options,
+                    loaded.execution.backend,
+                    lookup,
+                    &loaded.reusable_session,
+                    stream_ctx,
+                    stream_callback,
+                ) catch |err| {
+                    loaded.reusable_session.reset();
+                    return err;
+                },
+
+            .qwen => if (options.metal_profile or force_fresh_session)
+                try llama_cpu.generateLoadedStreaming(
+                    self.allocator,
+                    &loaded.model,
+                    prompt,
+                    options,
+                    loaded.execution.backend,
+                    lookup,
+                    loaded.execution.gated_ffn_policies,
+                    stream_ctx,
+                    stream_callback,
+                )
+            else
+                llama_cpu.generateLoadedStreamingCached(
+                    self.allocator,
+                    &loaded.model,
+                    prompt,
+                    options,
+                    loaded.execution.backend,
+                    lookup,
+                    &loaded.reusable_session,
+                    stream_ctx,
+                    stream_callback,
+                ) catch |err| {
+                    loaded.reusable_session.reset();
+                    return err;
+                },
+        };
         report.startup_breakdown.model_load_ns = loaded.startup_breakdown.model_load_ns;
         report.startup_breakdown.tensor_prepare_ns = loaded.startup_breakdown.tensor_prepare_ns;
         report.startup_breakdown.backend_init_ns = loaded.startup_breakdown.backend_init_ns;
@@ -285,6 +346,7 @@ pub const ResidentRuntime = struct {
         }
 
         const actual_model_path = model_path;
+        const family = try detectModelFamilyForPath(self.allocator, actual_model_path);
 
         var compiled_model: ?ziggy_format.CompiledModel = null;
         errdefer if (compiled_model) |*compiled| compiled.deinit();
@@ -346,6 +408,7 @@ pub const ResidentRuntime = struct {
 
         self.loaded = .{
             .model_path = owned_model_path,
+            .family = family,
             .backend_pref = backend_pref,
             .context_length_limit = context_length_limit,
             .experimental_gated_ffn = experimental_gated_ffn,
@@ -384,6 +447,7 @@ pub const ResidentRuntime = struct {
 
 const LoadedModel = struct {
     model_path: []u8,
+    family: types.ModelFamily,
     backend_pref: types.BackendPreference,
     context_length_limit: usize,
     experimental_gated_ffn: bool,

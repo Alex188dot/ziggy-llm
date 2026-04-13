@@ -35,15 +35,28 @@ pub fn generate(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    if (std.mem.endsWith(u8, model_path, ".ziggy")) {
+    const family = if (std.mem.endsWith(u8, model_path, ".ziggy")) blk: {
         const report = try ziggy_format.inspectFile(arena.allocator(), model_path);
-        if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
-        return llama_runtime.generateZiggy(allocator, model_path, prompt, options);
-    } else {
+        break :blk try types.modelFamilyFromArchitecture(report.architecture);
+    } else blk: {
         const report = try gguf.inspectFile(arena.allocator(), model_path);
-        if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
-        return llama_runtime.generate(allocator, model_path, prompt, options);
-    }
+        break :blk try types.modelFamilyFromArchitecture(report.architecture);
+    };
+
+    return switch (family) {
+        .llama => if (std.mem.endsWith(u8, model_path, ".ziggy"))
+            llama_runtime.generateZiggy(allocator, model_path, prompt, options)
+        else
+            llama_runtime.generate(allocator, model_path, prompt, options),
+
+        .qwen => blk: {
+            const qwen_runtime = @import("qwen_runtime.zig");
+            break :blk if (std.mem.endsWith(u8, model_path, ".ziggy"))
+                qwen_runtime.generateZiggy(allocator, model_path, prompt, options)
+            else
+                qwen_runtime.generate(allocator, model_path, prompt, options);
+        },
+    };
 }
 
 pub fn runCommand(
