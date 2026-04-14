@@ -3,6 +3,7 @@ const gguf = @import("../gguf.zig");
 const bench_runner = @import("bench_runner.zig");
 const llama_runtime = @import("llama_runtime.zig");
 const types = @import("types.zig");
+const families = @import("families/mod.zig");
 
 pub const primary_target = types.primary_target;
 pub const fallback_target = types.fallback_target;
@@ -33,9 +34,16 @@ pub fn generate(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const report = try gguf.inspectFile(arena.allocator(), model_path);
-    if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
-    return llama_runtime.generate(allocator, model_path, prompt, options);
+    const gguf_report = try gguf.inspectFile(arena.allocator(), model_path);
+    const family = families.detectModelFamily(gguf_report.architecture);
+
+    return switch (family) {
+        .llama, .qwen => llama_runtime.generate(allocator, model_path, prompt, options),
+        else => {
+            std.debug.print("Unsupported model family: {s}\n", .{family.label()});
+            return error.UnsupportedArchitecture;
+        },
+    };
 }
 
 pub fn runCommand(
