@@ -691,6 +691,7 @@ const Session = struct {
     attn_tmp: []f32,
     gate: []f32,
     up: []f32,
+    hybrid_temp: []f32,
     logits: []f32,
     pending_greedy_token: ?u32 = null,
     pending_shortlist: [llama_gpu.max_shortlist_len]llama_gpu.ShortlistEntry = undefined,
@@ -733,6 +734,7 @@ const Session = struct {
             .attn_tmp = try allocator.alloc(f32, model.embedding_length),
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
+            .hybrid_temp = try allocator.alloc(f32, model.tokenizer.tokens.len),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
             .scores = try allocator.alloc(f32, context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
@@ -803,6 +805,7 @@ const Session = struct {
         allocator.free(self.attn_tmp);
         allocator.free(self.gate);
         allocator.free(self.up);
+        allocator.free(self.hybrid_temp);
         allocator.free(self.logits);
         allocator.free(self.scores);
         allocator.free(self.k_cache);
@@ -1255,8 +1258,12 @@ const Session = struct {
     }
 
     fn canUseHybridMetalBatching(self: *const Session) bool {
-        _ = self;
-        return false;
+        return self.backend != null and
+            self.backend.?.label == .metal and
+            self.gpu_session == null and
+            self.metal_input_buffer != null and
+            self.metal_output_buffer != null and
+            useHybridMetalRouterForArchitecture(self.model.architecture);
     }
 
     fn runHybridMetalProjectionToDst(
@@ -1317,10 +1324,10 @@ const Session = struct {
         output_offset_elems += v_len;
 
         try metal_backend.commitSequence(backend);
-        try metal_backend.readBufferF32(output_buffer, self.logits[0..output_offset_elems]);
-        @memcpy(self.q, self.logits[0..q_len]);
-        @memcpy(self.k, self.logits[q_len .. q_len + k_len]);
-        @memcpy(self.v, self.logits[q_len + k_len .. output_offset_elems]);
+        try metal_backend.readBufferF32(output_buffer, self.hybrid_temp[0..output_offset_elems]);
+        @memcpy(self.q, self.hybrid_temp[0..q_len]);
+        @memcpy(self.k, self.hybrid_temp[q_len .. q_len + k_len]);
+        @memcpy(self.v, self.hybrid_temp[q_len + k_len .. output_offset_elems]);
     }
 
     fn runHybridMetalFfnFanout(self: *Session, layer: LayerRefs, input: []const f32) !void {
@@ -1338,9 +1345,9 @@ const Session = struct {
         output_offset_elems += up_len;
 
         try metal_backend.commitSequence(backend);
-        try metal_backend.readBufferF32(output_buffer, self.logits[0..output_offset_elems]);
-        @memcpy(self.gate, self.logits[0..gate_len]);
-        @memcpy(self.up, self.logits[gate_len .. gate_len + up_len]);
+        try metal_backend.readBufferF32(output_buffer, self.hybrid_temp[0..output_offset_elems]);
+        @memcpy(self.gate, self.hybrid_temp[0..gate_len]);
+        @memcpy(self.up, self.hybrid_temp[gate_len .. gate_len + up_len]);
     }
 
     fn canUseHybridMetalGreedy(self: *const Session) bool {

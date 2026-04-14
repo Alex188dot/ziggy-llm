@@ -451,7 +451,6 @@ fn createMetalExecution(
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
     const disable_compiled_for_arch =
-        std.mem.startsWith(u8, model.architecture, "qwen") or
         std.mem.startsWith(u8, model.architecture, "llama") or
         std.mem.startsWith(u8, model.architecture, "tinyllama");
 
