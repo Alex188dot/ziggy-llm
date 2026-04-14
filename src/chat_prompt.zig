@@ -104,7 +104,8 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
     // FIXED: stronger end-of-reply detection
     if (std.mem.indexOf(u8, reply[0..end], "<|im_end|>") != null or
         std.mem.indexOf(u8, reply[0..end], "</s>") != null or
-        std.mem.indexOf(u8, reply[0..end], "<|assistant|>") != null) {
+        std.mem.indexOf(u8, reply[0..end], "<|assistant|>") != null)
+    {
         // Already handled by the loop above, but ensures we detect these early
     }
 
@@ -236,6 +237,43 @@ fn renderConversation(
             }
             try writer.print("<|im_start|>assistant\n", .{});
         },
+        .tinyllama => {
+            if (include_default_system) {
+                try writer.print("<|system|>\n{s}</s>\n", .{system_message});
+            } else {
+                for (system_messages) |message| {
+                    try writer.print("<|system|>\n{s}</s>\n", .{message.content});
+                }
+            }
+            for (messages) |message| {
+                const role_tag: []const u8 = switch (message.role) {
+                    .system => "<|system|>",
+                    .user => "<|user|>",
+                    .assistant => "<|assistant|>",
+                };
+                try writer.print("{s}\n{s}</s>\n", .{ role_tag, message.content });
+            }
+            try writer.print("<|assistant|>\n", .{});
+        },
+        .llama3 => {
+            try writer.print("<|begin_of_text|>", .{});
+            if (include_default_system) {
+                try writer.print("<|start_header_id|>system<|end_header_id|>\n\n{s}<|eot_id|>", .{system_message});
+            } else {
+                for (system_messages) |message| {
+                    try writer.print("<|start_header_id|>system<|end_header_id|>\n\n{s}<|eot_id|>", .{message.content});
+                }
+            }
+            for (messages) |message| {
+                const role: []const u8 = switch (message.role) {
+                    .system => "system",
+                    .user => "user",
+                    .assistant => "assistant",
+                };
+                try writer.print("<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ role, message.content });
+            }
+            try writer.print("<|start_header_id|>assistant<|end_header_id|>\n\n", .{});
+        },
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -290,6 +328,22 @@ fn countRenderedMessageTokens(
             };
             break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, content });
         },
+        .tinyllama => blk: {
+            const role_tag: []const u8 = switch (role) {
+                .system => "<|system|>",
+                .user => "<|user|>",
+                .assistant => "<|assistant|>",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "{s}\n{s}</s>\n", .{ role_tag, content });
+        },
+        .llama3 => blk: {
+            const role_name: []const u8 = switch (role) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ role_name, content });
+        },
     };
     defer std.heap.page_allocator.free(snippet);
     return runtime_cache.promptTokenCount(model_path, snippet, backend);
@@ -300,6 +354,8 @@ fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system
         .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
         .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
         .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
+        .tinyllama => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
+        .llama3 => if (include_default_system) "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" ++ system_message ++ "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" else "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\n",
     };
 }
 

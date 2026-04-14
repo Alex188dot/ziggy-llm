@@ -341,15 +341,24 @@ fn createMetalExecution(
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
-    const effective_compiled_model = if (std.mem.startsWith(u8, model.architecture, "qwen")) null else compiled_model;
+    const disable_compiled_for_arch =
+        std.mem.startsWith(u8, model.architecture, "qwen") or
+        std.mem.startsWith(u8, model.architecture, "llama") or
+        std.mem.startsWith(u8, model.architecture, "tinyllama");
+
+    const effective_compiled_model = if (disable_compiled_for_arch) null else compiled_model;
+    const force_raw_metal_for_arch =
+        std.mem.startsWith(u8, model.architecture, "llama") or
+        std.mem.startsWith(u8, model.architecture, "tinyllama");
+    const effective_moon_quant_mode: types.MoonQuantMode = if (force_raw_metal_for_arch) .disabled else moon_quant_mode;
     const gated_ffn_policies = try buildGatedFfnPolicies(allocator, model, effective_compiled_model);
     errdefer allocator.free(gated_ffn_policies);
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
     const tensor_prepare_begin = std.time.nanoTimestamp();
     if (effective_compiled_model) |compiled| {
-        try dense_tensors.populateFromCompiled(model, compiled, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+        try dense_tensors.populateFromCompiled(model, compiled, effective_moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     } else {
-        try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+        try dense_tensors.populate(model, effective_moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     }
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 

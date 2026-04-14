@@ -110,6 +110,14 @@ fn hasGpuGreedyAcceleration(session: *const Session) bool {
     return session.gpu_session != null or session.canUseHybridMetalGreedy();
 }
 
+fn isQwenArchitecture(architecture: []const u8) bool {
+    return std.mem.startsWith(u8, architecture, "qwen");
+}
+
+fn useHybridMetalRouterForArchitecture(architecture: []const u8) bool {
+    return isQwenArchitecture(architecture);
+}
+
 const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
@@ -736,7 +744,31 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), gated_ffn_policies, experimental_gated_ffn, profiler);
+                if (useHybridMetalRouterForArchitecture(model.architecture)) {
+                    const max_input_elems = @max(model.embedding_length, model.feed_forward_length);
+                    const max_output_elems = model.tokenizer.tokens.len;
+
+                    session.metal_input_buffer = try metal_backend.createScratchBuffer(selected_backend, max_input_elems);
+                    errdefer if (session.metal_input_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+
+                    session.metal_output_buffer = try metal_backend.createScratchBuffer(selected_backend, max_output_elems);
+                    errdefer if (session.metal_output_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+
+                    session.metal_norm_scale_buffer = try metal_backend.createScratchBuffer(selected_backend, 1);
+                    errdefer if (session.metal_norm_scale_buffer) |buffer| metal_backend.destroyBuffer(buffer);
+
+                    session.metal_sampled_token_packed = try metal_backend.createScratchBuffer(selected_backend, 3);
+                    errdefer if (session.metal_sampled_token_packed) |buffer| metal_backend.destroyBuffer(buffer);
+                } else {
+                    session.gpu_session = try llama_gpu.Session.init(
+                        selected_backend,
+                        adaptDenseLookup(lookup),
+                        adaptModelDesc(model, context_length),
+                        gated_ffn_policies,
+                        experimental_gated_ffn,
+                        profiler,
+                    );
+                }
             }
         }
 
@@ -802,7 +834,7 @@ const Session = struct {
         if (prompt_tokens.len == 0) return;
         if (self.gpu_session == null or
             prompt_tokens.len == 1 or
-            std.mem.startsWith(u8, self.model.architecture, "qwen"))
+            useHybridMetalRouterForArchitecture(self.model.architecture))
         {
             for (prompt_tokens) |token_id| try self.stepNoOutput(token_id);
             return;

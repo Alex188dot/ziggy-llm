@@ -460,11 +460,11 @@ pub const Session = struct {
     ) !void {
         var normed_ready = false;
         var norm_scale_ready = layer_index == 0 and self.token_norm_scale_ready;
+        _ = &norm_scale_ready;
         if (layer_index == 0 and norm_scale_ready) self.token_norm_scale_ready = false;
 
-        if (!try self.runFusedQKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
-            const fused_qk_written = try self.runFusedQKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready);
-            if (!fused_qk_written and !try self.runFusedQProjectionRoPE(layer, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready, position)) {
+        if (true) {
+            if (true) {
                 try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                 normed_ready = true;
                 try self.runProjection(layer.attn_q, self.normed, self.q);
@@ -500,14 +500,14 @@ pub const Session = struct {
             const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
             const kv_offset_elements = layer_base + position * self.model.kv_dimension;
 
-            if (!fused_qk_written and !try self.runFusedKvCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready)) {
+            if (true) {
                 if (!normed_ready) {
                     try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                     normed_ready = true;
                 }
 
                 const kv_k_start = std.time.nanoTimestamp();
-                const fused_k_written = try self.runFusedKCacheWrite(layer, layer_index, position, self.hidden, layer.attn_norm, self.norm_scale, &norm_scale_ready);
+                const fused_k_written = false;
                 if (fused_k_written) {
                     try self.runProjection(layer.attn_v, self.normed, self.v);
                 } else if (!try self.runFusedKvFanout(layer.attn_k, layer.attn_v, self.normed, self.k, self.v)) {

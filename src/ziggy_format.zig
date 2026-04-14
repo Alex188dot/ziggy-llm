@@ -7,7 +7,7 @@ const llama_fixture = @import("runtime/llama_fixture.zig");
 
 pub const magic = "ZIGY";
 pub const current_version: u32 = 3;
-pub const current_runtime_version: u32 = 1;
+pub const current_runtime_version: u32 = 2;
 pub const default_alignment: u32 = 32;
 
 pub const CompiledLayoutKind = enum(u32) {
@@ -170,7 +170,7 @@ pub const ZiggyHeader = extern struct {
     pub fn validate(self: ZiggyHeader) !void {
         if (!std.mem.eql(u8, &self.magic, magic)) return error.InvalidMagic;
         if (self.version != current_version) return error.UnsupportedVersion;
-        if (self.runtime_version > current_runtime_version) return error.UnsupportedRuntimeVersion;
+        if (self.runtime_version != current_runtime_version) return error.UnsupportedRuntimeVersion;
         if (self.alignment == 0 or !std.math.isPowerOfTwo(self.alignment)) return error.InvalidAlignment;
     }
 };

@@ -86,6 +86,30 @@ pub const ChatTemplateStyle = enum {
     generic,
     chatml,
     qwen,
+    tinyllama,
+    llama3,
+};
+
+/// Model family classification for routing different inference paths
+pub const ModelFamily = enum {
+    /// Unknown or generic model family
+    unknown,
+    /// Qwen models (Qwen1.5, Qwen2, etc.) - use Qwen-specific Metal buffer allocation
+    qwen,
+    /// TinyLlama 1.0 - uses <|system|>/<|user|>/<|assistant|> with </s> end markers
+    tinyllama,
+    /// Llama 3.0+ (including Llama 3.1, 3.2) - uses <|begin_of_text|>/<|start_header_id|>/<|eot_id|>
+    llama3,
+    /// Other Llama models (Llama 2, early Llama 3 betas) - generic chat format
+    llama,
+    /// Gemma models from Google
+    gemma,
+    /// Mistral models
+    mistral,
+    /// Phi models from Microsoft
+    phi,
+    /// Mixtral mixture of experts
+    mixtral,
 };
 
 const TypeLayout = struct {
@@ -125,13 +149,99 @@ pub const InspectReport = struct {
         return formatTensorType(self.dominant_tensor_type);
     }
 
+    /// Detect chat template style using both template content and architecture fallback
     pub fn chatTemplateStyle(self: InspectReport) ChatTemplateStyle {
-        const detected = detectChatTemplateStyle(self.chat_template);
-        if (detected != .generic) return detected;
-        if (std.mem.startsWith(u8, self.architecture, "qwen")) return .qwen;
-        return .generic;
+        // First priority: template-based detection
+        const template_style = detectChatTemplateStyle(self.chat_template);
+        if (template_style != .generic) return template_style;
+
+        // Second priority: architecture-based fallback
+        return detectStyleByArchitecture(self.architecture);
+    }
+
+    /// Classify model by its architecture name
+    pub fn modelFamily(self: InspectReport) ModelFamily {
+        return classifyModelFamily(self.architecture, self.chat_template);
+    }
+
+    /// Check if this model requires Qwen-specific Metal buffer allocation
+    pub fn requiresQwenMetalPath(self: InspectReport) bool {
+        return self.modelFamily() == .qwen;
+    }
+
+    /// Check if this model uses Apple Metal GPU backend
+    pub fn usesMetalGpu(self: InspectReport) bool {
+        return self.modelFamily() != .qwen;
     }
 };
+
+/// Architecture-based template style detection (fallback when template detection fails)
+fn detectStyleByArchitecture(architecture: []const u8) ChatTemplateStyle {
+    // Llama 3.x uses different template format
+    if (std.mem.startsWith(u8, architecture, "llama")) {
+        // Llama 3+ uses <|begin_of_text|> marker
+        return .llama3;
+    }
+
+    // Qwen models
+    if (std.mem.startsWith(u8, architecture, "qwen")) {
+        return .qwen;
+    }
+
+    // TinyLlama is a separate architecture
+    if (std.mem.startsWith(u8, architecture, "tinyllama")) {
+        return .tinyllama;
+    }
+
+    return .generic;
+}
+
+/// Classify model into its family based on architecture and template
+fn classifyModelFamily(architecture: []const u8, chat_template: ?[]const u8) ModelFamily {
+    const template = chat_template orelse "";
+
+    // Qwen family
+    if (std.mem.startsWith(u8, architecture, "qwen")) {
+        return .qwen;
+    }
+
+    // TinyLlama family (distinct from general llama)
+    if (std.mem.startsWith(u8, architecture, "tinyllama")) {
+        return .tinyllama;
+    }
+
+    // Llama 3.x family (uses <|begin_of_text|>/<|eot_id|> markers)
+    if (std.mem.startsWith(u8, architecture, "llama")) {
+        if (std.mem.indexOf(u8, template, "<|begin_of_text|>") != null or
+            std.mem.indexOf(u8, template, "<|eot_id|>") != null)
+        {
+            return .llama3;
+        }
+        return .llama;
+    }
+
+    // Gemma family
+    if (std.mem.startsWith(u8, architecture, "gemma")) {
+        return .gemma;
+    }
+
+    // Mistral family
+    if (std.mem.startsWith(u8, architecture, "mistral")) {
+        return .mistral;
+    }
+
+    // Phi family
+    if (std.mem.startsWith(u8, architecture, "phi")) {
+        return .phi;
+    }
+
+    // Mixtral family
+    if (std.mem.startsWith(u8, architecture, "mixtral")) {
+        return .mixtral;
+    }
+
+    return .unknown;
+}
 
 pub const InspectError = error{
     InvalidMagic,
@@ -233,7 +343,7 @@ pub fn inspectFile(allocator: std.mem.Allocator, model_path: []const u8) !Inspec
     };
 }
 
-pub fn printInspectReport(writer: *std.Io.Writer, model_path: []const u8, report: InspectReport) !void {
+pub fn printInspectReport(writer: *std.io.Writer, model_path: []const u8, report: InspectReport) !void {
     var quantization_version_buffer: [32]u8 = undefined;
     var tokenizer_tokens_buffer: [32]u8 = undefined;
     var bos_buffer: [32]u8 = undefined;
@@ -246,6 +356,7 @@ pub fn printInspectReport(writer: *std.Io.Writer, model_path: []const u8, report
         \\gguf_version: {d}
         \\artifact_type: {s}
         \\architecture: {s}
+        \\model_family: {s}
         \\tensor_count: {d}
         \\metadata_count: {d}
         \\alignment: {d}
@@ -258,6 +369,7 @@ pub fn printInspectReport(writer: *std.Io.Writer, model_path: []const u8, report
         \\tokenizer_special_tokens: bos={s} eos={s} unk={s} pad={s}
         \\tokenizer_add_bos: {s}
         \\tokenizer_add_eos: {s}
+        \\chat_template_style: {s}
         \\data_offset: {d}
         \\
     ,
@@ -266,6 +378,7 @@ pub fn printInspectReport(writer: *std.Io.Writer, model_path: []const u8, report
             report.version,
             report.artifact_type,
             report.architecture,
+            @tagName(report.modelFamily()),
             report.tensor_count,
             report.metadata_count,
             report.alignment,
@@ -282,6 +395,7 @@ pub fn printInspectReport(writer: *std.Io.Writer, model_path: []const u8, report
             optionalInt(&pad_buffer, report.pad_token_id),
             formatOptionalBool(report.add_bos_token),
             formatOptionalBool(report.add_eos_token),
+            @tagName(report.chatTemplateStyle()),
             report.data_offset,
         },
     );
@@ -651,16 +765,38 @@ fn optionalString(value: ?[]const u8) []const u8 {
     return value orelse "<unset>";
 }
 
+/// Template-based chat template style detection
+/// Priority: Llama3 > Qwen > TinyLlama > ChatML > Generic
 pub fn detectChatTemplateStyle(chat_template: ?[]const u8) ChatTemplateStyle {
     const template = chat_template orelse return .generic;
+
+    // Llama 3.x: uses <|begin_of_text|> and <|eot_id|> markers
+    if (std.mem.indexOf(u8, template, "<|begin_of_text|>") != null) {
+        return .llama3;
+    }
+
+    // Qwen: uses <|im_start|>/<|im_end|> markers (with im_ prefix)
     if (std.mem.indexOf(u8, template, "<|im_start|>") != null) {
         return .qwen;
     }
+
+    // TinyLlama: uses <|system|>/<|user|>/<|assistant|> WITHOUT im_ prefix
+    // Check for <|system|> specifically (TinyLlama v1.0 template)
+    if (std.mem.indexOf(u8, template, "<|system|>") != null) {
+        return .tinyllama;
+    }
+
+    // ChatML: uses <|user|>/<|assistant|> without <|system|> (or with different format)
+    // But only if they DON'T have the im_ prefix (which would be Qwen)
     if (std.mem.indexOf(u8, template, "<|user|>") != null and
         std.mem.indexOf(u8, template, "<|assistant|>") != null)
     {
-        return .chatml;
+        // Double-check it's not Qwen format
+        if (std.mem.indexOf(u8, template, "<|im_") == null) {
+            return .chatml;
+        }
     }
+
     return .generic;
 }
 
@@ -830,6 +966,52 @@ test "inspect parses chat template metadata and detects chatml" {
     const report = try inspectFile(allocator, path);
     try std.testing.expect(report.chat_template != null);
     try std.testing.expectEqual(ChatTemplateStyle.chatml, report.chatTemplateStyle());
+}
+
+test "detectChatTemplateStyle identifies llama3 templates" {
+    const template = "{{ '<|begin_of_text|>' }}{% for message in messages %}{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}";
+    try std.testing.expectEqual(ChatTemplateStyle.llama3, detectChatTemplateStyle(template));
+}
+
+test "detectChatTemplateStyle identifies qwen templates" {
+    const template = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}{% endfor %}{{ '<|im_start|>assistant\n' }}";
+    try std.testing.expectEqual(ChatTemplateStyle.qwen, detectChatTemplateStyle(template));
+}
+
+test "detectChatTemplateStyle identifies tinyllama templates" {
+    const template = "<|system|>\n{system}</s>\n{% for message in messages %}<|{{ message['role'] }}|>\n{{ message['content'] }}</s>\n{% endfor %}<|assistant|>\n";
+    try std.testing.expectEqual(ChatTemplateStyle.tinyllama, detectChatTemplateStyle(template));
+}
+
+test "detectChatTemplateStyle falls back to architecture for llama" {
+    // No template - should fall back to llama3 for llama architecture
+    try std.testing.expectEqual(ChatTemplateStyle.llama3, detectChatTemplateByArchitectureFallback("llama", null));
+}
+
+test "modelFamily classifies qwen correctly" {
+    try std.testing.expectEqual(ModelFamily.qwen, classifyModelFamily("qwen2", null));
+    try std.testing.expectEqual(ModelFamily.qwen, classifyModelFamily("qwen1.5", null));
+}
+
+test "modelFamily classifies tinyllama correctly" {
+    try std.testing.expectEqual(ModelFamily.tinyllama, classifyModelFamily("tinyllama", null));
+}
+
+test "modelFamily classifies llama3 correctly" {
+    const llama3_template = "<|begin_of_text|>...";
+    try std.testing.expectEqual(ModelFamily.llama3, classifyModelFamily("llama", llama3_template));
+}
+
+test "modelFamily classifies gemma correctly" {
+    try std.testing.expectEqual(ModelFamily.gemma, classifyModelFamily("gemma", null));
+    try std.testing.expectEqual(ModelFamily.gemma, classifyModelFamily("gemma2", null));
+}
+
+// Helper for testing architecture fallback
+fn detectChatTemplateByArchitectureFallback(architecture: []const u8, chat_template: ?[]const u8) ChatTemplateStyle {
+    const template_style = detectChatTemplateStyle(chat_template);
+    if (template_style != .generic) return template_style;
+    return detectStyleByArchitecture(architecture);
 }
 
 const FixtureOptions = struct {
