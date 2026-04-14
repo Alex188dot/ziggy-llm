@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const families_mod = @import("families/mod.zig");
 const registry_mod = @import("families/registry.zig");
 const llama_family = @import("families/llama/mod.zig");
+const qwen_family = @import("families/qwen/mod.zig");
 
 pub const primary_target = types.primary_target;
 pub const fallback_target = types.fallback_target;
@@ -31,6 +32,7 @@ fn getRegistry() *registry_mod.FamilyRegistry {
     const reg = registry_mod.getGlobalRegistry();
     if (reg.count == 0) {
         reg.register(llama_family.FamilyHandler) catch unreachable;
+        reg.register(qwen_family.FamilyHandler) catch unreachable;
     }
     return reg;
 }
@@ -84,10 +86,6 @@ pub fn generate(
             .startup_breakdown = family_report.startup_breakdown,
             .metal_profile_summary = family_report.metal_profile_summary,
         };
-    }
-
-    if (family == .qwen) {
-        return llama_runtime.generate(allocator, model_path, prompt, options);
     }
 
     std.debug.print("Unsupported model family: {s}\n", .{family.label()});
