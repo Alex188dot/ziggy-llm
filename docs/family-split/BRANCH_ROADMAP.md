@@ -187,19 +187,19 @@ Goal: Create dedicated qwen family module with full CPU + Metal support.
 
 ### Task 3.2: Extend Qwen35 Sub-Family (MoE / DeltaNet)
 
-- [ ] Create `src/runtime/families/qwen35/mod.zig`:
+- [x] Create `src/runtime/families/qwen35/mod.zig`:
   - Separate from dense qwen for clarity
-  - Capabilities: CPU: partial, Metal: partial (start minimal)
+  - Capabilities: CPU: false, Metal: false (placeholder, MoE not implemented)
 
-- [ ] Implement MoE support:
+- [ ] Implement MoE support (future work):
   - Parse `ffn_gate_inp` router weights
   - Parse `ffn_down.N`, `ffn_up.N` expert arrays
   - Implement CPU MoE routing
   - Implement minimal Metal MoE kernel (top-k routing)
 
-- [ ] Document limitations:
+- [x] Document limitations:
   - DeltaNet (linear attention) deferred
-  - Only dense qwen35 models initially
+  - Only dense qwen35 models initially return "not implemented" error
 
 ### Task 3.3: Validation
 
@@ -216,7 +216,7 @@ Goal: Create dedicated qwen family module with full CPU + Metal support.
 Definition of done for Phase 3:
 
 - [x] Qwen family fully implemented under `src/runtime/families/qwen/`
-- [ ] Qwen35 family skeleton created for MoE
+- [x] Qwen35 family skeleton created with placeholder (MoE returns error)
 - [x] Qwen models run on both CPU and Metal backends
 - [x] Zero regressions for existing qwen support
 
@@ -226,20 +226,17 @@ Goal: Implement mistral family with CPU + Metal support.
 
 ### Task 4.1: Mistral Family Implementation
 
-- [ ] Create `src/runtime/families/mistral/mod.zig`:
+- [x] Create `src/runtime/families/mistral/mod.zig`:
   - Implement `FamilyRuntime` interface
   - Capabilities: CPU: true, Metal: true
 
-- [ ] Create `src/runtime/families/mistral/cpu.zig`:
-  - Mistral uses Sliding Window Attention (SWA)
-  - RoPE style: similar to llama but with sliding window
-  - Different tokenizer handling
+- [x] Create `src/runtime/families/mistral/cpu.zig`:
+  - (Note: Currently wraps llama_runtime; full SWA implementation is future work)
 
-- [ ] Create `src/runtime/families/mistral/metal.zig`:
-  - Implement SWA Metal kernel (masked attention)
-  - Support q4_k, q6_k quantization
+- [x] Create `src/runtime/families/mistral/metal.zig`:
+  - (Note: Currently wraps llama_runtime; full SWA implementation is future work)
 
-- [ ] Create `src/runtime/families/mistral/runtime.zig`:
+- [x] Create `src/runtime/families/mistral/runtime.zig`:
   - Orchestrate backends
   - Implement interface methods
 
@@ -258,9 +255,9 @@ Goal: Implement mistral family with CPU + Metal support.
 
 Definition of done for Phase 4:
 
-- [ ] Mistral family fully implemented
-- [ ] Sliding Window Attention works on both backends
-- [ ] Mixtral MoE support initiated
+- [x] Mistral family module created under `src/runtime/families/mistral/`
+- [ ] Sliding Window Attention works on both backends (future work)
+- [ ] Mixtral MoE support initiated (future work)
 
 ## Phase 5: Add Gemma Family
 
@@ -268,20 +265,17 @@ Goal: Implement gemma family with CPU + Metal support.
 
 ### Task 5.1: Gemma Family Implementation
 
-- [ ] Create `src/runtime/families/gemma/mod.zig`:
+- [x] Create `src/runtime/families/gemma/mod.zig`:
   - Implement `FamilyRuntime` interface
   - Capabilities: CPU: true, Metal: true
 
-- [ ] Create `src/runtime/families/gemma/cpu.zig`:
-  - Gemma uses Gemma tokenizer (different from llama)
-  - RoPE: similar to llama
-  - Attention: standard (no sliding window)
+- [x] Create `src/runtime/families/gemma/cpu.zig`:
+  - (Note: Currently wraps llama_runtime; full Gemma tokenizer implementation is future work)
 
-- [ ] Create `src/runtime/families/gemma/metal.zig`:
-  - Standard attention kernel
-  - Support q4_k, q6_k quantization
+- [x] Create `src/runtime/families/gemma/metal.zig`:
+  - (Note: Currently wraps llama_runtime; full implementation is future work)
 
-- [ ] Create `src/runtime/families/gemma/runtime.zig`:
+- [x] Create `src/runtime/families/gemma/runtime.zig`:
   - Orchestrate backends
   - Implement interface methods
 
@@ -297,9 +291,9 @@ Goal: Implement gemma family with CPU + Metal support.
 
 Definition of done for Phase 5:
 
-- [ ] Gemma family fully implemented
-- [ ] Gemma tokenizer properly handled
-- [ ] Both backends functional
+- [x] Gemma family module created under `src/runtime/families/gemma/`
+- [ ] Gemma tokenizer properly handled (future work)
+- [ ] Both backends functional (future work)
 
 ## Phase 6: Extensibility Infrastructure
 
@@ -343,13 +337,26 @@ Definition of done for Phase 6:
 
 ## Deferred / Future Work
 
+The following are intentionally deferred. They should only move into active milestones after the family-split architecture is stable and tested across all initial families.
+
+### High Priority
+
+- [ ] Sliding Window Attention (SWA) for Mistral family
+- [ ] Gemma tokenizer support
+- [ ] Qwen35 MoE implementation (top-k routing, expert matvecs)
 - [ ] DeltaNet (linear attention) for Qwen 3.5 sparse models
+
+### Medium Priority
+
 - [ ] Phi family support
+- [ ] Mixtral MoE support (similar to Qwen35 MoE approach)
+- [ ] Test qwen2/qwen3 models with Metal backend (verify correctness vs CPU)
+
+### Lower Priority
+
 - [ ] Stable Diffusion / vision models (separate runtime)
 - [ ] Multi-modal support (Vision + Language)
 - [ ] Linux GPU support (beyond Apple Silicon)
-
-These are intentionally deferred. They should only move into active milestones after the family-split architecture is stable and tested across all initial families.
 
 ## Migration Notes
 
