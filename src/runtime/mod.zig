@@ -3,6 +3,13 @@ const gguf = @import("../gguf.zig");
 const bench_runner = @import("bench_runner.zig");
 const llama_runtime = @import("llama_runtime.zig");
 const types = @import("types.zig");
+const families_mod = @import("families/mod.zig");
+const registry_mod = @import("families/registry.zig");
+const llama_family = @import("families/llama/mod.zig");
+const qwen_family = @import("families/qwen/mod.zig");
+const mistral_family = @import("families/mistral/mod.zig");
+const gemma_family = @import("families/gemma/mod.zig");
+const qwen35_family = @import("families/qwen35/mod.zig");
 
 pub const primary_target = types.primary_target;
 pub const fallback_target = types.fallback_target;
@@ -24,6 +31,18 @@ pub const BenchSummary = bench_runner.BenchSummary;
 pub const deltaNs = types.deltaNs;
 pub const nsToMs = types.nsToMs;
 
+fn getRegistry() *registry_mod.FamilyRegistry {
+    const reg = registry_mod.getGlobalRegistry();
+    if (reg.count == 0) {
+        reg.register(llama_family.FamilyHandler) catch unreachable;
+        reg.register(qwen_family.FamilyHandler) catch unreachable;
+        reg.register(mistral_family.FamilyHandler) catch unreachable;
+        reg.register(gemma_family.FamilyHandler) catch unreachable;
+        reg.register(qwen35_family.FamilyHandler) catch unreachable;
+    }
+    return reg;
+}
+
 pub fn generate(
     allocator: std.mem.Allocator,
     model_path: []const u8,
@@ -33,9 +52,50 @@ pub fn generate(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const report = try gguf.inspectFile(arena.allocator(), model_path);
-    if (!std.mem.eql(u8, report.architecture, native_architecture) and !std.mem.startsWith(u8, report.architecture, "qwen")) return error.UnsupportedArchitecture;
-    return llama_runtime.generate(allocator, model_path, prompt, options);
+    const gguf_report = try gguf.inspectFile(arena.allocator(), model_path);
+    const family = families_mod.detectModelFamily(gguf_report.architecture);
+    const reg = getRegistry();
+
+    if (reg.getRuntime(family)) |runtime| {
+        const family_options = families_mod.FamilyGenerateOptions{
+            .max_tokens = options.max_tokens,
+            .context_length = options.context_length,
+            .seed = options.seed,
+            .temperature = options.temperature,
+            .repeat_penalty = options.repeat_penalty,
+            .top_k = options.top_k,
+            .top_p = options.top_p,
+            .min_p = options.min_p,
+            .backend = @enumFromInt(@intFromEnum(options.backend)),
+            .moon_quant = options.moon_quant,
+            .metal_profile = options.metal_profile,
+            .sampling_strategy = options.sampling_strategy,
+        };
+
+        const family_report = try runtime.generate(allocator, model_path, prompt, family_options);
+
+        return types.GenerationReport{
+            .generated_text = family_report.generated_text,
+            .prompt_token_count = family_report.prompt_token_count,
+            .reused_prompt_token_count = family_report.reused_prompt_token_count,
+            .generated_token_count = family_report.generated_token_count,
+            .startup_ns = family_report.startup_ns,
+            .prompt_ns = family_report.prompt_ns,
+            .ttft_ns = family_report.ttft_ns,
+            .decode_ns = family_report.decode_ns,
+            .seed = family_report.seed,
+            .temperature = family_report.temperature,
+            .backend = @enumFromInt(@intFromEnum(family_report.backend)),
+            .sampling_strategy = family_report.sampling_strategy,
+            .sampling_path = family_report.sampling_path,
+            .readback_mode = family_report.readback_mode,
+            .startup_breakdown = family_report.startup_breakdown,
+            .metal_profile_summary = family_report.metal_profile_summary,
+        };
+    }
+
+    std.debug.print("Unsupported model family: {s}\n", .{family.label()});
+    return error.UnsupportedArchitecture;
 }
 
 pub fn runCommand(
