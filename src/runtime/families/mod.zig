@@ -1,6 +1,7 @@
 const std = @import("std");
 const gguf = @import("../../gguf.zig");
 const moon_quant = @import("../../moon_quant.zig");
+const types = @import("../types.zig");
 
 pub const supported_quantization = moon_quant.supported_quantization;
 
@@ -56,9 +57,9 @@ pub const FamilyGenerateOptions = struct {
     top_p: f32 = 1.0,
     min_p: f32 = 0.0,
     backend: FamilyBackendPreference = .auto,
-    moon_quant: moon_quant.MoonQuantMode = .enabled,
+    moon_quant: types.MoonQuantMode = .enabled,
     metal_profile: bool = false,
-    sampling_strategy: moon_quant.SamplingStrategy = .auto,
+    sampling_strategy: types.SamplingStrategy = .auto,
 };
 
 pub const FamilyReport = struct {
@@ -73,9 +74,9 @@ pub const FamilyReport = struct {
     seed: u64,
     temperature: f32,
     backend: BackendUsed,
-    sampling_strategy: moon_quant.SamplingStrategy = .auto,
-    sampling_path: moon_quant.EffectiveSamplingPath = .cpu_logits,
-    readback_mode: moon_quant.ReadbackMode = .none,
+    sampling_strategy: types.SamplingStrategy = .auto,
+    sampling_path: types.EffectiveSamplingPath = .cpu_logits,
+    readback_mode: types.ReadbackMode = .none,
     startup_breakdown: StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
 
@@ -103,22 +104,15 @@ pub const BackendUsed = enum {
     }
 };
 
-pub const StartupBreakdown = struct {
-    model_load_ns: u64 = 0,
-    tensor_prepare_ns: u64 = 0,
-    backend_init_ns: u64 = 0,
-    metal_prewarm_ns: u64 = 0,
-    session_init_ns: u64 = 0,
-    first_decode_step_ns: u64 = 0,
-};
+pub const StartupBreakdown = types.StartupBreakdown;
 
 pub const FamilyRuntime = struct {
     ctx: ?*anyopaque,
-    generate_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8, FamilyGenerateOptions) FamilyError!FamilyReport,
+    generate_fn: *const fn (?*anyopaque, std.mem.Allocator, []const u8, []const u8, FamilyGenerateOptions) anyerror!FamilyReport,
     deinit_fn: *const fn (?*anyopaque) void,
 
-    pub fn generate(self: FamilyRuntime, allocator: std.mem.Allocator, model_path: []const u8, prompt: []const u8, options: FamilyGenerateOptions) FamilyError!FamilyReport {
-        return self.generate_fn(self.ctx, allocator, model_path, prompt, options);
+    pub fn generate(self: FamilyRuntime, allocator: std.mem.Allocator, model_path: []const u8, prompt: []const u8, options: FamilyGenerateOptions) anyerror!FamilyReport {
+        return try self.generate_fn(self.ctx, allocator, model_path, prompt, options);
     }
 
     pub fn deinit(self: FamilyRuntime) void {
