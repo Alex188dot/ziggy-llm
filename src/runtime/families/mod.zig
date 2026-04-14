@@ -10,6 +10,7 @@ pub const ModelFamily = union(enum) {
     qwen,
     qwen35,
     mistral,
+    mistral3_2512,
     gemma,
     custom: []const u8,
 
@@ -19,6 +20,7 @@ pub const ModelFamily = union(enum) {
             .qwen => "qwen",
             .qwen35 => "qwen35",
             .mistral => "mistral",
+            .mistral3_2512 => "ministral3_2512",
             .gemma => "gemma",
             .custom => |s| s,
         };
@@ -136,7 +138,10 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.startsWith(u8, architecture, "qwen2_moe") or std.mem.startsWith(u8, architecture, "qwen3_moe")) {
         return .qwen35;
     }
-    if (std.mem.eql(u8, architecture, "mistral")) {
+    if (std.mem.eql(u8, architecture, "mistral3") or std.mem.eql(u8, architecture, "ministral3")) {
+        return .mistral3_2512;
+    }
+    if (std.mem.startsWith(u8, architecture, "mistral")) {
         return .mistral;
     }
     if (std.mem.eql(u8, architecture, "gemma")) {
@@ -161,6 +166,11 @@ test "detectModelFamily recognizes qwen35 moe variants" {
 
 test "detectModelFamily recognizes mistral" {
     try std.testing.expectEqual(ModelFamily.mistral, detectModelFamily("mistral"));
+}
+
+test "detectModelFamily recognizes mistral3_2512" {
+    try std.testing.expectEqual(ModelFamily.mistral3_2512, detectModelFamily("mistral3"));
+    try std.testing.expectEqual(ModelFamily.mistral3_2512, detectModelFamily("ministral3"));
 }
 
 test "detectModelFamily recognizes gemma" {

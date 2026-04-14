@@ -242,6 +242,7 @@ fn writeTensorData(list: *std.ArrayList(u8), tensor_type: llama_cpu.TensorType, 
         .q8_0 => try writeTensorDataQ8_0(list, values, row_len),
         .q4_k => try writeTensorDataQ4K(list, values, row_len),
         .q6_k => try writeTensorDataQ6K(list, values, row_len),
+        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
     }
 }
 

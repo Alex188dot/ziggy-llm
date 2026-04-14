@@ -107,6 +107,7 @@ const ValueType = enum(u32) {
     uint64 = 10,
     int64 = 11,
     float64 = 12,
+    float16 = 13,
 };
 
 pub const TensorType = enum(u32) {
@@ -115,6 +116,10 @@ pub const TensorType = enum(u32) {
     q8_0 = 8,
     q4_k = 12,
     q6_k = 14,
+    bf16 = 30,
+    i8 = 24,
+    i16 = 25,
+    i32 = 26,
 };
 
 pub const RopeStyle = enum(u32) {
@@ -978,6 +983,7 @@ const Session = struct {
                 .q8_0 => .q8_0,
                 .q4_k => .legacy_q4_k,
                 .q6_k => .legacy_q6_k,
+                .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
             },
             .values = input,
         });
@@ -1806,8 +1812,11 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     }
 
     const architecture = metadata.architecture orelse return error.MissingRequiredMetadata;
-    if (!std.mem.eql(u8, architecture, "llama") and !std.mem.startsWith(u8, architecture, "qwen")) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (std.mem.startsWith(u8, architecture, "qwen")) .neox else .interleaved;
+    const is_mistral = std.mem.startsWith(u8, architecture, "mistral");
+    const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
+    const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
+    if (!is_llama and !is_qwen and !is_mistral) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (is_qwen or is_mistral) .neox else .interleaved;
 
     if (metadata.tokenizer_model) |tm| {
         if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
@@ -2263,6 +2272,7 @@ pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 210);
         },
+        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
     };
 }
 
@@ -2313,6 +2323,7 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
         .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
         .q6_k => try dequantizeRowQ6K(out, row, row_len),
+        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
     }
 }
 
@@ -2323,6 +2334,7 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
         .q8_0 => try dotQ8_0Row(row, row_len, input),
         .q4_k => try dotQ4KRow(row, row_len, input),
         .q6_k => try dotQ6KRow(row, row_len, input),
+        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
     };
 }
 
@@ -2333,6 +2345,7 @@ fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, i
         .q8_0 => dotQ8_0Row(row, row_len, input) catch unreachable,
         .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
         .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
+        .bf16, .i8, .i16, .i32 => unreachable,
     };
 }
 
@@ -2880,14 +2893,21 @@ fn readStringArray(allocator: std.mem.Allocator, parser: *Parser, value_type: Va
 fn readFloatArray(allocator: std.mem.Allocator, parser: *Parser, value_type: ValueType, out: *std.ArrayList(f32)) !void {
     if (value_type != .array) return error.InvalidMetadataType;
     const element_type = std.meta.intToEnum(ValueType, try parser.readInt(u32)) catch return error.InvalidMetadataType;
-    if (element_type != .float32 and element_type != .float64) return error.InvalidMetadataType;
     const count = try parser.readInt(u64);
     try out.ensureTotalCapacity(allocator, std.math.cast(usize, count) orelse return error.Overflow);
     for (0..count) |_| {
-        const value = if (element_type == .float32)
-            @as(f32, @bitCast(try parser.readInt(u32)))
-        else
-            @as(f32, @floatCast(@as(f64, @bitCast(try parser.readInt(u64)))));
+        const value: f32 = switch (element_type) {
+            .float32 => @as(f32, @bitCast(try parser.readInt(u32))),
+            .float64 => @as(f32, @floatCast(@as(f64, @bitCast(try parser.readInt(u64))))),
+            .float16 => @as(f32, @floatCast(@as(f16, @bitCast(try parser.readInt(u16))))),
+            .int32 => @floatFromInt(try parser.readInt(i32)),
+            .int16 => @floatFromInt(try parser.readInt(i16)),
+            .int8 => @floatFromInt(try parser.readInt(i8)),
+            .uint32 => @floatFromInt(try parser.readInt(u32)),
+            .uint16 => @floatFromInt(try parser.readInt(u16)),
+            .uint8 => @floatFromInt(try parser.readInt(u8)),
+            else => return error.InvalidMetadataType,
+        };
         out.appendAssumeCapacity(value);
     }
 }
@@ -2917,7 +2937,7 @@ fn readU32Array(allocator: std.mem.Allocator, parser: *Parser, value_type: Value
 fn skipValue(parser: *Parser, value_type: ValueType) !void {
     switch (value_type) {
         .uint8, .int8, .bool => try parser.skipBytes(1),
-        .uint16, .int16 => try parser.skipBytes(2),
+        .uint16, .int16, .float16 => try parser.skipBytes(2),
         .uint32, .int32, .float32 => try parser.skipBytes(4),
         .uint64, .int64, .float64 => try parser.skipBytes(8),
         .string => {
