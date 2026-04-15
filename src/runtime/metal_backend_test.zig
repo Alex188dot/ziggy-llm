@@ -303,7 +303,7 @@ test "metal q6k matvec matches cpu dequantized reference" {
     var model = try llama_cpu.loadModel(std.testing.allocator, path);
     defer model.deinit(std.testing.allocator);
 
-    const tensor = model.layers[0].attn_q;
+    const tensor = model.layers[0].attn_q.?;
     const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
     const matrix = try llama_cpu.tensorBytes(&model, tensor);
 
@@ -356,7 +356,7 @@ test "metal q6k matvec writes to dst offset" {
     defer model.deinit(std.testing.allocator);
 
     const row_size = try llama_cpu.tensorRowByteSize(.q6_k, cols);
-    const matrix = try llama_cpu.tensorBytes(&model, model.layers[0].attn_q);
+    const matrix = try llama_cpu.tensorBytes(&model, model.layers[0].attn_q.?);
 
     var input: [cols]f32 = undefined;
     for (&input, 0..) |*value, index| {
@@ -525,7 +525,7 @@ test "metal q8_0 matvec matches cpu dequantized reference" {
     var model = try llama_cpu.loadModel(std.testing.allocator, path);
     defer model.deinit(std.testing.allocator);
 
-    const tensor = model.layers[0].attn_q;
+    const tensor = model.layers[0].attn_q.?;
     const row_size = try llama_cpu.tensorRowByteSize(.q8_0, cols);
     const matrix = try llama_cpu.tensorBytes(&model, tensor);
 
@@ -576,7 +576,7 @@ test "metal q8_0 fused add matches cpu dequantized reference" {
     var model = try llama_cpu.loadModel(std.testing.allocator, path);
     defer model.deinit(std.testing.allocator);
 
-    const tensor = model.layers[0].attn_q;
+    const tensor = model.layers[0].attn_q.?;
     const row_size = try llama_cpu.tensorRowByteSize(.q8_0, cols);
     const matrix = try llama_cpu.tensorBytes(&model, tensor);
 

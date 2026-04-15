@@ -131,8 +131,11 @@ pub const Session = struct {
         layer_index: usize,
         position: usize,
     ) !void {
+        if (layer.attn_q == null) {
+            return;
+        }
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
-        try self.runProjection(layer.attn_q, self.normed, self.q);
+        try self.runProjection(layer.attn_q.?, self.normed, self.q);
         if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
         if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.rope_dimension_count);
 
@@ -158,7 +161,7 @@ pub const Session = struct {
         const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
         const kv_k_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_k, self.normed, self.k);
+        try self.runProjection(layer.attn_k.?, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
         if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.rope_dimension_count);
         try metal_backend.applyRoPE(
@@ -192,7 +195,7 @@ pub const Session = struct {
         });
 
         const kv_v_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_v, self.normed, self.v);
+        try self.runProjection(layer.attn_v.?, self.normed, self.v);
         if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
         try metal_backend.storeKvHalf(
             self.backend,
@@ -230,7 +233,7 @@ pub const Session = struct {
             .depth = position + 1,
             .extra = self.model.head_count_kv,
         });
-        try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
+        try self.runProjectionAdd(layer.attn_output.?, self.attn, self.hidden);
     }
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {

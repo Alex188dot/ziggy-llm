@@ -86,6 +86,11 @@ const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
 
+pub const LayerType = enum {
+    full_attention,
+    linear_attention,
+};
+
 fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOptions) runtime_types.EffectiveSamplingPath {
     if (!has_gpu_session) return .cpu_logits;
     const path = runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
@@ -191,19 +196,32 @@ const ScaleMinK4 = struct {
 
 pub const LayerRefs = struct {
     attn_norm: TensorRef,
-    attn_q: TensorRef,
+    attn_q: ?TensorRef = null,
     attn_q_bias: ?TensorRef = null,
     attn_q_norm: ?TensorRef = null,
-    attn_k: TensorRef,
+    attn_k: ?TensorRef = null,
     attn_k_bias: ?TensorRef = null,
     attn_k_norm: ?TensorRef = null,
-    attn_v: TensorRef,
+    attn_v: ?TensorRef = null,
     attn_v_bias: ?TensorRef = null,
-    attn_output: TensorRef,
+    attn_output: ?TensorRef = null,
     ffn_norm: TensorRef,
     ffn_gate: TensorRef,
     ffn_down: TensorRef,
     ffn_up: TensorRef,
+    linear_attn: ?LinearAttnTensors = null,
+};
+
+pub const LinearAttnTensors = struct {
+    in_proj_qkv: TensorRef,
+    in_proj_z: TensorRef,
+    in_proj_b: TensorRef,
+    in_proj_a: TensorRef,
+    conv1d: TensorRef,
+    dt_bias: TensorRef,
+    A_log: TensorRef,
+    norm_weight: TensorRef,
+    out_proj: TensorRef,
 };
 
 const Metadata = struct {
@@ -219,6 +237,13 @@ const Metadata = struct {
     head_count_kv: ?u32 = null,
     rms_norm_eps: ?f32 = null,
     rope_freq_base: ?f32 = null,
+    partial_rotary_factor: ?f32 = null,
+    linear_num_key_heads: ?u32 = null,
+    linear_num_value_heads: ?u32 = null,
+    linear_key_head_dim: ?u32 = null,
+    linear_value_head_dim: ?u32 = null,
+    linear_conv_kernel_dim: ?u32 = null,
+    layer_types: std.ArrayList([]u8) = .empty,
     tokenizer_model: ?[]u8 = null,
     tokenizer_pre: ?[]u8 = null,
     tokenizer_tokens: std.ArrayList([]u8) = .empty,
@@ -238,10 +263,12 @@ const Metadata = struct {
         if (self.tokenizer_pre) |value| allocator.free(value);
         for (self.tokenizer_tokens.items) |token| allocator.free(token);
         for (self.tokenizer_merges.items) |merge| allocator.free(merge);
+        for (self.layer_types.items) |lt| allocator.free(lt);
         self.tokenizer_tokens.deinit(allocator);
         self.tokenizer_merges.deinit(allocator);
         self.tokenizer_scores.deinit(allocator);
         self.tokenizer_types.deinit(allocator);
+        self.layer_types.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -564,24 +591,43 @@ pub const Model = struct {
     output: TensorRef,
     output_norm: TensorRef,
     layers: []LayerRefs,
+    is_qwen35_text: bool = false,
+    partial_rotary_factor: f32 = 1.0,
+    linear_num_key_heads: u32 = 16,
+    linear_num_value_heads: u32 = 16,
+    linear_key_head_dim: u32 = 128,
+    linear_value_head_dim: u32 = 128,
+    linear_conv_kernel_dim: u32 = 4,
+    layer_types: []LayerType = &.{},
 
     pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
         self.tokenizer.deinit(allocator);
         for (self.layers) |layer| {
             allocator.free(layer.attn_norm.name);
-            allocator.free(layer.attn_q.name);
+            if (layer.attn_q) |q| allocator.free(q.name);
             if (layer.attn_q_bias) |b| allocator.free(b.name);
             if (layer.attn_q_norm) |n| allocator.free(n.name);
-            allocator.free(layer.attn_k.name);
+            if (layer.attn_k) |k| allocator.free(k.name);
             if (layer.attn_k_bias) |b| allocator.free(b.name);
             if (layer.attn_k_norm) |n| allocator.free(n.name);
-            allocator.free(layer.attn_v.name);
+            if (layer.attn_v) |v| allocator.free(v.name);
             if (layer.attn_v_bias) |b| allocator.free(b.name);
-            allocator.free(layer.attn_output.name);
+            if (layer.attn_output) |o| allocator.free(o.name);
             allocator.free(layer.ffn_norm.name);
             allocator.free(layer.ffn_gate.name);
             allocator.free(layer.ffn_down.name);
             allocator.free(layer.ffn_up.name);
+            if (layer.linear_attn) |la| {
+                allocator.free(la.in_proj_qkv.name);
+                allocator.free(la.in_proj_z.name);
+                allocator.free(la.in_proj_b.name);
+                allocator.free(la.in_proj_a.name);
+                allocator.free(la.conv1d.name);
+                allocator.free(la.dt_bias.name);
+                allocator.free(la.A_log.name);
+                allocator.free(la.norm_weight.name);
+                allocator.free(la.out_proj.name);
+            }
         }
         allocator.free(self.layers);
         allocator.free(self.token_embd.name);
@@ -919,33 +965,45 @@ const Session = struct {
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
 
         for (self.model.layers, 0..) |layer, layer_index| {
+            const is_linear_attn = layer.linear_attn != null;
+
             if (self.gpu_session) |*gpu_session| {
                 if (layer_index == 0) try gpu_session.beginToken(self.hidden);
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
+            } else if (is_linear_attn) {
+                try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
+                @memset(self.attn_tmp, 0);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
-                try self.recordCalibration(layer.attn_q, .attn_q, self.normed);
-                try self.recordCalibration(layer.attn_k, .attn_k, self.normed);
-                try self.recordCalibration(layer.attn_v, .attn_v, self.normed);
-
-                try self.matVec(self.q, layer.attn_q, self.normed);
+                if (layer.attn_q) |q| {
+                    try self.recordCalibration(q, .attn_q, self.normed);
+                    try self.matVec(self.q, q, self.normed);
+                }
                 if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
                 if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.rope_dimension_count);
 
-                try self.matVec(self.k, layer.attn_k, self.normed);
+                if (layer.attn_k) |k| {
+                    try self.recordCalibration(k, .attn_k, self.normed);
+                    try self.matVec(self.k, k, self.normed);
+                }
                 if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
                 if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.rope_dimension_count);
 
-                try self.matVec(self.v, layer.attn_v, self.normed);
+                if (layer.attn_v) |v| {
+                    try self.recordCalibration(v, .attn_v, self.normed);
+                    try self.matVec(self.v, v, self.normed);
+                }
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
-                applyRoPE(self.q, self.model.head_count, self.model.rope_dimension_count, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
-                applyRoPE(self.k, self.model.head_count_kv, self.model.rope_dimension_count, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
+                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
-                try self.recordCalibration(layer.attn_output, .attn_output, self.attn_out);
-                try self.matVec(self.attn_tmp, layer.attn_output, self.attn_out);
-                addInPlace(self.hidden, self.attn_tmp);
+                if (layer.attn_output) |o| {
+                    try self.recordCalibration(o, .attn_output, self.attn_out);
+                    try self.matVec(self.attn_tmp, o, self.attn_out);
+                }
             }
 
             if (self.gpu_session) |*gpu_session| {
@@ -1142,15 +1200,15 @@ fn adaptTensorDesc(tensor: TensorRef) gpu.TensorDesc {
 fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
-        .attn_q = adaptTensorDesc(layer.attn_q),
+        .attn_q = if (layer.attn_q) |q| adaptTensorDesc(q) else null,
         .attn_q_bias = if (layer.attn_q_bias) |b| adaptTensorDesc(b) else null,
         .attn_q_norm = if (layer.attn_q_norm) |n| adaptTensorDesc(n) else null,
-        .attn_k = adaptTensorDesc(layer.attn_k),
+        .attn_k = if (layer.attn_k) |k| adaptTensorDesc(k) else null,
         .attn_k_bias = if (layer.attn_k_bias) |b| adaptTensorDesc(b) else null,
         .attn_k_norm = if (layer.attn_k_norm) |n| adaptTensorDesc(n) else null,
-        .attn_v = adaptTensorDesc(layer.attn_v),
+        .attn_v = if (layer.attn_v) |v| adaptTensorDesc(v) else null,
         .attn_v_bias = if (layer.attn_v_bias) |b| adaptTensorDesc(b) else null,
-        .attn_output = adaptTensorDesc(layer.attn_output),
+        .attn_output = if (layer.attn_output) |o| adaptTensorDesc(o) else null,
         .ffn_norm = adaptTensorDesc(layer.ffn_norm),
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
         .ffn_down = adaptTensorDesc(layer.ffn_down),
@@ -1819,8 +1877,9 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_mistral = std.mem.startsWith(u8, architecture, "mistral");
     const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
     const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
-    if (!is_llama and !is_qwen and !is_mistral) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (is_qwen or is_mistral) .neox else .interleaved;
+    const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text");
+    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text) .neox else .interleaved;
 
     if (metadata.tokenizer_model) |tm| {
         if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
@@ -1860,25 +1919,68 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     };
     const output_norm = try takeTensor(allocator, &tensors, "output_norm.weight");
 
+    const partial_rotary_factor = metadata.partial_rotary_factor orelse 1.0;
+    const linear_num_key_heads = metadata.linear_num_key_heads orelse 16;
+    const linear_num_value_heads = metadata.linear_num_value_heads orelse 16;
+    const linear_key_head_dim = metadata.linear_key_head_dim orelse 128;
+    const linear_value_head_dim = metadata.linear_value_head_dim orelse 128;
+    const linear_conv_kernel_dim = metadata.linear_conv_kernel_dim orelse 4;
+
+    var layer_types: []LayerType = &.{};
+    defer if (layer_types.len > 0) allocator.free(layer_types);
+
+    if (is_qwen35_text and metadata.layer_types.items.len > 0) {
+        layer_types = try allocator.alloc(LayerType, metadata.layer_types.items.len);
+        for (metadata.layer_types.items, 0..) |lt, i| {
+            layer_types[i] = if (std.mem.eql(u8, lt, "linear_attention")) .linear_attention else .full_attention;
+        }
+    }
+
     const layers = try allocator.alloc(LayerRefs, block_count);
     errdefer allocator.free(layers);
     for (0..block_count) |index| {
-        layers[index] = .{
-            .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
-            .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
-            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
-            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
-            .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
-            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
-            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
-            .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
-            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
-            .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
-            .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
-            .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
-            .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
-            .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-        };
+        if (is_qwen35_text and layer_types.len > 0 and layer_types[index] == .linear_attention) {
+            layers[index] = .{
+                .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
+                .attn_q = null,
+                .attn_k = null,
+                .attn_v = null,
+                .attn_output = null,
+                .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
+                .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+                .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+                .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+                .linear_attn = .{
+                    .in_proj_qkv = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_qkv.weight"),
+                    .in_proj_z = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_z.weight"),
+                    .in_proj_b = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_b.weight"),
+                    .in_proj_a = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_a.weight"),
+                    .conv1d = try takeLayerTensor(allocator, &tensors, index, "linear_attn.conv1d.weight"),
+                    .dt_bias = try takeLayerTensor(allocator, &tensors, index, "linear_attn.dt_bias.weight"),
+                    .A_log = try takeLayerTensor(allocator, &tensors, index, "linear_attn.A_log.weight"),
+                    .norm_weight = try takeLayerTensor(allocator, &tensors, index, "linear_attn.norm.weight"),
+                    .out_proj = try takeLayerTensor(allocator, &tensors, index, "linear_attn.out_proj.weight"),
+                },
+            };
+        } else {
+            layers[index] = .{
+                .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
+                .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+                .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+                .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
+                .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+                .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+                .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
+                .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+                .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
+                .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
+                .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
+                .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+                .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+                .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+                .linear_attn = null,
+            };
+        }
     }
 
     const tokenizer = try buildTokenizer(allocator, &metadata);
@@ -1911,6 +2013,14 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .output = output,
         .output_norm = output_norm,
         .layers = layers,
+        .is_qwen35_text = is_qwen35_text,
+        .partial_rotary_factor = partial_rotary_factor,
+        .linear_num_key_heads = linear_num_key_heads,
+        .linear_num_value_heads = linear_num_value_heads,
+        .linear_key_head_dim = linear_key_head_dim,
+        .linear_value_head_dim = linear_value_head_dim,
+        .linear_conv_kernel_dim = linear_conv_kernel_dim,
+        .layer_types = layer_types,
     };
 }
 
@@ -2140,6 +2250,34 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.endsWith(u8, key, ".rope.freq_base")) {
         metadata.rope_freq_base = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "partial_rotary_factor")) {
+        metadata.partial_rotary_factor = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "linear_num_key_heads")) {
+        metadata.linear_num_key_heads = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "linear_num_value_heads")) {
+        metadata.linear_num_value_heads = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "linear_key_head_dim")) {
+        metadata.linear_key_head_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "linear_value_head_dim")) {
+        metadata.linear_value_head_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "linear_conv_kernel_dim")) {
+        metadata.linear_conv_kernel_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "layer_types")) {
+        try readStringArray(allocator, parser, value_type, &metadata.layer_types);
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.model")) {

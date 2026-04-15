@@ -11,6 +11,7 @@ const mistral_family = @import("families/mistral/mod.zig");
 const mistral3_family = @import("families/ministral3_2512/mod.zig");
 const gemma_family = @import("families/gemma/mod.zig");
 const qwen35_family = @import("families/qwen35/mod.zig");
+const qwen35_text_family = @import("families/qwen35_text/mod.zig");
 
 pub const primary_target = types.primary_target;
 pub const fallback_target = types.fallback_target;
@@ -41,6 +42,7 @@ fn getRegistry() *registry_mod.FamilyRegistry {
         reg.register(mistral3_family.FamilyHandler) catch unreachable;
         reg.register(gemma_family.FamilyHandler) catch unreachable;
         reg.register(qwen35_family.FamilyHandler) catch unreachable;
+        reg.register(qwen35_text_family.FamilyHandler) catch unreachable;
     }
     return reg;
 }
