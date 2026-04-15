@@ -4,3 +4,4 @@ zig-out/
 .DS_Store
 models
 AGENTS.md
+docs/experiments
