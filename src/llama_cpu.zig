@@ -553,6 +553,8 @@ pub const Model = struct {
     head_count: usize,
     head_count_kv: usize,
     head_dimension: usize,
+    q_projection_size: usize,
+    kv_projection_size: usize,
     kv_dimension: usize,
     rms_norm_eps: f32,
     rope_freq_base: f32,
@@ -674,10 +676,10 @@ const Session = struct {
             .token_buffer = try allocator.alloc(u32, token_capacity),
             .hidden = try allocator.alloc(f32, model.embedding_length),
             .normed = try allocator.alloc(f32, model.embedding_length),
-            .q = try allocator.alloc(f32, model.embedding_length),
-            .k = try allocator.alloc(f32, model.kv_dimension),
-            .v = try allocator.alloc(f32, model.kv_dimension),
-            .attn_out = try allocator.alloc(f32, model.embedding_length),
+            .q = try allocator.alloc(f32, model.q_projection_size),
+            .k = try allocator.alloc(f32, model.kv_projection_size),
+            .v = try allocator.alloc(f32, model.kv_projection_size),
+            .attn_out = try allocator.alloc(f32, model.q_projection_size),
             .attn_tmp = try allocator.alloc(f32, model.embedding_length),
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
@@ -928,17 +930,17 @@ const Session = struct {
 
                 try self.matVec(self.q, layer.attn_q, self.normed);
                 if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
-                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.head_dimension);
+                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.rope_dimension_count);
 
                 try self.matVec(self.k, layer.attn_k, self.normed);
                 if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
-                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.head_dimension);
+                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.rope_dimension_count);
 
                 try self.matVec(self.v, layer.attn_v, self.normed);
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
-                applyRoPE(self.q, self.model.head_count, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
-                applyRoPE(self.k, self.model.head_count_kv, self.model.head_dimension, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.q, self.model.head_count, self.model.rope_dimension_count, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.rope_dimension_count, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 try self.recordCalibration(layer.attn_output, .attn_output, self.attn_out);
@@ -998,7 +1000,7 @@ const Session = struct {
 
     fn computeAttention(self: *Session, layer_index: usize) void {
         @memset(self.attn_out, 0);
-        const head_dim = self.model.head_dimension;
+        const head_dim = self.model.rope_dimension_count;
         const kv_group_size = self.model.head_count / self.model.head_count_kv;
         const layer_base = layer_index * self.context_length * self.model.kv_dimension;
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -1879,7 +1881,10 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
 
     const tokenizer = try buildTokenizer(allocator, &metadata);
     const head_dimension = embedding_length / head_count;
-    const kv_dimension = head_dimension * head_count_kv;
+    const effective_rope_dim = @max(rope_dimension_count, head_dimension);
+    const q_projection_size = head_count * effective_rope_dim;
+    const kv_projection_size = head_count_kv * effective_rope_dim;
+    const kv_dimension = kv_projection_size;
 
     return .{
         .bytes = mapped_bytes,
@@ -1893,6 +1898,8 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .head_count = head_count,
         .head_count_kv = head_count_kv,
         .head_dimension = head_dimension,
+        .q_projection_size = q_projection_size,
+        .kv_projection_size = kv_projection_size,
         .kv_dimension = kv_dimension,
         .rms_norm_eps = rms_norm_eps,
         .rope_freq_base = rope_freq_base,

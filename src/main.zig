@@ -14,7 +14,7 @@ pub fn main() !void {
     const config = try cli.parseArgs(args);
 
     if (config.command != .help and config.command != .version and config.command != .update) {
-        update.checkForUpdates(allocator);
+        // update.checkForUpdates(allocator);
     }
 
     var stdout_buffer: [4096]u8 = undefined;
