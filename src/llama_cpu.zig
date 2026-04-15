@@ -1168,6 +1168,8 @@ fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDes
         .head_count = model.head_count,
         .head_count_kv = model.head_count_kv,
         .head_dimension = model.head_dimension,
+        .q_projection_size = model.q_projection_size,
+        .kv_projection_size = model.kv_projection_size,
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
         .vocab_size = model.tokenizer.tokens.len,

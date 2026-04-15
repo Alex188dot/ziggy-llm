@@ -55,6 +55,8 @@ pub const ModelDesc = struct {
     head_count: usize,
     head_count_kv: usize,
     head_dimension: usize,
+    q_projection_size: usize,
+    kv_projection_size: usize,
     kv_dimension: usize,
     rope_freq_base: f32,
     vocab_size: usize,
@@ -101,18 +103,18 @@ pub const Session = struct {
     ) !Session {
         const max_input = @max(model.embedding_length, model.feed_forward_length);
         const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.vocab_size));
-        const cache_len = model.block_count * model.context_length * model.kv_dimension;
+        const cache_len = model.block_count * model.context_length * model.kv_projection_size;
         const hidden = try metal_backend.createScratchBuffer(backend, max_input);
         errdefer metal_backend.destroyBuffer(hidden);
         const normed = try metal_backend.createScratchBuffer(backend, model.embedding_length);
         errdefer metal_backend.destroyBuffer(normed);
-        const q = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        const q = try metal_backend.createScratchBuffer(backend, model.q_projection_size);
         errdefer metal_backend.destroyBuffer(q);
-        const k = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        const k = try metal_backend.createScratchBuffer(backend, model.kv_projection_size);
         errdefer metal_backend.destroyBuffer(k);
-        const v = try metal_backend.createScratchBuffer(backend, model.kv_dimension);
+        const v = try metal_backend.createScratchBuffer(backend, model.kv_projection_size);
         errdefer metal_backend.destroyBuffer(v);
-        const attn = try metal_backend.createScratchBuffer(backend, model.embedding_length);
+        const attn = try metal_backend.createScratchBuffer(backend, model.q_projection_size);
         errdefer metal_backend.destroyBuffer(attn);
         const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
         errdefer metal_backend.destroyBuffer(gate);
@@ -193,14 +195,14 @@ pub const Session = struct {
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
         try self.runProjection(layer.attn_q, self.normed, self.q);
         if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
-        if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.head_dimension);
+        if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.rope_dimension_count);
 
         const q_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
             self.backend,
             self.q,
             self.model.head_count,
-            self.model.head_dimension,
+            self.model.rope_dimension_count,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
@@ -208,23 +210,23 @@ pub const Session = struct {
         );
         self.recordCategoryWithShape(.elementwise_ops, q_rope_start, .{
             .rows = self.model.head_count,
-            .cols = self.model.head_dimension,
+            .cols = self.model.rope_dimension_count,
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
 
-        const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-        const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+        const layer_base = layer_index * self.model.context_length * self.model.kv_projection_size;
+        const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
         const kv_k_start = std.time.nanoTimestamp();
         try self.runProjection(layer.attn_k, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
-        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.head_dimension);
+        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.rope_dimension_count);
         try metal_backend.applyRoPE(
             self.backend,
             self.k,
             self.model.head_count_kv,
-            self.model.head_dimension,
+            self.model.rope_dimension_count,
             self.model.rope_dimension_count,
             position,
             self.model.rope_freq_base,
@@ -235,17 +237,17 @@ pub const Session = struct {
             self.k,
             self.k_cache,
             kv_offset_elements,
-            self.model.kv_dimension,
+            self.model.kv_projection_size,
         );
         self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
-            .cols = self.model.head_dimension,
+            .cols = self.model.rope_dimension_count,
             .depth = self.model.rope_dimension_count,
             .extra = position + 1,
         });
         self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
             .rows = 1,
-            .cols = self.model.kv_dimension,
+            .cols = self.model.kv_projection_size,
             .depth = layer_index,
             .extra = position + 1,
         });
@@ -258,11 +260,11 @@ pub const Session = struct {
             self.v,
             self.v_cache,
             kv_offset_elements,
-            self.model.kv_dimension,
+            self.model.kv_projection_size,
         );
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
-            .cols = self.model.kv_dimension,
+            .cols = self.model.kv_projection_size,
             .depth = layer_index,
             .extra = position + 1,
         });
@@ -276,16 +278,16 @@ pub const Session = struct {
             self.attn,
             self.model.head_count,
             self.model.head_count_kv,
-            self.model.head_dimension,
-            self.model.kv_dimension,
+            self.model.rope_dimension_count,
+            self.model.kv_projection_size,
             self.model.context_length,
             position,
             layer_base,
-            @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
+            @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.rope_dimension_count))),
         );
         self.recordCategoryWithShape(.attention, attention_start, .{
             .rows = self.model.head_count,
-            .cols = self.model.head_dimension,
+            .cols = self.model.rope_dimension_count,
             .depth = position + 1,
             .extra = self.model.head_count_kv,
         });
@@ -723,22 +725,22 @@ pub const Session = struct {
                     self.backend,
                     self.q,
                     self.model.head_count,
-                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
                     self.model.rope_style,
                 );
 
-                const layer_base = layer_index * self.model.context_length * self.model.kv_dimension;
-                const kv_offset_elements = layer_base + position * self.model.kv_dimension;
+                const layer_base = layer_index * self.model.context_length * self.model.kv_projection_size;
+                const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
                 try self.runProjection(layer.attn_k, self.normed, self.k);
                 try metal_backend.applyRoPE(
                     self.backend,
                     self.k,
                     self.model.head_count_kv,
-                    self.model.head_dimension,
+                    self.model.rope_dimension_count,
                     self.model.rope_dimension_count,
                     position,
                     self.model.rope_freq_base,
@@ -749,7 +751,7 @@ pub const Session = struct {
                     self.k,
                     self.k_cache,
                     kv_offset_elements,
-                    self.model.kv_dimension,
+                    self.model.kv_projection_size,
                 );
 
                 try self.runProjection(layer.attn_v, self.normed, self.v);
@@ -758,7 +760,7 @@ pub const Session = struct {
                     self.v,
                     self.v_cache,
                     kv_offset_elements,
-                    self.model.kv_dimension,
+                    self.model.kv_projection_size,
                 );
 
                 try metal_backend.attentionFused(
@@ -769,12 +771,12 @@ pub const Session = struct {
                     self.attn,
                     self.model.head_count,
                     self.model.head_count_kv,
-                    self.model.head_dimension,
-                    self.model.kv_dimension,
+                    self.model.rope_dimension_count,
+                    self.model.kv_projection_size,
                     self.model.context_length,
                     position,
                     layer_base,
-                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.head_dimension))),
+                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.rope_dimension_count))),
                 );
 
                 try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
