@@ -700,6 +700,14 @@ const Session = struct {
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
+    linear_conv_state: []f32,
+    linear_recurrent_state: []f32,
+    linear_qkv: []f32,
+    linear_z: []f32,
+    linear_a: []f32,
+    linear_b: []f32,
+    linear_g: []f32,
+    linear_conv_tmp: []f32,
     moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
     position: usize = 0,
@@ -714,6 +722,14 @@ const Session = struct {
         profiler: ?*metal_profile.Profiler,
         moon_quant_calibrator: ?*moon_quant_calibration.Calibrator,
     ) !Session {
+        const linear_num_v_heads = model.linear_num_value_heads;
+        const linear_value_dim_per_head = model.linear_value_head_dim;
+        const linear_key_dim_per_head = model.linear_key_head_dim;
+        const conv_state_per_layer = linear_num_v_heads * linear_value_dim_per_head * model.linear_conv_kernel_dim;
+        const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
+        const linear_qkv_dim = 2 * model.linear_num_key_heads * linear_key_dim_per_head + linear_num_v_heads * linear_value_dim_per_head;
+        const linear_z_dim = linear_num_v_heads * linear_value_dim_per_head;
+
         var session = Session{
             .model = model,
             .context_length = context_length,
@@ -733,6 +749,14 @@ const Session = struct {
             .scores = try allocator.alloc(f32, context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
             .v_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
+            .linear_conv_state = try allocator.alloc(f32, model.block_count * conv_state_per_layer),
+            .linear_recurrent_state = try allocator.alloc(f32, model.block_count * recurrent_state_per_layer),
+            .linear_qkv = try allocator.alloc(f32, linear_qkv_dim),
+            .linear_z = try allocator.alloc(f32, linear_z_dim),
+            .linear_a = try allocator.alloc(f32, model.linear_num_key_heads),
+            .linear_b = try allocator.alloc(f32, model.linear_num_key_heads),
+            .linear_g = try allocator.alloc(f32, model.linear_num_key_heads),
+            .linear_conv_tmp = try allocator.alloc(f32, linear_z_dim),
             .moon_quant_calibrator = moon_quant_calibrator,
         };
         errdefer session.deinit(allocator);
@@ -775,6 +799,14 @@ const Session = struct {
         allocator.free(self.scores);
         allocator.free(self.k_cache);
         allocator.free(self.v_cache);
+        allocator.free(self.linear_conv_state);
+        allocator.free(self.linear_recurrent_state);
+        allocator.free(self.linear_qkv);
+        allocator.free(self.linear_z);
+        allocator.free(self.linear_a);
+        allocator.free(self.linear_b);
+        allocator.free(self.linear_g);
+        allocator.free(self.linear_conv_tmp);
         self.* = undefined;
     }
 
@@ -972,7 +1004,8 @@ const Session = struct {
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else if (is_linear_attn) {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
-                @memset(self.attn_tmp, 0);
+                try self.computeLinearAttention(layer_index, layer.linear_attn.?);
+                addInPlace(self.hidden, self.attn_tmp);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 if (layer.attn_q) |q| {
@@ -1095,6 +1128,126 @@ const Session = struct {
                 }
             }
         }
+    }
+
+    fn computeLinearAttention(self: *Session, layer_index: usize, linear_attn: LinearAttnTensors) !void {
+        const model = self.model;
+        const num_key_heads = model.linear_num_key_heads;
+        const num_value_heads = model.linear_num_value_heads;
+        const key_head_dim = model.linear_key_head_dim;
+        const value_head_dim = model.linear_value_head_dim;
+        const kernel_dim = model.linear_conv_kernel_dim;
+        const q_dim = num_key_heads * key_head_dim;
+        const v_dim = num_value_heads * value_head_dim;
+
+        const qkv_dim = q_dim + q_dim + v_dim;
+        const num_heads = num_key_heads;
+
+        try self.matVec(self.linear_qkv[0..qkv_dim], linear_attn.in_proj_qkv, self.normed);
+
+        const q_out = self.linear_qkv[0..q_dim];
+        const v_out = self.linear_qkv[q_dim + q_dim ..][0..v_dim];
+
+        try self.matVec(self.linear_z[0..v_dim], linear_attn.in_proj_z, self.normed);
+
+        try self.matVec(self.linear_a[0..num_heads], linear_attn.in_proj_a, q_out);
+
+        const dt_bias_bytes = try tensorBytes(model, linear_attn.dt_bias);
+        const a_log_bytes = try tensorBytes(model, linear_attn.A_log);
+
+        for (0..num_heads) |h| {
+            const a_val = self.linear_a[h];
+            const dt_bias_val = switch (linear_attn.dt_bias.tensor_type) {
+                .f32 => readF32(dt_bias_bytes[h * 4 ..][0..4]),
+                .f16 => readF16AsF32(dt_bias_bytes[h * 2 ..][0..2]),
+                else => return error.UnsupportedTensorType,
+            };
+            const a_log_val = switch (linear_attn.A_log.tensor_type) {
+                .f32 => readF32(a_log_bytes[h * 4 ..][0..4]),
+                .f16 => readF16AsF32(a_log_bytes[h * 2 ..][0..2]),
+                else => return error.UnsupportedTensorType,
+            };
+
+            const softplus_val = if (a_val + dt_bias_val > 20.0) a_val + dt_bias_val else std.math.log1p(@exp(a_val + dt_bias_val));
+            const g_val = -@exp(a_log_val) * softplus_val;
+            self.linear_g[h] = g_val;
+        }
+
+        const conv_state_per_layer = num_value_heads * value_head_dim * kernel_dim;
+        const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
+        const conv_state_base = layer_index * conv_state_per_layer;
+        const recurrent_state_base = layer_index * recurrent_state_per_layer;
+
+        const conv1d_bytes = try tensorBytes(model, linear_attn.conv1d);
+        const conv_out = self.linear_conv_tmp[0..v_dim];
+
+        @memset(conv_out, 0);
+
+        var head_idx: usize = 0;
+        while (head_idx < num_value_heads) : (head_idx += 1) {
+            const v_head_base = head_idx * value_head_dim;
+            const v_head = v_out[v_head_base..][0..value_head_dim];
+            const conv_head_base = head_idx * value_head_dim;
+            const conv_head_out = conv_out[conv_head_base..][0..value_head_dim];
+
+            var offset: usize = 0;
+            while (offset < value_head_dim) : (offset += 1) {
+                var kernel_idx: usize = 0;
+                while (kernel_idx < kernel_dim - 1) : (kernel_idx += 1) {
+                    const state_idx = kernel_idx * value_head_dim + offset;
+                    const state_offset = conv_state_base + head_idx * value_head_dim * kernel_dim + state_idx;
+                    const w_idx = kernel_idx * value_head_dim * value_head_dim + offset * value_head_dim + offset;
+                    const w_val = switch (linear_attn.conv1d.tensor_type) {
+                        .f32 => readF32(conv1d_bytes[w_idx * 4 ..][0..4]),
+                        .f16 => readF16AsF32(conv1d_bytes[w_idx * 2 ..][0..2]),
+                        else => return error.UnsupportedTensorType,
+                    };
+                    conv_head_out[offset] += self.linear_conv_state[state_offset] * w_val;
+                }
+
+                const w_idx = (kernel_dim - 1) * value_head_dim * value_head_dim + offset * value_head_dim + offset;
+                const w_val = switch (linear_attn.conv1d.tensor_type) {
+                    .f32 => readF32(conv1d_bytes[w_idx * 4 ..][0..4]),
+                    .f16 => readF16AsF32(conv1d_bytes[w_idx * 2 ..][0..2]),
+                    else => return error.UnsupportedTensorType,
+                };
+                conv_head_out[offset] += v_head[offset] * w_val;
+            }
+        }
+
+        var shift_offset: usize = 0;
+        while (shift_offset < value_head_dim * (kernel_dim - 1)) : (shift_offset += value_head_dim) {
+            const src_offset = conv_state_base + shift_offset;
+            const dst_offset = conv_state_base + value_head_dim + shift_offset;
+            @memcpy(self.linear_conv_state[dst_offset..][0..value_head_dim], self.linear_conv_state[src_offset..][0..value_head_dim]);
+        }
+        @memcpy(self.linear_conv_state[conv_state_base..][0..value_head_dim], v_out[0..v_dim]);
+
+        var g_idx: usize = 0;
+        while (g_idx < num_heads) : (g_idx += 1) {
+            const g_val = self.linear_g[g_idx];
+            const recurrent_offset = recurrent_state_base + g_idx * key_head_dim * value_head_dim;
+            const conv_head_offset = g_idx * value_head_dim;
+
+            var j: usize = 0;
+            while (j < key_head_dim * value_head_dim) : (j += 1) {
+                const conv_idx = conv_head_offset + j;
+                self.linear_recurrent_state[recurrent_offset + j] = g_val * self.linear_recurrent_state[recurrent_offset + j] + (1 - g_val) * conv_out[conv_idx];
+            }
+        }
+
+        const norm_bytes = try tensorBytes(model, linear_attn.norm_weight);
+        var norm_idx: usize = 0;
+        while (norm_idx < v_dim) : (norm_idx += 1) {
+            const norm_w = switch (linear_attn.norm_weight.tensor_type) {
+                .f32 => readF32(norm_bytes[norm_idx * 4 ..][0..4]),
+                .f16 => readF16AsF32(norm_bytes[norm_idx * 2 ..][0..2]),
+                else => return error.UnsupportedTensorType,
+            };
+            self.linear_z[norm_idx] *= norm_w;
+        }
+
+        try self.matVec(self.attn_tmp, linear_attn.out_proj, self.linear_z[0..v_dim]);
     }
 
     fn matVec(self: *Session, out: []f32, tensor: TensorRef, input: []const f32) !void {
