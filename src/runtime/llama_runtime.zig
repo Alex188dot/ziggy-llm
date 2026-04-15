@@ -1,8 +1,8 @@
 const std = @import("std");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_cpu = @import("../model/loader.zig");
 const backend_api = @import("backend.zig");
 const llama_fixture = @import("llama_fixture.zig");
-const llama_metal = @import("llama_metal.zig");
+const llama_metal = @import("gpu/metal/tensor_store.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
 

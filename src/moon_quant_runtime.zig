@@ -1,5 +1,5 @@
 const std = @import("std");
-const llama_cpu = @import("llama_cpu.zig");
+const llama_cpu = @import("model/loader.zig");
 const calibration = @import("moon_quant_calibration.zig");
 const llama_fixture = @import("runtime/llama_fixture.zig");
 

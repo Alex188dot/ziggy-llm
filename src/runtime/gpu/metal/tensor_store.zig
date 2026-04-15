@@ -1,10 +1,10 @@
 const std = @import("std");
-const backend_api = @import("backend.zig");
-const metal_backend = @import("metal_backend.zig");
-const types = @import("types.zig");
-const llama = @import("../llama_cpu.zig");
-const moon_quant = @import("../moon_quant.zig");
-const llama_fixture = @import("llama_fixture.zig");
+const backend_api = @import("../../backend.zig");
+const metal_backend = @import("../../metal_backend.zig");
+const types = @import("../../types.zig");
+const llama = @import("../../../model/loader.zig");
+const moon_quant = @import("../../../moon_quant.zig");
+const llama_fixture = @import("../../llama_fixture.zig");
 
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,

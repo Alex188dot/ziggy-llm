@@ -1,11 +1,11 @@
 const std = @import("std");
-const terminal = @import("terminal.zig");
-const backend_api = @import("runtime/backend.zig");
-const llama_gpu = @import("runtime/llama_gpu.zig");
-const metal_profile = @import("runtime/metal_profile.zig");
-const moon_quant_calibration = @import("moon_quant_calibration.zig");
-const runtime_types = @import("runtime/types.zig");
-const sampling = @import("sampling.zig");
+const terminal = @import("../terminal.zig");
+const backend_api = @import("../runtime/backend.zig");
+const gpu = @import("../runtime/gpu/session.zig");
+const metal_profile = @import("../runtime/metal_profile.zig");
+const moon_quant_calibration = @import("../moon_quant_calibration.zig");
+const runtime_types = @import("../runtime/types.zig");
+const sampling = @import("../sampling.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -636,7 +636,7 @@ const Session = struct {
     context_length: usize,
     backend: ?backend_api.MatVecBackend,
     dense_tensors: ?DenseTensorLookup,
-    gpu_session: ?llama_gpu.Session = null,
+    gpu_session: ?gpu.Session = null,
     token_buffer: []u32,
     hidden: []f32,
     normed: []f32,
@@ -649,7 +649,7 @@ const Session = struct {
     up: []f32,
     logits: []f32,
     pending_greedy_token: ?u32 = null,
-    pending_shortlist: [llama_gpu.max_shortlist_len]llama_gpu.ShortlistEntry = undefined,
+    pending_shortlist: [gpu.max_shortlist_len]gpu.ShortlistEntry = undefined,
     pending_shortlist_len: usize = 0,
     scores: []f32,
     k_cache: []f32,
@@ -694,7 +694,7 @@ const Session = struct {
         if (backend) |selected_backend| {
             if (selected_backend.label == .metal) {
                 const lookup = dense_tensors orelse return error.InvalidTensorMetadata;
-                session.gpu_session = try llama_gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
+                session.gpu_session = try gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
             }
         }
 
@@ -754,7 +754,7 @@ const Session = struct {
         }
     }
 
-    fn stepShortlist(self: *Session, token_id: u32, shortlist_len: usize) ![]const llama_gpu.ShortlistEntry {
+    fn stepShortlist(self: *Session, token_id: u32, shortlist_len: usize) ![]const gpu.ShortlistEntry {
         if (self.gpu_session == null) {
             _ = try self.step(token_id);
             self.pending_shortlist_len = 0;
@@ -864,19 +864,19 @@ const Session = struct {
         if (draft_tokens.len == 0) return 0;
 
         const gpu_session = &self.gpu_session.?;
-        var layers: [64]llama_gpu.LayerDesc = undefined;
+        var layers: [64]gpu.LayerDesc = undefined;
         for (self.model.layers, 0..) |layer, i| {
             layers[i] = adaptLayerDesc(layer);
         }
 
-        var all_drafts: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        var all_drafts: [gpu.max_draft_len + 1]u32 = undefined;
         all_drafts[0] = current_token;
         for (draft_tokens, 0..) |dt, i| {
             all_drafts[i + 1] = dt;
         }
         const batch_count = draft_tokens.len + 1;
 
-        var predicted: [llama_gpu.max_draft_len + 1]u32 = undefined;
+        var predicted: [gpu.max_draft_len + 1]u32 = undefined;
         const accepted_count = try gpu_session.runBatchSpeculativeDecode(
             layers[0..self.model.layers.len],
             all_drafts[0..batch_count],
@@ -1121,7 +1121,7 @@ const Session = struct {
     }
 };
 
-fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
+fn adaptDenseLookup(lookup: DenseTensorLookup) gpu.DenseLookup {
     return .{
         .ctx = lookup.ctx,
         .get_dense_fn = lookup.get_by_offset_fn,
@@ -1130,7 +1130,7 @@ fn adaptDenseLookup(lookup: DenseTensorLookup) llama_gpu.DenseLookup {
     };
 }
 
-fn adaptTensorDesc(tensor: TensorRef) llama_gpu.TensorDesc {
+fn adaptTensorDesc(tensor: TensorRef) gpu.TensorDesc {
     return .{
         .offset = tensor.offset,
         .rows = tensor.rowCount() catch unreachable,
@@ -1139,7 +1139,7 @@ fn adaptTensorDesc(tensor: TensorRef) llama_gpu.TensorDesc {
     };
 }
 
-fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
+fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
         .attn_q = adaptTensorDesc(layer.attn_q),
@@ -1158,7 +1158,7 @@ fn adaptLayerDesc(layer: LayerRefs) llama_gpu.LayerDesc {
     };
 }
 
-fn adaptModelDesc(model: *const Model, context_length: usize) llama_gpu.ModelDesc {
+fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
     return .{
         .embedding_length = model.embedding_length,
         .block_count = model.block_count,
@@ -1354,7 +1354,7 @@ pub fn generateLoadedStreaming(
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
     const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
-    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const prompt_begin = std.time.nanoTimestamp();
     const prompt_token_count = try model.tokenizer.encodeInto(allocator, prompt, session.token_buffer);
@@ -1375,7 +1375,7 @@ pub fn generateLoadedStreaming(
     var output = std.ArrayList(u8).empty;
     defer output.deinit(allocator);
     const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
-    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const candidate_capacity = if (shortlist_sampling) gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
     const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
@@ -1580,7 +1580,7 @@ pub fn generateLoadedStreamingCached(
     if (session.position < prompt_token_count) {
         const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
         const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
-        const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
+        const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
         if (sampling_path == .gpu_topk_sampler) {
             const remaining = prompt_tokens[session.position..prompt_token_count];
             if (remaining.len > 1) {
@@ -1600,7 +1600,7 @@ pub fn generateLoadedStreamingCached(
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
     const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_sampling = sampling_path == .gpu_shortlist_cpu_sampler;
-    const candidate_capacity = if (shortlist_sampling) llama_gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
+    const candidate_capacity = if (shortlist_sampling) gpu.max_shortlist_len else if (sampling_path == .cpu_logits) session.logits.len else 0;
     const sample_candidates = try allocator.alloc(sampling.SampleCandidate, candidate_capacity);
     defer allocator.free(sample_candidates);
     var generated_token_count: usize = 0;
@@ -1611,7 +1611,7 @@ pub fn generateLoadedStreamingCached(
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
-    const gpu_top_k = if (options.top_k == 0) @min(llama_gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
+    const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const max_draft_len = 3;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;

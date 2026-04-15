@@ -1,5 +1,5 @@
 const std = @import("std");
-const llama_gpu = @import("runtime/llama_gpu.zig");
+const llama_gpu = @import("runtime/gpu/session.zig");
 const runtime_types = @import("runtime/types.zig");
 
 pub const SampleCandidate = struct {

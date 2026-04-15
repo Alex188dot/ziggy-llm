@@ -1,5 +1,5 @@
 const std = @import("std");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_cpu = @import("../model/loader.zig");
 
 const rope_metaspace = "\xE2\x96\x81";
 const q4_k_block_values = 256;

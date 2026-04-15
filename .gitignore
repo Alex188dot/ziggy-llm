@@ -5,3 +5,4 @@ zig-out/
 models
 AGENTS.md
 docs/experiments
+docs/refactoring

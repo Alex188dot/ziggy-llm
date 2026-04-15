@@ -1,6 +1,6 @@
 const std = @import("std");
 const metal_backend = @import("metal_backend.zig");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_cpu = @import("../model/loader.zig");
 const moon_quant = @import("../moon_quant.zig");
 const llama_fixture = @import("llama_fixture.zig");
 

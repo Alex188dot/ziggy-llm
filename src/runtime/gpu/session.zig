@@ -1,7 +1,7 @@
 const std = @import("std");
-const backend_api = @import("backend.zig");
-const metal_backend = @import("metal_backend.zig");
-const metal_profile = @import("metal_profile.zig");
+const backend_api = @import("../backend.zig");
+const metal_backend = @import("../metal_backend.zig");
+const metal_profile = @import("../metal_profile.zig");
 
 pub const DenseLookup = struct {
     ctx: ?*const anyopaque,
