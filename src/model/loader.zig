@@ -1377,6 +1377,20 @@ fn adaptTensorDesc(tensor: TensorRef) gpu.TensorDesc {
     };
 }
 
+fn adaptLinearAttnDesc(linear_attn: LinearAttnTensors) gpu.LinearAttnDesc {
+    return .{
+        .in_proj_qkv = adaptTensorDesc(linear_attn.in_proj_qkv),
+        .in_proj_z = adaptTensorDesc(linear_attn.in_proj_z),
+        .in_proj_b = adaptTensorDesc(linear_attn.in_proj_b),
+        .in_proj_a = adaptTensorDesc(linear_attn.in_proj_a),
+        .conv1d = adaptTensorDesc(linear_attn.conv1d),
+        .dt_bias = adaptTensorDesc(linear_attn.dt_bias),
+        .A_log = adaptTensorDesc(linear_attn.A_log),
+        .norm_weight = adaptTensorDesc(linear_attn.norm_weight),
+        .out_proj = adaptTensorDesc(linear_attn.out_proj),
+    };
+}
+
 fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
@@ -1393,6 +1407,7 @@ fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
         .ffn_down = adaptTensorDesc(layer.ffn_down),
         .ffn_up = adaptTensorDesc(layer.ffn_up),
+        .linear_attn = if (layer.linear_attn) |la| adaptLinearAttnDesc(la) else null,
     };
 }
 
@@ -1414,6 +1429,11 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
         .rope_style = @intFromEnum(model.rope_style),
+        .linear_num_key_heads = model.linear_num_key_heads,
+        .linear_num_value_heads = model.linear_num_value_heads,
+        .linear_key_head_dim = model.linear_key_head_dim,
+        .linear_value_head_dim = model.linear_value_head_dim,
+        .linear_conv_kernel_dim = model.linear_conv_kernel_dim,
     };
 }
 

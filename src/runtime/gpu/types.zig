@@ -26,6 +26,18 @@ pub const TensorDesc = struct {
     tensor_type: u32,
 };
 
+pub const LinearAttnDesc = struct {
+    in_proj_qkv: TensorDesc,
+    in_proj_z: TensorDesc,
+    in_proj_b: TensorDesc,
+    in_proj_a: TensorDesc,
+    conv1d: TensorDesc,
+    dt_bias: TensorDesc,
+    A_log: TensorDesc,
+    norm_weight: TensorDesc,
+    out_proj: TensorDesc,
+};
+
 pub const LayerDesc = struct {
     attn_norm: TensorDesc,
     attn_q: ?TensorDesc = null,
@@ -41,6 +53,7 @@ pub const LayerDesc = struct {
     ffn_gate: TensorDesc,
     ffn_down: TensorDesc,
     ffn_up: TensorDesc,
+    linear_attn: ?LinearAttnDesc = null,
 };
 
 pub const ModelDesc = struct {
@@ -60,6 +73,11 @@ pub const ModelDesc = struct {
     rms_norm_eps: f32,
     token_embd_offset: u64,
     rope_style: u32,
+    linear_num_key_heads: u32 = 16,
+    linear_num_value_heads: u32 = 16,
+    linear_key_head_dim: u32 = 128,
+    linear_value_head_dim: u32 = 128,
+    linear_conv_kernel_dim: u32 = 4,
 };
 
 pub const ShortlistEntry = struct {

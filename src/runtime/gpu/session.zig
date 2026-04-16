@@ -7,6 +7,7 @@ const gpu_types = @import("types.zig");
 pub const DenseLookup = gpu_types.DenseLookup;
 pub const TensorDesc = gpu_types.TensorDesc;
 pub const LayerDesc = gpu_types.LayerDesc;
+pub const LinearAttnDesc = gpu_types.LinearAttnDesc;
 pub const ModelDesc = gpu_types.ModelDesc;
 pub const ShortlistEntry = gpu_types.ShortlistEntry;
 pub const max_shortlist_len = gpu_types.max_shortlist_len;
@@ -33,6 +34,14 @@ pub const Session = struct {
     batch_logits: metal_backend.BufferHandle,
     batch_tokens: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
+    linear_qkv: metal_backend.BufferHandle,
+    linear_z: metal_backend.BufferHandle,
+    linear_a: metal_backend.BufferHandle,
+    linear_b: metal_backend.BufferHandle,
+    linear_g: metal_backend.BufferHandle,
+    linear_conv_tmp: metal_backend.BufferHandle,
+    linear_conv_state: metal_backend.BufferHandle,
+    linear_recurrent_state: metal_backend.BufferHandle,
 
     pub fn init(
         backend: backend_api.MatVecBackend,
@@ -76,6 +85,31 @@ pub const Session = struct {
         const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(batch_tokens);
 
+        const linear_num_v_heads = model.linear_num_value_heads;
+        const linear_value_dim_per_head = model.linear_value_head_dim;
+        const linear_key_dim_per_head = model.linear_key_head_dim;
+        const conv_state_per_layer = linear_num_v_heads * linear_value_dim_per_head * model.linear_conv_kernel_dim;
+        const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
+        const linear_qkv_dim = 2 * model.linear_num_key_heads * linear_key_dim_per_head + linear_num_v_heads * linear_value_dim_per_head;
+        const linear_z_dim = linear_num_v_heads * linear_value_dim_per_head;
+
+        const linear_qkv = try metal_backend.createScratchBuffer(backend, linear_qkv_dim);
+        errdefer metal_backend.destroyBuffer(linear_qkv);
+        const linear_z = try metal_backend.createScratchBuffer(backend, linear_z_dim);
+        errdefer metal_backend.destroyBuffer(linear_z);
+        const linear_a = try metal_backend.createScratchBuffer(backend, model.linear_num_key_heads);
+        errdefer metal_backend.destroyBuffer(linear_a);
+        const linear_b = try metal_backend.createScratchBuffer(backend, model.linear_num_key_heads);
+        errdefer metal_backend.destroyBuffer(linear_b);
+        const linear_g = try metal_backend.createScratchBuffer(backend, model.linear_num_key_heads);
+        errdefer metal_backend.destroyBuffer(linear_g);
+        const linear_conv_tmp = try metal_backend.createScratchBuffer(backend, linear_z_dim);
+        errdefer metal_backend.destroyBuffer(linear_conv_tmp);
+        const linear_conv_state = try metal_backend.createScratchBuffer(backend, model.block_count * conv_state_per_layer);
+        errdefer metal_backend.destroyBuffer(linear_conv_state);
+        const linear_recurrent_state = try metal_backend.createScratchBuffer(backend, model.block_count * recurrent_state_per_layer);
+        errdefer metal_backend.destroyBuffer(linear_recurrent_state);
+
         return .{
             .backend = backend,
             .dense_lookup = dense_lookup,
@@ -97,6 +131,14 @@ pub const Session = struct {
             .batch_logits = batch_logits,
             .batch_tokens = batch_tokens,
             .profiler = profiler,
+            .linear_qkv = linear_qkv,
+            .linear_z = linear_z,
+            .linear_a = linear_a,
+            .linear_b = linear_b,
+            .linear_g = linear_g,
+            .linear_conv_tmp = linear_conv_tmp,
+            .linear_conv_state = linear_conv_state,
+            .linear_recurrent_state = linear_recurrent_state,
         };
     }
 
@@ -117,6 +159,15 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.v_cache);
         metal_backend.destroyBuffer(self.batch_logits);
         metal_backend.destroyBuffer(self.batch_tokens);
+        metal_backend.destroyBuffer(self.linear_qkv);
+        metal_backend.destroyBuffer(self.linear_z);
+        metal_backend.destroyBuffer(self.linear_a);
+        metal_backend.destroyBuffer(self.linear_b);
+        metal_backend.destroyBuffer(self.linear_g);
+        metal_backend.destroyBuffer(self.linear_conv_tmp);
+        metal_backend.destroyBuffer(self.linear_conv_state);
+        metal_backend.destroyBuffer(self.linear_recurrent_state);
+        metal_backend.destroyBuffer(self.batch_tokens);
         self.* = undefined;
     }
 
@@ -131,6 +182,10 @@ pub const Session = struct {
         layer_index: usize,
         position: usize,
     ) !void {
+        if (layer.linear_attn) |la| {
+            try self.runLinearAttention(layer, la, layer_index);
+            return;
+        }
         if (layer.attn_q == null) {
             return;
         }
@@ -593,6 +648,140 @@ pub const Session = struct {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
             }
         }
+    }
+
+    fn runLinearAttention(
+        self: *Session,
+        layer: LayerDesc,
+        la: gpu_types.LinearAttnDesc,
+        layer_index: usize,
+    ) !void {
+        const model = self.model;
+        const num_key_heads = model.linear_num_key_heads;
+        const num_value_heads = model.linear_num_value_heads;
+        const key_head_dim = model.linear_key_head_dim;
+        const value_head_dim = model.linear_value_head_dim;
+        const kernel_dim = model.linear_conv_kernel_dim;
+        const q_dim = num_key_heads * key_head_dim;
+        const v_dim = num_value_heads * value_head_dim;
+        const qkv_dim = q_dim + q_dim + v_dim;
+        const num_heads = num_key_heads;
+
+        const conv_state_per_layer = num_value_heads * value_head_dim * kernel_dim;
+        const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
+        const conv_state_base = layer_index * conv_state_per_layer;
+        const recurrent_state_base = layer_index * recurrent_state_per_layer;
+
+        var cpu_qkv: [4096]f32 = undefined;
+        var cpu_z: [4096]f32 = undefined;
+        var cpu_a: [256]f32 = undefined;
+        var cpu_g: [256]f32 = undefined;
+        var cpu_conv_tmp: [4096]f32 = undefined;
+        var cpu_conv_state: [4096]f32 = undefined;
+        var cpu_recurrent_state: [4096]f32 = undefined;
+
+        try metal_backend.readBufferF32(self.linear_qkv, cpu_qkv[0..qkv_dim]);
+        try metal_backend.readBufferF32(self.linear_z, cpu_z[0..v_dim]);
+        try metal_backend.readBufferF32(self.linear_conv_state, cpu_conv_state[0 .. model.block_count * conv_state_per_layer]);
+        try metal_backend.readBufferF32(self.linear_recurrent_state, cpu_recurrent_state[0 .. model.block_count * recurrent_state_per_layer]);
+
+        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+
+        try self.runProjection(la.in_proj_qkv, self.normed, self.linear_qkv);
+        try metal_backend.readBufferF32(self.linear_qkv, cpu_qkv[0..qkv_dim]);
+
+        try self.runProjectionToDst(la.in_proj_z, self.normed, self.linear_z, 0);
+        try metal_backend.readBufferF32(self.linear_z, cpu_z[0..v_dim]);
+
+        try self.runProjectionToDst(la.in_proj_a, self.linear_qkv, self.linear_a, 0);
+        try metal_backend.readBufferF32(self.linear_a, cpu_a[0..num_heads]);
+
+        var dt_bias_data: [256]f32 = undefined;
+        try self.readDenseTensor(la.dt_bias, dt_bias_data[0..num_heads]);
+        var a_log_data: [256]f32 = undefined;
+        try self.readDenseTensor(la.A_log, a_log_data[0..num_heads]);
+
+        var h: usize = 0;
+        while (h < num_heads) : (h += 1) {
+            const a_val = cpu_a[h];
+            const dt_bias_val = dt_bias_data[h];
+            const a_log_val = a_log_data[h];
+            const softplus_val = if (a_val + dt_bias_val > 20.0) a_val + dt_bias_val else std.math.log1p(@exp(a_val + dt_bias_val));
+            cpu_g[h] = -@exp(a_log_val) * softplus_val;
+        }
+
+        @memset(cpu_conv_tmp[0..v_dim], 0);
+
+        var head_idx: usize = 0;
+        while (head_idx < num_value_heads) : (head_idx += 1) {
+            const v_head_base = head_idx * value_head_dim;
+            const conv_head_base = head_idx * value_head_dim;
+            const conv_head_out = cpu_conv_tmp[conv_head_base..][0..value_head_dim];
+            const v_head = cpu_qkv[q_dim + q_dim + v_head_base ..][0..value_head_dim];
+
+            var offset: usize = 0;
+            while (offset < value_head_dim) : (offset += 1) {
+                var kernel_idx: usize = 0;
+                while (kernel_idx < kernel_dim - 1) : (kernel_idx += 1) {
+                    const state_idx = kernel_idx * value_head_dim + offset;
+                    const state_offset = conv_state_base + head_idx * value_head_dim * kernel_dim + state_idx;
+                    const w_idx = kernel_idx * value_head_dim * value_head_dim + offset * value_head_dim + offset;
+                    var w_val: f32 = undefined;
+                    try self.readScalarFromTensor(la.conv1d, w_idx, &w_val);
+                    const state_val = cpu_conv_state[state_offset];
+                    conv_head_out[offset] += state_val * w_val;
+                }
+
+                const w_idx = (kernel_dim - 1) * value_head_dim * value_head_dim + offset * value_head_dim + offset;
+                var w_val: f32 = undefined;
+                try self.readScalarFromTensor(la.conv1d, w_idx, &w_val);
+                conv_head_out[offset] += v_head[offset] * w_val;
+            }
+        }
+
+        var shift_offset: usize = 0;
+        while (shift_offset < value_head_dim * (kernel_dim - 1)) : (shift_offset += value_head_dim) {
+            const src_offset = conv_state_base + shift_offset;
+            const dst_offset = conv_state_base + value_head_dim + shift_offset;
+            @memcpy(cpu_conv_state[dst_offset..][0..value_head_dim], cpu_conv_state[src_offset..][0..value_head_dim]);
+        }
+        @memcpy(cpu_conv_state[conv_state_base..][0..value_head_dim], cpu_qkv[q_dim + q_dim ..][0..value_head_dim]);
+
+        var g_idx: usize = 0;
+        while (g_idx < num_heads) : (g_idx += 1) {
+            const g_val = cpu_g[g_idx];
+            const recurrent_offset = recurrent_state_base + g_idx * key_head_dim * value_head_dim;
+            const conv_head_offset = g_idx * value_head_dim;
+
+            var j: usize = 0;
+            while (j < key_head_dim * value_head_dim) : (j += 1) {
+                const conv_idx = conv_head_offset + j;
+                cpu_recurrent_state[recurrent_offset + j] = g_val * cpu_recurrent_state[recurrent_offset + j] + (1 - g_val) * cpu_conv_tmp[conv_idx];
+            }
+        }
+
+        var norm_weight_data: [4096]f32 = undefined;
+        try self.readDenseTensor(la.norm_weight, norm_weight_data[0..v_dim]);
+        var i: usize = 0;
+        while (i < v_dim) : (i += 1) {
+            cpu_z[i] *= norm_weight_data[i];
+        }
+
+        try metal_backend.writeBufferF32(self.linear_z, cpu_z[0..v_dim]);
+        try metal_backend.writeBufferF32(self.linear_conv_state, cpu_conv_state[0 .. model.block_count * conv_state_per_layer]);
+        try metal_backend.writeBufferF32(self.linear_recurrent_state, cpu_recurrent_state[0 .. model.block_count * recurrent_state_per_layer]);
+
+        try self.runProjectionAdd(la.out_proj, self.linear_z, self.hidden);
+    }
+
+    fn readDenseTensor(self: *Session, tensor: TensorDesc, out: []f32) !void {
+        const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        @memcpy(out, weights);
+    }
+
+    fn readScalarFromTensor(self: *Session, tensor: TensorDesc, index: usize, out: *f32) !void {
+        const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+        out.* = weights[index];
     }
 
     fn runBiasAdd(self: *Session, tensor: TensorDesc, target: metal_backend.BufferHandle) !void {
