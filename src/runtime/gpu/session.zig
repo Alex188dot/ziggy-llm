@@ -167,7 +167,6 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.linear_conv_tmp);
         metal_backend.destroyBuffer(self.linear_conv_state);
         metal_backend.destroyBuffer(self.linear_recurrent_state);
-        metal_backend.destroyBuffer(self.batch_tokens);
         self.* = undefined;
     }
 

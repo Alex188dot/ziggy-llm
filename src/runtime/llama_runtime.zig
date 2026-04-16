@@ -29,8 +29,6 @@ pub fn generate(
     const model_load_begin = std.time.nanoTimestamp();
     var model = try llama_cpu.loadModel(allocator, model_path);
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
-    defer model.deinit(allocator);
-
     var execution = try selectExecution(allocator, &model, options.backend, options.moon_quant, options.metal_profile);
     defer execution.deinit(allocator);
 
@@ -44,7 +42,6 @@ pub fn generate(
         }
     else
         null;
-
     var llama_report = try llama_cpu.generateLoaded(
         allocator,
         &model,

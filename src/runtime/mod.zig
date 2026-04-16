@@ -64,6 +64,8 @@ pub fn generate(
     std.debug.print("DEBUG: registry count={d}\n", .{reg.count});
 
     if (reg.getRuntime(family)) |runtime| {
+        std.debug.print("DEBUG: calling runtime.generate\n", .{});
+        std.debug.print("DEBUG: about to enter runtime.generate\n", .{});
         const family_options = families_mod.FamilyGenerateOptions{
             .max_tokens = options.max_tokens,
             .context_length = options.context_length,
