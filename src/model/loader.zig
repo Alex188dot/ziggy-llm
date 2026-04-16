@@ -118,13 +118,37 @@ const ValueType = enum(u32) {
 pub const TensorType = enum(u32) {
     f32 = 0,
     f16 = 1,
+    q4_0 = 2,
+    q4_1 = 3,
+    q5_0 = 6,
+    q5_1 = 7,
     q8_0 = 8,
+    q8_1 = 9,
+    q2_k = 10,
+    q3_k = 11,
     q4_k = 12,
+    q5_k = 13,
     q6_k = 14,
-    bf16 = 30,
+    q8_k = 15,
+    iq2_xxs = 16,
+    iq2_xs = 17,
+    iq3_xxs = 18,
+    iq1_s = 19,
+    iq4_nl = 20,
+    iq3_s = 21,
+    iq2_s = 22,
+    iq4_xs = 23,
     i8 = 24,
     i16 = 25,
     i32 = 26,
+    i64 = 27,
+    f64 = 28,
+    iq1_m = 29,
+    bf16 = 30,
+    tq1_0 = 34,
+    tq2_0 = 35,
+    mxfp4 = 39,
+    nvfp4 = 40,
 };
 
 pub const RopeStyle = enum(u32) {
@@ -1076,7 +1100,10 @@ const Session = struct {
                 .q8_0 => .q8_0,
                 .q4_k => .legacy_q4_k,
                 .q6_k => .legacy_q6_k,
-                .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
+                .q5_k => .q5_k_m,
+                .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+                .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
+                .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
             },
             .values = input,
         });
@@ -2030,7 +2057,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_mistral = std.mem.startsWith(u8, architecture, "mistral");
     const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
     const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
-    const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text");
+    const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
     if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text) return error.UnsupportedArchitecture;
     const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text) .neox else .interleaved;
 
@@ -2092,48 +2119,23 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const layers = try allocator.alloc(LayerRefs, block_count);
     errdefer allocator.free(layers);
     for (0..block_count) |index| {
-        if (is_qwen35_text and layer_types.len > 0 and layer_types[index] == .linear_attention) {
-            layers[index] = .{
-                .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
-                .attn_q = null,
-                .attn_k = null,
-                .attn_v = null,
-                .attn_output = null,
-                .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
-                .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
-                .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
-                .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-                .linear_attn = .{
-                    .in_proj_qkv = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_qkv.weight"),
-                    .in_proj_z = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_z.weight"),
-                    .in_proj_b = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_b.weight"),
-                    .in_proj_a = try takeLayerTensor(allocator, &tensors, index, "linear_attn.in_proj_a.weight"),
-                    .conv1d = try takeLayerTensor(allocator, &tensors, index, "linear_attn.conv1d.weight"),
-                    .dt_bias = try takeLayerTensor(allocator, &tensors, index, "linear_attn.dt_bias.weight"),
-                    .A_log = try takeLayerTensor(allocator, &tensors, index, "linear_attn.A_log.weight"),
-                    .norm_weight = try takeLayerTensor(allocator, &tensors, index, "linear_attn.norm.weight"),
-                    .out_proj = try takeLayerTensor(allocator, &tensors, index, "linear_attn.out_proj.weight"),
-                },
-            };
-        } else {
-            layers[index] = .{
-                .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
-                .attn_q = try takeLayerTensor(allocator, &tensors, index, "attn_q.weight"),
-                .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
-                .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
-                .attn_k = try takeLayerTensor(allocator, &tensors, index, "attn_k.weight"),
-                .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
-                .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
-                .attn_v = try takeLayerTensor(allocator, &tensors, index, "attn_v.weight"),
-                .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
-                .attn_output = try takeLayerTensor(allocator, &tensors, index, "attn_output.weight"),
-                .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
-                .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
-                .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
-                .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-                .linear_attn = null,
-            };
-        }
+        layers[index] = .{
+            .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
+            .attn_q = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
+            .attn_k = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
+            .attn_v = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
+            .attn_output = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_output.weight"),
+            .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
+            .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+            .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+            .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+            .linear_attn = null,
+        };
     }
 
     const tokenizer = try buildTokenizer(allocator, &metadata);
@@ -2560,19 +2562,57 @@ pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
     return switch (tensor_type) {
         .f32 => try std.math.mul(usize, row_len, 4),
         .f16 => try std.math.mul(usize, row_len, 2),
-        .q4_k => blk: {
-            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
-            break :blk try std.math.mul(usize, row_len / 256, 144);
+        .q4_0 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 36);
+        },
+        .q4_1 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 50);
+        },
+        .q5_0 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 44);
+        },
+        .q5_1 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 58);
         },
         .q8_0 => blk: {
             if (row_len % 32 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 32, 34);
         },
+        .q8_1 => blk: {
+            if (row_len % 32 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 32, 66);
+        },
+        .q2_k => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 80);
+        },
+        .q3_k => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 110);
+        },
+        .q4_k => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 144);
+        },
+        .q5_k => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 176);
+        },
         .q6_k => blk: {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 210);
         },
-        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
+        .q8_k => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 256);
+        },
+        .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
+        .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
 }
 
@@ -2623,7 +2663,24 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
         .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
         .q6_k => try dequantizeRowQ6K(out, row, row_len),
-        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
+        .q5_k => try dequantizeRowQ5K(out, row, row_len),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
+        .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
+    }
+}
+
+fn dequantizeRowQ5K(out: []f32, row: []const u8, row_len: usize) !void {
+    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    var out_offset: usize = 0;
+    var block_index: usize = 0;
+    while (block_index < row.len) : (block_index += 176) {
+        const block = row[block_index .. block_index + 176];
+        const d = readF16AsF32(block[0..2]);
+        for (0..32) |index| {
+            out[out_offset + index] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index]))));
+        }
+        out_offset += 32;
     }
 }
 
@@ -2634,8 +2691,27 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
         .q8_0 => try dotQ8_0Row(row, row_len, input),
         .q4_k => try dotQ4KRow(row, row_len, input),
         .q6_k => try dotQ6KRow(row, row_len, input),
-        .bf16, .i8, .i16, .i32 => return error.UnsupportedTensorType,
+        .q5_k => try dotQ5KRow(row, row_len, input),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
+        .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
+}
+
+fn dotQ5KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
+    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    var sum: f32 = 0;
+    var input_offset: usize = 0;
+    var block_index: usize = 0;
+    while (block_index < row.len) : (block_index += 176) {
+        const block = row[block_index .. block_index + 176];
+        const d = readF16AsF32(block[0..2]);
+        for (0..32) |index| {
+            sum = @mulAdd(f32, d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))), input[input_offset + index], sum);
+        }
+        input_offset += 32;
+    }
+    return sum;
 }
 
 fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, input: []const f32) f32 {
@@ -2645,7 +2721,10 @@ fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, i
         .q8_0 => dotQ8_0Row(row, row_len, input) catch unreachable,
         .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
         .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
-        .bf16, .i8, .i16, .i32 => unreachable,
+        .q5_k => dotQ5KRow(row, row_len, input) catch unreachable,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => unreachable,
+        .i8, .i16, .i32, .i64, .f64, .bf16 => unreachable,
+        .tq1_0, .tq2_0, .mxfp4, .nvfp4 => unreachable,
     };
 }
 

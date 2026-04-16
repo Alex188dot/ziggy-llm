@@ -140,6 +140,9 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.startsWith(u8, architecture, "qwen2_moe") or std.mem.startsWith(u8, architecture, "qwen3_moe")) {
         return .qwen35;
     }
+    if (std.mem.eql(u8, architecture, "qwen35")) {
+        return .qwen35_text;
+    }
     if (std.mem.eql(u8, architecture, "qwen3_5_text")) {
         return .qwen35_text;
     }
@@ -171,6 +174,7 @@ test "detectModelFamily recognizes qwen35 moe variants" {
 
 test "detectModelFamily recognizes qwen35_text dense variant" {
     try std.testing.expectEqual(ModelFamily.qwen35_text, detectModelFamily("qwen3_5_text"));
+    try std.testing.expectEqual(ModelFamily.qwen35_text, detectModelFamily("qwen35"));
 }
 
 test "detectModelFamily recognizes mistral" {
