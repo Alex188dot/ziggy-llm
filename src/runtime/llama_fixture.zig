@@ -20,6 +20,7 @@ const token_scores = [_]f32{ 0, 0, 0, 1, 1, 1, 1, -10, -10, -10, -10, -10, -10, 
 const token_types = [_]u32{ 2, 3, 3, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6, 6 };
 
 pub const FixtureOptions = struct {
+    architecture: []const u8 = "llama",
     embedding_length: usize = vocab.len,
     feed_forward_length: usize = 4,
     projection_type: llama_cpu.TensorType = .f16,
@@ -137,7 +138,7 @@ pub fn makeLlamaModelFixtureWithOptions(allocator: std.mem.Allocator, options: F
     writeInt(&list, u64, 21);
 
     writeStringKv(&list, "general.type", "model");
-    writeStringKv(&list, "general.architecture", "llama");
+    writeStringKv(&list, "general.architecture", options.architecture);
     writeU32Kv(&list, "general.alignment", 32);
     writeStringKv(&list, "tokenizer.ggml.model", "llama");
     writeStringArrayKv(&list, "tokenizer.ggml.tokens", &vocab);

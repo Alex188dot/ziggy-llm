@@ -4,8 +4,8 @@ const moon_quant = @import("../moon_quant.zig");
 pub const primary_target = "Apple Silicon + Metal";
 pub const fallback_target = "Apple Silicon CPU";
 pub const native_architecture = "llama";
-pub const supported_architecture = "llama, qwen2 (native CPU + Metal)";
-pub const supported_model_family = "llama and qwen2 family GGUF models through the native CPU or Metal runtime";
+pub const supported_architecture = "llama, qwen2, qwen3, qwen3.5 (native CPU + Metal)";
+pub const supported_model_family = "llama and qwen family GGUF models (including qwen3.5 variants) through the native CPU or Metal runtime";
 pub const supported_quantization = moon_quant.supported_quantization;
 pub const default_context_length: usize = 8192;
 

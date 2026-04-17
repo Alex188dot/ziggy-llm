@@ -130,11 +130,17 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.eql(u8, architecture, "llama")) {
         return .llama;
     }
+    if (std.mem.startsWith(u8, architecture, "qwen2_moe") or
+        std.mem.startsWith(u8, architecture, "qwen3_moe") or
+        std.mem.startsWith(u8, architecture, "qwen3.5_moe") or
+        std.mem.startsWith(u8, architecture, "qwen35_moe") or
+        std.mem.eql(u8, architecture, "qwen3.5") or
+        std.mem.eql(u8, architecture, "qwen35"))
+    {
+        return .qwen35;
+    }
     if (std.mem.eql(u8, architecture, "qwen2") or std.mem.eql(u8, architecture, "qwen3")) {
         return .qwen;
-    }
-    if (std.mem.startsWith(u8, architecture, "qwen2_moe") or std.mem.startsWith(u8, architecture, "qwen3_moe")) {
-        return .qwen35;
     }
     if (std.mem.eql(u8, architecture, "mistral")) {
         return .mistral;
@@ -154,9 +160,13 @@ test "detectModelFamily recognizes qwen2 and qwen3" {
     try std.testing.expectEqual(ModelFamily.qwen, detectModelFamily("qwen3"));
 }
 
-test "detectModelFamily recognizes qwen35 moe variants" {
+test "detectModelFamily recognizes qwen35 variants" {
     try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen2_moe"));
     try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen3_moe"));
+    try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen3.5_moe"));
+    try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen35_moe"));
+    try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen3.5"));
+    try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen35"));
 }
 
 test "detectModelFamily recognizes mistral" {
