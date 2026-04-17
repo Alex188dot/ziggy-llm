@@ -256,6 +256,7 @@ Goal: Implement mistral family with CPU + Metal support.
 Definition of done for Phase 4:
 
 - [x] Mistral family module created under `src/runtime/families/mistral/`
+- [x] Mistral architecture documentation created in `docs/family-split/mistral/`
 - [ ] Sliding Window Attention works on both backends (future work)
 - [ ] Mixtral MoE support initiated (future work)
 
@@ -292,6 +293,7 @@ Goal: Implement gemma family with CPU + Metal support.
 Definition of done for Phase 5:
 
 - [x] Gemma family module created under `src/runtime/families/gemma/`
+- [x] Gemma architecture documentation created in `docs/family-split/gemma/`
 - [ ] Gemma tokenizer properly handled (future work)
 - [ ] Both backends functional (future work)
 

@@ -14,7 +14,7 @@ pub fn main() !void {
     const config = try cli.parseArgs(args);
 
     if (config.command != .help and config.command != .version and config.command != .update) {
-        update.checkForUpdates(allocator);
+        // update.checkForUpdates(allocator);
     }
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -28,7 +28,7 @@ test {
     std.testing.refAllDecls(@import("commands.zig"));
     std.testing.refAllDecls(@import("runtime.zig"));
     std.testing.refAllDecls(@import("runtime/metal_backend_test.zig"));
-    std.testing.refAllDecls(@import("llama_cpu.zig"));
+    std.testing.refAllDecls(@import("model/loader.zig"));
     std.testing.refAllDecls(@import("gguf.zig"));
     std.testing.refAllDecls(@import("moon_quant.zig"));
     std.testing.refAllDecls(@import("moon_quant_calibration.zig"));

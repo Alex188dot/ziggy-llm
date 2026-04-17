@@ -9,7 +9,9 @@ pub const ModelFamily = union(enum) {
     llama,
     qwen,
     qwen35,
+    qwen35_text,
     mistral,
+    mistral3_2512,
     gemma,
     custom: []const u8,
 
@@ -18,7 +20,9 @@ pub const ModelFamily = union(enum) {
             .llama => "llama",
             .qwen => "qwen",
             .qwen35 => "qwen35",
+            .qwen35_text => "qwen35_text",
             .mistral => "mistral",
+            .mistral3_2512 => "ministral3_2512",
             .gemma => "gemma",
             .custom => |s| s,
         };
@@ -136,7 +140,16 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.startsWith(u8, architecture, "qwen2_moe") or std.mem.startsWith(u8, architecture, "qwen3_moe")) {
         return .qwen35;
     }
-    if (std.mem.eql(u8, architecture, "mistral")) {
+    if (std.mem.eql(u8, architecture, "qwen35")) {
+        return .qwen35_text;
+    }
+    if (std.mem.eql(u8, architecture, "qwen3_5_text")) {
+        return .qwen35_text;
+    }
+    if (std.mem.eql(u8, architecture, "mistral3") or std.mem.eql(u8, architecture, "ministral3")) {
+        return .mistral3_2512;
+    }
+    if (std.mem.startsWith(u8, architecture, "mistral")) {
         return .mistral;
     }
     if (std.mem.eql(u8, architecture, "gemma")) {
@@ -159,8 +172,18 @@ test "detectModelFamily recognizes qwen35 moe variants" {
     try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen3_moe"));
 }
 
+test "detectModelFamily recognizes qwen35_text dense variant" {
+    try std.testing.expectEqual(ModelFamily.qwen35_text, detectModelFamily("qwen3_5_text"));
+    try std.testing.expectEqual(ModelFamily.qwen35_text, detectModelFamily("qwen35"));
+}
+
 test "detectModelFamily recognizes mistral" {
     try std.testing.expectEqual(ModelFamily.mistral, detectModelFamily("mistral"));
+}
+
+test "detectModelFamily recognizes mistral3_2512" {
+    try std.testing.expectEqual(ModelFamily.mistral3_2512, detectModelFamily("mistral3"));
+    try std.testing.expectEqual(ModelFamily.mistral3_2512, detectModelFamily("ministral3"));
 }
 
 test "detectModelFamily recognizes gemma" {

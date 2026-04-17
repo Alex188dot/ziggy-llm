@@ -1,5 +1,5 @@
 const std = @import("std");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_cpu = @import("../model/loader.zig");
 
 const rope_metaspace = "\xE2\x96\x81";
 const q4_k_block_values = 256;
@@ -242,6 +242,10 @@ fn writeTensorData(list: *std.ArrayList(u8), tensor_type: llama_cpu.TensorType, 
         .q8_0 => try writeTensorDataQ8_0(list, values, row_len),
         .q4_k => try writeTensorDataQ4K(list, values, row_len),
         .q6_k => try writeTensorDataQ6K(list, values, row_len),
+        .q5_k => return error.UnsupportedTensorType,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
+        .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     }
 }
 

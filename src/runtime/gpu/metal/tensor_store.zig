@@ -1,10 +1,10 @@
 const std = @import("std");
-const backend_api = @import("backend.zig");
-const metal_backend = @import("metal_backend.zig");
-const types = @import("types.zig");
-const llama = @import("../llama_cpu.zig");
-const moon_quant = @import("../moon_quant.zig");
-const llama_fixture = @import("llama_fixture.zig");
+const backend_api = @import("../../backend.zig");
+const metal_backend = @import("../../metal_backend.zig");
+const types = @import("../../types.zig");
+const llama = @import("../../../model/loader.zig");
+const moon_quant = @import("../../../moon_quant.zig");
+const llama_fixture = @import("../../llama_fixture.zig");
 
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,
@@ -45,19 +45,30 @@ pub const DenseTensorStore = struct {
         try self.addTensor(model, model.output_norm, moon_quant_mode, profiler);
         for (model.layers) |layer| {
             try self.addTensor(model, layer.attn_norm, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.attn_q, moon_quant_mode, profiler);
+            if (layer.attn_q) |q| try self.addTensor(model, q, moon_quant_mode, profiler);
             if (layer.attn_q_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
             if (layer.attn_q_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.attn_k, moon_quant_mode, profiler);
+            if (layer.attn_k) |k| try self.addTensor(model, k, moon_quant_mode, profiler);
             if (layer.attn_k_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
             if (layer.attn_k_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.attn_v, moon_quant_mode, profiler);
+            if (layer.attn_v) |v| try self.addTensor(model, v, moon_quant_mode, profiler);
             if (layer.attn_v_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.attn_output, moon_quant_mode, profiler);
+            if (layer.attn_output) |o| try self.addTensor(model, o, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_norm, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_down, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_up, moon_quant_mode, profiler);
+            if (layer.linear_attn) |la| {
+                try self.addTensor(model, la.in_proj_qkv, moon_quant_mode, profiler);
+                try self.addTensor(model, la.in_proj_z, moon_quant_mode, profiler);
+                try self.addTensor(model, la.in_proj_b, moon_quant_mode, profiler);
+                try self.addTensor(model, la.in_proj_a, moon_quant_mode, profiler);
+                try self.addTensor(model, la.conv1d, moon_quant_mode, profiler);
+                try self.addTensor(model, la.dt_bias, moon_quant_mode, profiler);
+                try self.addTensor(model, la.A_log, moon_quant_mode, profiler);
+                try self.addTensor(model, la.norm_weight, moon_quant_mode, profiler);
+                try self.addTensor(model, la.out_proj, moon_quant_mode, profiler);
+            }
         }
     }
 

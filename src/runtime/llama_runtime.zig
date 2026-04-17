@@ -1,8 +1,8 @@
 const std = @import("std");
-const llama_cpu = @import("../llama_cpu.zig");
+const llama_cpu = @import("../model/loader.zig");
 const backend_api = @import("backend.zig");
 const llama_fixture = @import("llama_fixture.zig");
-const llama_metal = @import("llama_metal.zig");
+const llama_metal = @import("gpu/metal/tensor_store.zig");
 const metal_backend = @import("metal_backend.zig");
 const types = @import("types.zig");
 
@@ -29,8 +29,6 @@ pub fn generate(
     const model_load_begin = std.time.nanoTimestamp();
     var model = try llama_cpu.loadModel(allocator, model_path);
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
-    defer model.deinit(allocator);
-
     var execution = try selectExecution(allocator, &model, options.backend, options.moon_quant, options.metal_profile);
     defer execution.deinit(allocator);
 
@@ -44,7 +42,6 @@ pub fn generate(
         }
     else
         null;
-
     var llama_report = try llama_cpu.generateLoaded(
         allocator,
         &model,

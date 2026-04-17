@@ -163,9 +163,11 @@ pub fn inspectFile(allocator: std.mem.Allocator, model_path: []const u8) !Inspec
     const metadata_count = readInt(&reader, u64) catch return error.TruncatedFile;
 
     var state = ParseState{};
+    var unknown_key_count: u64 = 0;
     var kv_index: u64 = 0;
     while (kv_index < metadata_count) : (kv_index += 1) {
-        try parseMetadataEntry(allocator, &reader, &state);
+        const result = try parseMetadataEntry(allocator, &reader, &state);
+        if (result == .unknown) unknown_key_count += 1;
     }
 
     if (state.artifact_type) |artifact_type| {
@@ -302,6 +304,7 @@ const ParseState = struct {
     add_eos_token: ?bool = null,
     tensor_type_counts: [ggml_type_count]u64 = [_]u64{0} ** ggml_type_count,
     max_tensor_extent: u64 = 0,
+    verbosity: ?u32 = null,
 };
 
 const TensorInfo = struct {
@@ -316,73 +319,74 @@ fn parseMetadataEntry(
     allocator: std.mem.Allocator,
     reader: anytype,
     state: *ParseState,
-) !void {
+) !enum { known, unknown } {
     const key = try readOwnedString(allocator, reader);
     const raw_value_type = readInt(reader, u32) catch return error.TruncatedFile;
     const value_type = std.meta.intToEnum(ValueType, raw_value_type) catch return error.InvalidMetadataType;
 
     if (std.mem.eql(u8, key, "general.type")) {
         state.artifact_type = try readExpectedString(allocator, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "general.architecture")) {
         state.architecture = try readExpectedString(allocator, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "general.alignment")) {
         state.alignment = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "general.quantization_version")) {
         state.quantization_version = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "general.file_type")) {
         state.file_type = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.model")) {
         state.tokenizer_model = try readExpectedString(allocator, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.pre")) {
         state.tokenizer_pre = try readExpectedString(allocator, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.tokens")) {
         state.tokenizer_tokens = try readStringArrayCount(reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.chat_template")) {
         state.chat_template = try readExpectedString(allocator, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.bos_token_id")) {
         state.bos_token_id = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.eos_token_id")) {
         state.eos_token_id = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.unknown_token_id")) {
         state.unk_token_id = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.padding_token_id")) {
         state.pad_token_id = try readExpectedUnsigned(u32, reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.add_bos_token")) {
         state.add_bos_token = try readExpectedBool(reader, value_type);
-        return;
+        return .known;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.add_eos_token")) {
         state.add_eos_token = try readExpectedBool(reader, value_type);
-        return;
+        return .known;
     }
 
     try skipValue(reader, value_type);
+    return .unknown;
 }
 
 fn parseTensorInfo(
