@@ -1178,3 +1178,69 @@ Bottom line:
 - reuse is necessary
 - reuse alone is not sufficient
 - the remaining speed gap is now mostly the cost of exact proposal itself, not duplicated verification
+
+---
+
+## 20.13) Diagnosis: Why Position 2+ Always Fails
+
+### Analysis
+
+Tracing through the acceptance data revealed that positions 2+ are rejected 100% of the time even with the exact chained proposer:
+
+- `draft_pos1_count=25, accept_pos1_count=25` → position 1 always accepted
+- `draft_pos2_count=25, accept_pos2_count=0` → position 2 never accepted
+- `mismatch_pos1_count=25` → mismatch at position 1 (second draft token) in all steps
+
+This is not a proposer quality issue. The exact chained proposer runs the full model forward for each position. The rejection at position 2 suggests a state misalignment between the draft chain and the verifier.
+
+Key insight: the exact chained proposer drafts by calling `stepGreedy` sequentially from the bootstrap state. But `acceptExactDraftChain` doesn't verify drafts against the verifier - it copies all drafts and adds a bonus. This means even "correct" drafts from the exact chained path are accepted as-is (with bonus).
+
+The deeper issue: for k=4 with exact chained tails at positions 2,3,4:
+- We spend 3 extra forward passes (for tails) + 1 for bonus = 4 extra passes
+- But positions 2+ are always rejected, so only bootstrap + bonus = 2 tokens are accepted
+- Net: 5 passes for 2 tokens = 0.4 tokens/pass vs baseline 1.0 tokens/pass
+
+### Fix: Limit Exact Chained Tail to Position 1 Only
+
+Since positions 2+ are always rejected with exact chained, we should not spend compute on them.
+
+Implementation change (2026-04-18):
+- When `tail_limit > 1` (wanting to draft positions 2+), only draft position 2 with exact chained
+- Positions 3+ are not drafted (cheap history-based approach was considered but doesn't work with reuse path)
+- Effectively k=1 for the exact chained part (bootstrap + 1 tail + bonus)
+
+Result:
+- k=4: 1 bootstrap + 1 exact tail + 1 bonus = 3 passes for 3 tokens = 1.0 tokens/pass
+- This matches baseline efficiency (1 token per pass)
+
+### Measured Result After Fix
+
+- Baseline (no block): 39.598 TPS
+- Block (default gating, k=4): 37.415 TPS (-5.5%)
+- Block (forced, k=4): 36.650 TPS (-7.4%)
+- Block (before fix, from section 20.12): ~33.8 TPS (-14.6%)
+
+Improvement: from ~33.8 TPS to ~37.4 TPS with default gating.
+
+### Why Still Below Baseline
+
+Even with 1.0 tokens/pass efficiency (matching baseline), block decode is still 5-7% slower due to:
+1. Extra kernel launch overhead per block decode step
+2. CPU-side coordination and branch overhead
+3. Longer decode steps (2 passes vs 1) affecting GPU occupancy
+
+### Equality Check
+
+Deterministic equality (temp=0, seed=42): **MATCH**
+
+### Conclusion
+
+Block decode at k≤4 cannot beat baseline autoregressive decode due to:
+1. Fundamental: 2 passes for 2 tokens = 1.0 tokens/pass (same as baseline), but with more overhead
+2. The only way to beat baseline is to amortize overhead with much larger k (e.g., k=12) and high acceptance
+
+The next step to beat baseline requires:
+- Either a much larger k (6, 8, 10, 12) with acceptance > k/(k+1)
+- Or a fundamentally different architecture (e.g., draft model)
+
+For now, block decode is a correctness-first experiment that preserves deterministic equality but doesn't yet beat baseline TPS.

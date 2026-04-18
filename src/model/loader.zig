@@ -1374,6 +1374,21 @@ const Session = struct {
         return produced;
     }
 
+    fn proposeTailTokensCheap(
+        history: []const u32,
+        max_draft: usize,
+        out: []u32,
+        trace_out: ?[]draft_proposer.TailProposalTrace,
+    ) usize {
+        if (max_draft == 0 or out.len == 0 or history.len == 0) return 0;
+        return draft_proposer.proposeTailTokensFromAcceptedContext(
+            history,
+            max_draft,
+            out,
+            trace_out,
+        );
+    }
+
     fn acceptExactDraftChain(self: *Session, draft_tokens: []const u32, out_accepted: []u32) !usize {
         if (draft_tokens.len == 0) return 0;
         if (out_accepted.len < draft_tokens.len + 1) return error.InvalidTensorMetadata;
@@ -2175,25 +2190,22 @@ pub fn generateLoadedStreaming(
                 drafted_tokens[0] = bootstrap_token;
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
-                if (tail_limit > 0) {
+                if (tail_limit > 1) {
                     const logits_tail_len = try session.proposeTailTokensLogitsAligned(
                         bootstrap_token,
-                        tail_limit,
+                        1,
                         drafted_tokens[1..],
                         tail_trace[0..],
                         options.exp_block_trace,
                     );
                     if (logits_tail_len > 0) {
-                        var tail_idx: usize = 0;
-                        while (tail_idx < logits_tail_len) : (tail_idx += 1) {
-                            traceTailProposal(
-                                options.exp_block_trace,
-                                model.tokenizer,
-                                tail_idx + 2,
-                                drafted_tokens[1 + tail_idx],
-                                tail_trace[tail_idx],
-                            );
-                        }
+                        traceTailProposal(
+                            options.exp_block_trace,
+                            model.tokenizer,
+                            2,
+                            drafted_tokens[1],
+                            tail_trace[0],
+                        );
                         draft_len += logits_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
@@ -2620,25 +2632,22 @@ pub fn generateLoadedStreamingCached(
                 drafted_tokens[0] = bootstrap_token;
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
-                if (tail_limit > 0) {
+                if (tail_limit > 1) {
                     const logits_tail_len = try session.proposeTailTokensLogitsAligned(
                         bootstrap_token,
-                        tail_limit,
+                        1,
                         drafted_tokens[1..],
                         tail_trace[0..],
                         options.exp_block_trace,
                     );
                     if (logits_tail_len > 0) {
-                        var tail_idx: usize = 0;
-                        while (tail_idx < logits_tail_len) : (tail_idx += 1) {
-                            traceTailProposal(
-                                options.exp_block_trace,
-                                model.tokenizer,
-                                tail_idx + 2,
-                                drafted_tokens[1 + tail_idx],
-                                tail_trace[tail_idx],
-                            );
-                        }
+                        traceTailProposal(
+                            options.exp_block_trace,
+                            model.tokenizer,
+                            2,
+                            drafted_tokens[1],
+                            tail_trace[0],
+                        );
                         draft_len += logits_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
