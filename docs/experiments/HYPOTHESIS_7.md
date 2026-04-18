@@ -1082,3 +1082,99 @@ Conclusion:
   - GPU-side proposal/verifier reuse
   - verifier-side batching that avoids recomputing proposal work
   - or a separate cheaper draft model
+
+### 20.11) Implementation Plan: Reuse First, Then Cheaper Signal
+
+Goal:
+
+- remove duplicated exact compute from the logits-aligned chained drafting experiment
+- preserve the proof that model-state-aligned token 2+ drafting yields high acceptance
+- establish a reusable fast path that later cheaper proposers can plug into
+
+Plan:
+
+1. Reuse exact chained proposal state directly:
+   - when token 2+ is drafted by exact chained `stepGreedy` calls, do not roll that state back
+   - consume the final drafted token with one additional exact greedy step to produce the verifier-equivalent bonus token
+   - treat the drafted prefix as already verified, because it came from the exact verifier model itself
+
+2. Keep block accounting identical:
+   - preserve `accepted_prefix_len`, per-position draft/accept counts, and trace output
+   - keep output semantics identical to the current verifier path
+   - record this as a proposal-state reuse path, not a separate sampling mode
+
+3. Benchmark the reuse-only version:
+   - compare against the current duplicated exact-chain experiment
+   - compare against baseline autoregressive greedy decode
+   - check whether removing duplicate verification work recovers most of the lost TPS
+
+4. Only then tackle the cheap-signal half:
+   - once reuse works end-to-end, replace exact chained tail steps with a cheaper proposer that can feed the same reused / batched acceptance path
+   - candidates remain: shortlist-driven token 2, reduced draft path, or separate draft model
+
+Expected outcome:
+
+- acceptance should remain very high
+- TPS should improve materially versus the duplicated exact-chain experiment
+- it still may not beat baseline, because proposal still performs exact per-token forward work
+- this is the required foundation before attempting a truly cheaper proposer
+
+### 20.12) Reuse-Only Follow-Up Result
+
+Implemented the first half of the plan from section 20.11:
+
+- exact logits-aligned chained drafts are no longer rolled back and re-verified
+- the proposal state is reused directly
+- one final exact greedy step on the last drafted token produces the verifier-equivalent bonus token
+- accepted-prefix accounting and trace output are preserved
+
+What this means:
+
+- the proposal path is still exact and still expensive
+- but the duplicate verifier pass has been removed
+- this isolates the value of proposal-state reuse before introducing a genuinely cheaper signal
+
+Canonical traced run result after reuse:
+
+- `tps: 18.237`
+- `block.accepted_prefix_len: 1.870`
+- `block.rollback_count: 0`
+- `block.draft_pos2_count: 12`
+- `block.accept_pos2_count: 12`
+- `block.draft_pos3_count: 4`
+- `block.accept_pos3_count: 4`
+- `block.draft_pos4_count: 4`
+- `block.accept_pos4_count: 4`
+
+Canonical forced bench result after reuse (`k=4`, `confidence_margin=0`, warm avg):
+
+- `warm.tps_avg=33.809`
+- `warm.block.accepted_prefix_len_avg=2.639`
+- `warm.block.rollback_count_avg=0`
+- `warm.block.draft_pos2_count_avg=25`
+- `warm.block.accept_pos2_count_avg=25`
+- `warm.block.draft_pos3_count_avg=17`
+- `warm.block.accept_pos3_count_avg=17`
+- `warm.block.draft_pos4_count_avg=17`
+- `warm.block.accept_pos4_count_avg=17`
+
+Interpretation:
+
+- reuse works
+- removing the duplicate verifier pass recovers a large fraction of the lost throughput
+- warm TPS improved materially versus the duplicated exact-chain experiment (`21.848 -> 33.809`)
+- acceptance remains very strong and rollbacks remain zero
+
+But the experiment still does not beat baseline greedy decode:
+
+- proposal still performs exact per-token forward work
+- so the current path is now "exact grouped decode with reuse", not a truly cheaper speculative path
+- the next required step remains the same:
+  - keep the reuse path
+  - replace the exact chained token-2+ proposer with a cheaper signal source that can feed the same acceptance path
+
+Bottom line:
+
+- reuse is necessary
+- reuse alone is not sufficient
+- the remaining speed gap is now mostly the cost of exact proposal itself, not duplicated verification

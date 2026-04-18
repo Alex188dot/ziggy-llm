@@ -1332,20 +1332,6 @@ const Session = struct {
         if (!self.supportsLogitsAlignedChaining()) return 0;
 
         const draft_cap = @min(max_draft, out.len);
-        const base_position = self.position;
-        const base_pending_greedy = self.pending_greedy_token;
-        const base_pending_shortlist_len = self.pending_shortlist_len;
-        const base_pending_shortlist = self.pending_shortlist;
-
-        try self.gpu_session.?.backupKvSlots(base_position, draft_cap);
-        defer self.gpu_session.?.restoreKvSlots(base_position, draft_cap) catch {};
-        defer {
-            self.position = base_position;
-            self.pending_greedy_token = base_pending_greedy;
-            self.pending_shortlist_len = base_pending_shortlist_len;
-            self.pending_shortlist = base_pending_shortlist;
-        }
-
         var next_input = current_token;
         var produced: usize = 0;
         while (produced < draft_cap) {
@@ -1386,6 +1372,16 @@ const Session = struct {
         }
 
         return produced;
+    }
+
+    fn acceptExactDraftChain(self: *Session, draft_tokens: []const u32, out_accepted: []u32) !usize {
+        if (draft_tokens.len == 0) return 0;
+        if (out_accepted.len < draft_tokens.len + 1) return error.InvalidTensorMetadata;
+
+        @memcpy(out_accepted[0..draft_tokens.len], draft_tokens);
+        const bonus_token = try self.stepGreedy(draft_tokens[draft_tokens.len - 1]);
+        out_accepted[draft_tokens.len] = bonus_token;
+        return draft_tokens.len + 1;
     }
 
     fn step(self: *Session, token_id: u32) ![]const f32 {
@@ -2073,10 +2069,10 @@ pub fn generateLoadedStreaming(
     var block_acceptance_window_cursor: usize = 0;
     var block_spec_disable_remaining: usize = 0;
     var block_verify_ns_total: u64 = 0;
-    var block_gpu_backup_ns_total: u64 = 0;
-    var block_gpu_restore_ns_total: u64 = 0;
-    var block_gpu_sequence_commits_total: usize = 0;
-    var block_gpu_fallback_count_total: usize = 0;
+    const block_gpu_backup_ns_total: u64 = 0;
+    const block_gpu_restore_ns_total: u64 = 0;
+    const block_gpu_sequence_commits_total: usize = 0;
+    const block_gpu_fallback_count_total: usize = 0;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -2128,9 +2124,6 @@ pub fn generateLoadedStreaming(
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             if (exp_block_enabled) {
-                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
-                const verify_begin = std.time.nanoTimestamp();
-                var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
                 const exp_block_cap: usize = @min(gpu.max_draft_len, options.exp_block_k);
                 const bootstrap_token = try session.stepGreedy(next_token);
@@ -2213,28 +2206,15 @@ pub fn generateLoadedStreaming(
                 var accepted_count: usize = 1;
                 const precheck_attempted = false;
                 const precheck_failed = false;
-                accepted_tokens[0] = bootstrap_token;
-                if (draft_tokens.len == 1) {
-                    accepted_tokens[1] = try session.stepGreedy(bootstrap_token);
-                    accepted_count = 2;
-                } else {
-                    const tail_draft = draft_tokens[1..];
-                    var tail_count: usize = if (use_gpu_block)
-                        session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
-                    else
-                        try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                    if (tail_count == 0) {
-                        tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                    }
-                    accepted_count = tail_count + 1;
-                }
+                const reuse_begin = std.time.nanoTimestamp();
+                accepted_count = try session.acceptExactDraftChain(draft_tokens, accepted_tokens[0..]);
                 if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
                     return error.InvalidTensorMetadata;
                 }
                 if (session.position != position_before_verify + accepted_count) {
                     return error.InvalidTensorMetadata;
                 }
-                const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
+                const verify_elapsed = deltaNs(reuse_begin, std.time.nanoTimestamp());
                 const accepted_prefix_len = accepted_count - 1;
                 const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
                 const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
@@ -2285,12 +2265,6 @@ pub fn generateLoadedStreaming(
                         block_spec_disable_remaining = options.exp_block_disable_steps;
                         block_decode_quality_gate_trigger_count += 1;
                     }
-                }
-                if (use_gpu_block) {
-                    block_gpu_backup_ns_total += batch_stats.backup_ns;
-                    block_gpu_restore_ns_total += batch_stats.restore_ns;
-                    block_gpu_sequence_commits_total += batch_stats.sequence_commits;
-                    if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
                 traceBlockAttempt(
                     options.exp_block_trace,
@@ -2540,10 +2514,10 @@ pub fn generateLoadedStreamingCached(
     var block_acceptance_window_cursor: usize = 0;
     var block_spec_disable_remaining: usize = 0;
     var block_verify_ns_total: u64 = 0;
-    var block_gpu_backup_ns_total: u64 = 0;
-    var block_gpu_restore_ns_total: u64 = 0;
-    var block_gpu_sequence_commits_total: usize = 0;
-    var block_gpu_fallback_count_total: usize = 0;
+    const block_gpu_backup_ns_total: u64 = 0;
+    const block_gpu_restore_ns_total: u64 = 0;
+    const block_gpu_sequence_commits_total: usize = 0;
+    const block_gpu_fallback_count_total: usize = 0;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -2595,9 +2569,6 @@ pub fn generateLoadedStreamingCached(
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             if (exp_block_enabled) {
-                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
-                const verify_begin = std.time.nanoTimestamp();
-                var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
                 const exp_block_cap: usize = @min(gpu.max_draft_len, options.exp_block_k);
                 const bootstrap_token = try session.stepGreedy(next_token);
@@ -2680,28 +2651,15 @@ pub fn generateLoadedStreamingCached(
                 var accepted_count: usize = 1;
                 const precheck_attempted = false;
                 const precheck_failed = false;
-                accepted_tokens[0] = bootstrap_token;
-                if (draft_tokens.len == 1) {
-                    accepted_tokens[1] = try session.stepGreedy(bootstrap_token);
-                    accepted_count = 2;
-                } else {
-                    const tail_draft = draft_tokens[1..];
-                    var tail_count: usize = if (use_gpu_block)
-                        session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
-                    else
-                        try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                    if (tail_count == 0) {
-                        tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                    }
-                    accepted_count = tail_count + 1;
-                }
+                const reuse_begin = std.time.nanoTimestamp();
+                accepted_count = try session.acceptExactDraftChain(draft_tokens, accepted_tokens[0..]);
                 if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
                     return error.InvalidTensorMetadata;
                 }
                 if (session.position != position_before_verify + accepted_count) {
                     return error.InvalidTensorMetadata;
                 }
-                const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
+                const verify_elapsed = deltaNs(reuse_begin, std.time.nanoTimestamp());
                 const accepted_prefix_len = accepted_count - 1;
                 const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
                 const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
@@ -2752,12 +2710,6 @@ pub fn generateLoadedStreamingCached(
                         block_spec_disable_remaining = options.exp_block_disable_steps;
                         block_decode_quality_gate_trigger_count += 1;
                     }
-                }
-                if (use_gpu_block) {
-                    block_gpu_backup_ns_total += batch_stats.backup_ns;
-                    block_gpu_restore_ns_total += batch_stats.restore_ns;
-                    block_gpu_sequence_commits_total += batch_stats.sequence_commits;
-                    if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
                 traceBlockAttempt(
                     options.exp_block_trace,
