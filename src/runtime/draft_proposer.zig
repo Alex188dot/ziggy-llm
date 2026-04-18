@@ -130,6 +130,26 @@ pub fn proposeDraftTokensFromShortlistDetailed(
     return result;
 }
 
+pub fn proposeDraftTokensFromHistoryChain(
+    current_token: u32,
+    history: []const u32,
+    max_draft: usize,
+    out: []u32,
+) usize {
+    if (max_draft == 0 or out.len == 0 or history.len == 0) return 0;
+
+    const draft_cap = @min(max_draft, out.len);
+    var produced: usize = 0;
+
+    while (produced < draft_cap) : (produced += 1) {
+        const prefix = out[0..produced];
+        const next = mostFrequentHistoryContinuation(current_token, prefix, history) orelse break;
+        out[produced] = next;
+    }
+
+    return produced;
+}
+
 pub fn proposeDraftTokensDetailed(
     current_token: u32,
     history: []const u32,
@@ -616,6 +636,55 @@ fn shortlistLogitOf(token_id: u32, shortlist: []const gpu.ShortlistEntry) f32 {
     return -std.math.inf(f32);
 }
 
+fn mostFrequentHistoryContinuation(current_token: u32, drafted_prefix: []const u32, history: []const u32) ?u32 {
+    var candidate_ids: [max_candidates]u32 = undefined;
+    var candidate_counts: [max_candidates]u16 = undefined;
+    var candidate_len: usize = 0;
+
+    if (history.len <= drafted_prefix.len + 1) return null;
+
+    var i: usize = 0;
+    while (i + drafted_prefix.len + 1 < history.len) : (i += 1) {
+        if (history[i] != current_token) continue;
+
+        var matches = true;
+        var j: usize = 0;
+        while (j < drafted_prefix.len) : (j += 1) {
+            if (history[i + 1 + j] != drafted_prefix[j]) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches) continue;
+
+        const next = history[i + 1 + drafted_prefix.len];
+        var slot: usize = 0;
+        while (slot < candidate_len and candidate_ids[slot] != next) : (slot += 1) {}
+        if (slot < candidate_len) {
+            candidate_counts[slot] +|= 1;
+            continue;
+        }
+        if (candidate_len >= max_candidates) continue;
+        candidate_ids[candidate_len] = next;
+        candidate_counts[candidate_len] = 1;
+        candidate_len += 1;
+    }
+
+    if (candidate_len == 0) return null;
+
+    var best_idx: usize = 0;
+    var k: usize = 1;
+    while (k < candidate_len) : (k += 1) {
+        if (candidate_counts[k] > candidate_counts[best_idx] or
+            (candidate_counts[k] == candidate_counts[best_idx] and candidate_ids[k] < candidate_ids[best_idx]))
+        {
+            best_idx = k;
+        }
+    }
+
+    return candidate_ids[best_idx];
+}
+
 fn buildTopShortlist(logits: []const f32, out: []u32) usize {
     if (logits.len == 0 or out.len == 0) return 0;
 
@@ -709,4 +778,14 @@ test "flat logits guard rejects draft step" {
     });
     try std.testing.expect(res.first_token_guard_reject);
     try std.testing.expectEqual(@as(usize, 0), res.drafted_len);
+}
+
+test "history chain proposer follows repeated continuation" {
+    const history = [_]u32{ 10, 20, 30, 40, 10, 20, 30, 50, 10, 20, 30, 40 };
+    var out: [3]u32 = undefined;
+    const drafted = proposeDraftTokensFromHistoryChain(10, &history, 3, &out);
+    try std.testing.expectEqual(@as(usize, 3), drafted);
+    try std.testing.expectEqual(@as(u32, 20), out[0]);
+    try std.testing.expectEqual(@as(u32, 30), out[1]);
+    try std.testing.expectEqual(@as(u32, 40), out[2]);
 }

@@ -801,3 +801,18 @@ Conclusion: primary bottleneck is proposer token ranking/selection quality, not 
   - current tail proposer often only contributes one exact token plus a verifier bonus, which is not enough amortization
 
 Interpretation: the major correctness/selection bug is fixed. The next optimization target is no longer "why is position-0 wrong?" but "how do we raise accepted tail length above 1 without reintroducing mismatch churn?"
+
+### 18.4) Tail Stop Guard + Human Trace
+
+- [x] Trace token text is now human-readable:
+  - block traces print decoded token text (`" is"`, `" for"`, `" an"`) instead of raw tokenizer internals like `Ġis`.
+- [x] Tail proposer no longer forces stale token-2 guesses when there is no continuation evidence:
+  - if history-chain evidence for token 2+ is absent, block drafting stops at length 1 for that step
+  - verifier bonus still appends the exact next token
+- [x] Measured effect on canonical forced run:
+  - repeated bad tails like `"for" -> "for"` are removed
+  - `accepted_prefix_len` improved slightly above `1.0`
+  - rollback count dropped further
+  - TPS improved versus the previous post-shortlist-bootstrap state, though still below baseline
+
+Interpretation: stale/fake tail speculation is now suppressed. The remaining path to a real speedup is stronger token-2+ proposal quality, not more permissive drafting.

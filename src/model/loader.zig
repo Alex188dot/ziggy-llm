@@ -214,9 +214,11 @@ fn traceBlockProposals(
     var i: usize = 0;
     while (i < draft_tokens.len) : (i += 1) {
         const proposed = draft_tokens[i];
-        const proposed_piece: []const u8 = if (proposed < tokenizer.tokens.len) tokenizer.tokens[proposed] else "<oov>";
+        var proposed_buf: [64]u8 = undefined;
+        const proposed_piece = tokenTracePiece(tokenizer, proposed, &proposed_buf);
         if (i < accepted_prefix_len) {
-            const verified_piece: []const u8 = if (accepted_tokens[i] < tokenizer.tokens.len) tokenizer.tokens[accepted_tokens[i]] else "<oov>";
+            var verified_buf: [64]u8 = undefined;
+            const verified_piece = tokenTracePiece(tokenizer, accepted_tokens[i], &verified_buf);
             std.debug.print(
                 "BLOCK_PROPOSAL step={d} idx={d} proposed={d} proposed_piece=\"{s}\" verified={d} verified_piece=\"{s}\" decision=ACCEPT reason=prefix_match\n",
                 .{ step, i, proposed, proposed_piece, accepted_tokens[i], verified_piece },
@@ -225,7 +227,8 @@ fn traceBlockProposals(
         }
 
         if (i == accepted_prefix_len and accepted_prefix_len < draft_tokens.len and i < accepted_tokens.len) {
-            const verified_piece: []const u8 = if (accepted_tokens[i] < tokenizer.tokens.len) tokenizer.tokens[accepted_tokens[i]] else "<oov>";
+            var verified_buf: [64]u8 = undefined;
+            const verified_piece = tokenTracePiece(tokenizer, accepted_tokens[i], &verified_buf);
             const reason: []const u8 = if (i == 0 and precheck_attempted and precheck_failed) "precheck_mismatch" else "verify_mismatch";
             std.debug.print(
                 "BLOCK_PROPOSAL step={d} idx={d} proposed={d} proposed_piece=\"{s}\" verified={d} verified_piece=\"{s}\" decision=DISCARD reason={s}\n",
@@ -242,12 +245,62 @@ fn traceBlockProposals(
 
     if (accepted_tokens.len > draft_tokens.len) {
         const bonus = accepted_tokens[draft_tokens.len];
-        const bonus_piece: []const u8 = if (bonus < tokenizer.tokens.len) tokenizer.tokens[bonus] else "<oov>";
+        var bonus_buf: [64]u8 = undefined;
+        const bonus_piece = tokenTracePiece(tokenizer, bonus, &bonus_buf);
         std.debug.print(
             "BLOCK_PROPOSAL step={d} bonus_token={d} bonus_piece=\"{s}\" decision=APPEND reason=verified_next\n",
             .{ step, bonus, bonus_piece },
         );
     }
+}
+
+fn tokenTracePiece(tokenizer: Tokenizer, token_id: u32, out: []u8) []const u8 {
+    if (out.len == 0) return "";
+    if (token_id >= tokenizer.tokens.len) return "<oov>";
+
+    var pos: usize = 0;
+    switch (tokenizer.mode) {
+        .score_dp => {
+            const token = tokenizer.tokens[token_id];
+            var index: usize = 0;
+            while (index < token.len and pos < out.len) {
+                if (index + rope_metaspace.len <= token.len and std.mem.eql(u8, token[index .. index + rope_metaspace.len], rope_metaspace)) {
+                    out[pos] = ' ';
+                    pos += 1;
+                    index += rope_metaspace.len;
+                } else {
+                    const ch = token[index];
+                    out[pos] = switch (ch) {
+                        '\n' => ' ',
+                        '\r' => ' ',
+                        '\t' => ' ',
+                        else => ch,
+                    };
+                    pos += 1;
+                    index += 1;
+                }
+            }
+        },
+        .gpt2_bpe => {
+            const token = tokenizer.tokens[token_id];
+            var view = std.unicode.Utf8View.init(token) catch return "<bad-utf8>";
+            var it = view.iterator();
+            while (it.nextCodepoint()) |codepoint| {
+                if (pos >= out.len) break;
+                const byte = gpt2DecodeByte(codepoint) orelse continue;
+                out[pos] = switch (byte) {
+                    '\n' => ' ',
+                    '\r' => ' ',
+                    '\t' => ' ',
+                    else => byte,
+                };
+                pos += 1;
+            }
+        },
+    }
+
+    if (pos == 0) return "";
+    return std.mem.trimRight(u8, out[0..pos], " ");
 }
 
 fn shortlistTop1Top2Margin(shortlist: []const gpu.ShortlistEntry) f32 {
@@ -1991,29 +2044,19 @@ pub fn generateLoadedStreaming(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail = session.findDraftTokens(bootstrap_token, tail_limit);
-                    if (history_tail.len > 0) {
-                        @memcpy(drafted_tokens[1 .. 1 + history_tail.len], history_tail);
-                        draft_len += history_tail.len;
-                    } else {
-                        const proposer_shortlist = session.pending_shortlist[0..session.pending_shortlist_len];
-                        if (proposer_shortlist.len > 0) {
-                            const propose_result = draft_proposer.proposeDraftTokensFromShortlistDetailed(
-                                bootstrap_token,
-                                session.token_buffer[0..session.position],
-                                proposer_shortlist,
-                                options.repeat_penalty,
-                                tail_limit,
-                                drafted_tokens[1..],
-                                .{
-                                    .trace = options.exp_block_trace,
-                                },
-                            );
-                            if (propose_result.first_token_guard_reject) {
-                                block_decode_confidence_gated += 1;
-                            }
-                            draft_len += propose_result.drafted_len;
-                        }
+                    const history_tail_len = draft_proposer.proposeDraftTokensFromHistoryChain(
+                        bootstrap_token,
+                        session.token_buffer[0..session.position],
+                        tail_limit,
+                        drafted_tokens[1..],
+                    );
+                    if (history_tail_len > 0) {
+                        draft_len += history_tail_len;
+                    } else if (options.exp_block_trace) {
+                        std.debug.print(
+                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_history_tail_evidence bootstrap_token={d}\n",
+                            .{bootstrap_token},
+                        );
                     }
                 }
                 const draft_tokens = drafted_tokens[0..draft_len];
@@ -2428,29 +2471,19 @@ pub fn generateLoadedStreamingCached(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail = session.findDraftTokens(bootstrap_token, tail_limit);
-                    if (history_tail.len > 0) {
-                        @memcpy(drafted_tokens[1 .. 1 + history_tail.len], history_tail);
-                        draft_len += history_tail.len;
-                    } else {
-                        const proposer_shortlist = session.pending_shortlist[0..session.pending_shortlist_len];
-                        if (proposer_shortlist.len > 0) {
-                            const propose_result = draft_proposer.proposeDraftTokensFromShortlistDetailed(
-                                bootstrap_token,
-                                session.token_buffer[0..session.position],
-                                proposer_shortlist,
-                                options.repeat_penalty,
-                                tail_limit,
-                                drafted_tokens[1..],
-                                .{
-                                    .trace = options.exp_block_trace,
-                                },
-                            );
-                            if (propose_result.first_token_guard_reject) {
-                                block_decode_confidence_gated += 1;
-                            }
-                            draft_len += propose_result.drafted_len;
-                        }
+                    const history_tail_len = draft_proposer.proposeDraftTokensFromHistoryChain(
+                        bootstrap_token,
+                        session.token_buffer[0..session.position],
+                        tail_limit,
+                        drafted_tokens[1..],
+                    );
+                    if (history_tail_len > 0) {
+                        draft_len += history_tail_len;
+                    } else if (options.exp_block_trace) {
+                        std.debug.print(
+                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_history_tail_evidence bootstrap_token={d}\n",
+                            .{bootstrap_token},
+                        );
                     }
                 }
                 const draft_tokens = drafted_tokens[0..draft_len];
