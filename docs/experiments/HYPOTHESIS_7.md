@@ -945,3 +945,63 @@ Interpretation:
 - So section 20 is only partially complete in outcome terms:
   - the right architecture and instrumentation are now in place
   - the next improvement must come from a stronger token-2 selection policy, not from drafting deeper with the current proposer
+
+### 20.7) Canonical Trace Diagnosis
+
+Latest canonical trace confirms:
+
+- token 1 is fully fixed:
+  - `block.draft_pos1_count=32`
+  - `block.accept_pos1_count=32`
+- token 2 is still the active bottleneck:
+  - `block.draft_pos2_count=2`
+  - `block.accept_pos2_count=0`
+  - both token-2 attempts failed at `mismatch_pos=1`
+
+Observed examples:
+
+- after accepted `" a"`, token 2 was proposed as `" a"` but verifier wanted `" happy"`
+- after accepted `" Zig"`, token 2 was proposed as `" He"` but verifier wanted `" is"`
+
+Interpretation:
+
+- the current suffix proposer is now safe enough to stop most weak tail drafts
+- but when it does attempt token 2, its ranking is still too weak
+- the remaining work is therefore not "draft more often"
+- the remaining work is "rank token-2 candidates better when drafting is attempted"
+
+### 20.8) Next Step
+
+Implement a stronger token-2 selector that keeps the conservative stop policy but improves candidate ranking with:
+
+1. suffix-length preference
+2. recency weighting
+3. local pattern continuation support over the last accepted `2..4` tokens
+4. minimum support thresholds before token 2 is emitted
+
+Success criterion for this next step:
+
+- `block.accept_pos2_count` becomes non-zero on the canonical prompt without causing large rollback growth.
+
+### 20.9) Next-Step Implementation Result
+
+- [x] Implemented a stronger token-2 ranking pass:
+  - suffix-length preference
+  - recency weighting
+  - stricter support thresholds
+  - tail trace now includes weighted score
+
+Latest canonical forced bench after this pass:
+
+- `warm.tps_avg=36.320`
+- `warm.block.accepted_prefix_len_avg=1.000`
+- `warm.block.rollback_count_avg=3`
+- `warm.block.draft_pos2_count_avg=3`
+- `warm.block.accept_pos2_count_avg=0`
+
+Interpretation:
+
+- the proposer is still conservative and correct at token 1
+- token 2 is still not being accepted on the canonical prompt
+- this means weighted suffix ranking alone is not sufficient
+- the next real implementation step must use a different signal class for token 2, not just a better count-based ranking of historical suffix matches

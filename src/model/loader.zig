@@ -201,8 +201,8 @@ fn traceTailProposal(
     var piece_buf: [64]u8 = undefined;
     const piece = tokenTracePiece(tokenizer, token_id, &piece_buf);
     std.debug.print(
-        "BLOCK_TAIL_PROPOSAL pos={d} token={d} piece=\"{s}\" source={s} matched_context={d} matches={d}\n",
-        .{ position, token_id, piece, trace.label(), trace.matched_context_tokens, trace.match_count },
+        "BLOCK_TAIL_PROPOSAL pos={d} token={d} piece=\"{s}\" source={s} matched_context={d} matches={d} score={d:.3}\n",
+        .{ position, token_id, piece, trace.label(), trace.matched_context_tokens, trace.match_count, trace.weighted_score },
     );
 }
 

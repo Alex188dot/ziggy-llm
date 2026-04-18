@@ -34,6 +34,7 @@ pub const TailProposalTrace = struct {
     source: TailProposalSource = .exact_suffix,
     matched_context_tokens: usize = 0,
     match_count: u16 = 0,
+    weighted_score: f32 = 0,
 
     pub fn label(self: TailProposalTrace) []const u8 {
         return switch (self.source) {
@@ -187,6 +188,7 @@ pub fn proposeTailTokensFromAcceptedContext(
                     .source = continuation.trace.source,
                     .matched_context_tokens = continuation.trace.matched_context_tokens,
                     .match_count = continuation.trace.match_count,
+                    .weighted_score = continuation.trace.weighted_score,
                 };
             }
         }
@@ -692,25 +694,35 @@ fn bestContextContinuation(history: []const u32, drafted_prefix: []const u32) ?C
     const max_context_len = @min(total_context_len, @as(usize, 8));
     if (max_context_len == 0) return null;
 
+    var best_token_id: u32 = 0;
+    var best_context_len: usize = 0;
+    var best_match_count: u16 = 0;
+    var best_score: f32 = 0;
+    var found = false;
+
     var context_len = max_context_len;
     while (context_len >= 1) : (context_len -= 1) {
         var candidate_ids: [max_candidates]u32 = undefined;
         var candidate_counts: [max_candidates]u16 = undefined;
+        var candidate_scores: [max_candidates]f32 = [_]f32{0} ** max_candidates;
         var candidate_len: usize = 0;
 
         var i: usize = 0;
         while (i + context_len < history.len) : (i += 1) {
             if (!historyContextMatches(history, drafted_prefix, i, context_len)) continue;
             const next = history[i + context_len];
+            const score = contextMatchScore(history.len, i, context_len);
             var slot: usize = 0;
             while (slot < candidate_len and candidate_ids[slot] != next) : (slot += 1) {}
             if (slot < candidate_len) {
                 candidate_counts[slot] +|= 1;
+                candidate_scores[slot] += score;
                 continue;
             }
             if (candidate_len >= max_candidates) continue;
             candidate_ids[candidate_len] = next;
             candidate_counts[candidate_len] = 1;
+            candidate_scores[candidate_len] = score;
             candidate_len += 1;
         }
 
@@ -722,30 +734,60 @@ fn bestContextContinuation(history: []const u32, drafted_prefix: []const u32) ?C
         var best_idx: usize = 0;
         var k: usize = 1;
         while (k < candidate_len) : (k += 1) {
-            if (candidate_counts[k] > candidate_counts[best_idx] or
-                (candidate_counts[k] == candidate_counts[best_idx] and candidate_ids[k] < candidate_ids[best_idx]))
+            if (candidate_scores[k] > candidate_scores[best_idx] or
+                (candidate_scores[k] == candidate_scores[best_idx] and candidate_counts[k] > candidate_counts[best_idx]) or
+                (candidate_scores[k] == candidate_scores[best_idx] and candidate_counts[k] == candidate_counts[best_idx] and candidate_ids[k] < candidate_ids[best_idx]))
             {
                 best_idx = k;
             }
         }
 
         const best_count = candidate_counts[best_idx];
-        if ((context_len == 1 and best_count < 2) or (context_len == 2 and best_count < 1)) {
+        const best_candidate_score = candidate_scores[best_idx];
+        if (!passesContextSupportThreshold(context_len, best_count, best_candidate_score)) {
             if (context_len == 1) break;
             continue;
         }
 
-        return .{
-            .token_id = candidate_ids[best_idx],
-            .trace = .{
-                .source = if (context_len == max_context_len) .exact_suffix else .suffix_backoff,
-                .matched_context_tokens = context_len,
-                .match_count = best_count,
-            },
-        };
+        if (!found or
+            best_candidate_score > best_score or
+            (best_candidate_score == best_score and context_len > best_context_len) or
+            (best_candidate_score == best_score and context_len == best_context_len and best_count > best_match_count) or
+            (best_candidate_score == best_score and context_len == best_context_len and best_count == best_match_count and candidate_ids[best_idx] < best_token_id))
+        {
+            found = true;
+            best_token_id = candidate_ids[best_idx];
+            best_context_len = context_len;
+            best_match_count = best_count;
+            best_score = best_candidate_score;
+        }
     }
 
-    return null;
+    if (!found) return null;
+    return .{
+        .token_id = best_token_id,
+        .trace = .{
+            .source = if (best_context_len == max_context_len) .exact_suffix else .suffix_backoff,
+            .matched_context_tokens = best_context_len,
+            .match_count = best_match_count,
+            .weighted_score = best_score,
+        },
+    };
+}
+
+fn contextMatchScore(history_len: usize, history_start: usize, context_len: usize) f32 {
+    const recency_ratio = @as(f32, @floatFromInt(history_start + context_len)) / @as(f32, @floatFromInt(@max(@as(usize, 1), history_len)));
+    const recency_bonus = 1.0 + 2.0 * recency_ratio;
+    const context_bonus = 1.0 + 0.75 * @as(f32, @floatFromInt(context_len));
+    const recent_window_bonus: f32 = if (history_start + context_len + 16 >= history_len) 1.5 else 0.0;
+    return recency_bonus * context_bonus + recent_window_bonus;
+}
+
+fn passesContextSupportThreshold(context_len: usize, match_count: u16, weighted_score: f32) bool {
+    if (context_len >= 4) return match_count >= 1;
+    if (context_len == 3) return match_count >= 1 and weighted_score >= 4.5;
+    if (context_len == 2) return match_count >= 1 and weighted_score >= 5.0;
+    return match_count >= 2 and weighted_score >= 6.0;
 }
 
 fn historyContextMatches(history: []const u32, drafted_prefix: []const u32, history_start: usize, context_len: usize) bool {
@@ -931,4 +973,22 @@ test "accepted-context tail proposer uses longest suffix and backoff" {
     try std.testing.expectEqual(@as(u32, 13), out[1]);
     try std.testing.expectEqual(@as(usize, 4), trace[0].matched_context_tokens);
     try std.testing.expectEqualStrings("suffix_backoff", trace[0].label());
+    try std.testing.expect(trace[0].weighted_score > 0);
+}
+
+test "accepted-context proposer prefers recent stronger continuation" {
+    const history = [_]u32{
+        1, 2, 9,
+        1, 2, 9,
+        1, 2, 9,
+        7, 8, 1,
+        2, 5, 7,
+        8, 1, 2,
+    };
+    var out: [1]u32 = undefined;
+    var trace: [1]TailProposalTrace = undefined;
+    const drafted = proposeTailTokensFromAcceptedContext(&history, 1, &out, &trace);
+    try std.testing.expectEqual(@as(usize, 1), drafted);
+    try std.testing.expectEqual(@as(u32, 5), out[0]);
+    try std.testing.expect(trace[0].matched_context_tokens >= 2);
 }
