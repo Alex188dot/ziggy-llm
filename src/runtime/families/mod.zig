@@ -13,6 +13,8 @@ pub const ModelFamily = union(enum) {
     mistral,
     mistral3_2512,
     gemma,
+    gemma2,
+    gemma3,
     custom: []const u8,
 
     pub fn label(self: ModelFamily) []const u8 {
@@ -24,6 +26,8 @@ pub const ModelFamily = union(enum) {
             .mistral => "mistral",
             .mistral3_2512 => "ministral3_2512",
             .gemma => "gemma",
+            .gemma2 => "gemma2",
+            .gemma3 => "gemma3",
             .custom => |s| s,
         };
     }
@@ -155,6 +159,12 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.eql(u8, architecture, "gemma")) {
         return .gemma;
     }
+    if (std.mem.eql(u8, architecture, "gemma2")) {
+        return .gemma2;
+    }
+    if (std.mem.eql(u8, architecture, "gemma3")) {
+        return .gemma3;
+    }
     return ModelFamily{ .custom = architecture };
 }
 
@@ -188,6 +198,14 @@ test "detectModelFamily recognizes mistral3_2512" {
 
 test "detectModelFamily recognizes gemma" {
     try std.testing.expectEqual(ModelFamily.gemma, detectModelFamily("gemma"));
+}
+
+test "detectModelFamily recognizes gemma2" {
+    try std.testing.expectEqual(ModelFamily.gemma2, detectModelFamily("gemma2"));
+}
+
+test "detectModelFamily recognizes gemma3" {
+    try std.testing.expectEqual(ModelFamily.gemma3, detectModelFamily("gemma3"));
 }
 
 test "detectModelFamily falls back to custom for unknown architectures" {

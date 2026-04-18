@@ -10,6 +10,8 @@ const qwen_family = @import("families/qwen/mod.zig");
 const mistral_family = @import("families/mistral/mod.zig");
 const mistral3_family = @import("families/ministral3_2512/mod.zig");
 const gemma_family = @import("families/gemma/mod.zig");
+const gemma2_family = @import("families/gemma2/mod.zig");
+const gemma3_family = @import("families/gemma3/mod.zig");
 const qwen35_family = @import("families/qwen35/mod.zig");
 const qwen35_text_family = @import("families/qwen35_text/mod.zig");
 
@@ -41,6 +43,8 @@ fn getRegistry() *registry_mod.FamilyRegistry {
         reg.register(mistral_family.FamilyHandler) catch unreachable;
         reg.register(mistral3_family.FamilyHandler) catch unreachable;
         reg.register(gemma_family.FamilyHandler) catch unreachable;
+        reg.register(gemma2_family.FamilyHandler) catch unreachable;
+        reg.register(gemma3_family.FamilyHandler) catch unreachable;
         reg.register(qwen35_family.FamilyHandler) catch unreachable;
         reg.register(qwen35_text_family.FamilyHandler) catch unreachable;
     }

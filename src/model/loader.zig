@@ -2078,7 +2078,8 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
     const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
     const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
-    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text) return error.UnsupportedArchitecture;
+    const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
+    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text and !is_gemma) return error.UnsupportedArchitecture;
     const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text) .neox else .interleaved;
 
     if (metadata.tokenizer_model) |tm| {
@@ -2219,6 +2220,57 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
     const token_count = metadata.tokenizer_tokens.items.len;
     if (token_count == 0) return error.MissingRequiredMetadata;
 
+    const is_gemma_tokenizer = if (metadata.architecture) |arch|
+        std.mem.eql(u8, arch, "gemma") or std.mem.eql(u8, arch, "gemma2") or std.mem.eql(u8, arch, "gemma3")
+    else
+        false;
+
+    if (is_gemma_tokenizer) {
+        if (token_count == 0) {
+            return error.MissingRequiredMetadata;
+        }
+        const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
+        metadata.tokenizer_tokens = .empty;
+        const scores = if (metadata.tokenizer_scores.items.len > 0)
+            try metadata.tokenizer_scores.toOwnedSlice(allocator)
+        else
+            try allocator.alloc(f32, 0);
+        metadata.tokenizer_scores = .empty;
+        const token_types = if (metadata.tokenizer_types.items.len == token_count)
+            try metadata.tokenizer_types.toOwnedSlice(allocator)
+        else blk: {
+            const fallback = try allocator.alloc(u32, token_count);
+            @memset(fallback, 1);
+            break :blk fallback;
+        };
+        metadata.tokenizer_types = .empty;
+        var byte_fallback = [_]?u32{null} ** 256;
+        for (tokens, 0..) |token, token_id| {
+            if (parseByteFallback(token)) |byte| byte_fallback[byte] = @intCast(token_id);
+        }
+        var special_tokens = std.ArrayList(u32).empty;
+        for (token_types, 0..) |t, id| {
+            if (t == @intFromEnum(TokenType.control) or t == @intFromEnum(TokenType.user_defined)) {
+                try special_tokens.append(allocator, @intCast(id));
+            }
+        }
+        return .{
+            .mode = .score_dp,
+            .tokens = tokens,
+            .scores = scores,
+            .token_types = token_types,
+            .special_tokens = try special_tokens.toOwnedSlice(allocator),
+            .byte_fallback = byte_fallback,
+            .merge_table = std.AutoHashMap(Tokenizer.MergeKey, Tokenizer.MergeValue).init(allocator),
+            .bos_token_id = metadata.bos_token_id,
+            .eos_token_id = metadata.eos_token_id,
+            .unk_token_id = metadata.unk_token_id,
+            .pad_token_id = metadata.pad_token_id,
+            .add_bos_token = metadata.add_bos_token orelse true,
+            .add_eos_token = metadata.add_eos_token orelse false,
+        };
+    }
+
     const is_bpe = if (metadata.tokenizer_model) |m|
         std.mem.eql(u8, m, "gpt2") or std.mem.startsWith(u8, m, "qwen")
     else if (metadata.architecture) |arch|
@@ -2230,12 +2282,18 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
         return buildGpt2Tokenizer(allocator, metadata, token_count);
     }
 
-    if (metadata.tokenizer_scores.items.len != token_count) return error.MissingRequiredMetadata;
+    if (!is_gemma_tokenizer and metadata.tokenizer_scores.items.len != token_count) return error.MissingRequiredMetadata;
 
-    const tokens = try metadata.tokenizer_tokens.toOwnedSlice(allocator);
+    const tokens = if (is_gemma_tokenizer and metadata.tokenizer_tokens.items.len == 0)
+        try allocator.alloc([]u8, 1)
+    else
+        try metadata.tokenizer_tokens.toOwnedSlice(allocator);
     metadata.tokenizer_tokens = .empty;
 
-    const scores = try metadata.tokenizer_scores.toOwnedSlice(allocator);
+    const scores = if (is_gemma_tokenizer)
+        try allocator.alloc(f32, 0)
+    else
+        try metadata.tokenizer_scores.toOwnedSlice(allocator);
     metadata.tokenizer_scores = .empty;
 
     const token_types = if (metadata.tokenizer_types.items.len == token_count)
@@ -2472,7 +2530,12 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.scores")) {
-        try readFloatArray(allocator, parser, value_type, &metadata.tokenizer_scores);
+        const arch = metadata.architecture orelse "";
+        if (std.mem.eql(u8, arch, "gemma") or std.mem.eql(u8, arch, "gemma2") or std.mem.eql(u8, arch, "gemma3")) {
+            try skipValue(parser, value_type);
+        } else {
+            try readFloatArray(allocator, parser, value_type, &metadata.tokenizer_scores);
+        }
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.token_type")) {
