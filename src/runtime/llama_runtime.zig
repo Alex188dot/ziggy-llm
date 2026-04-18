@@ -86,6 +86,10 @@ pub fn generate(
         .block_accepted_prefix_len = llama_report.block_accepted_prefix_len,
         .block_rollback_count = llama_report.block_rollback_count,
         .block_verify_ns = llama_report.block_verify_ns,
+        .block_gpu_backup_ns = llama_report.block_gpu_backup_ns,
+        .block_gpu_restore_ns = llama_report.block_gpu_restore_ns,
+        .block_gpu_sequence_commits = llama_report.block_gpu_sequence_commits,
+        .block_gpu_fallback_count = llama_report.block_gpu_fallback_count,
     };
 }
 

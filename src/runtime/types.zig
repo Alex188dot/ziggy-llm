@@ -194,6 +194,10 @@ pub const GenerationReport = struct {
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_verify_ns: u64 = 0,
+    block_gpu_backup_ns: u64 = 0,
+    block_gpu_restore_ns: u64 = 0,
+    block_gpu_sequence_commits: usize = 0,
+    block_gpu_fallback_count: usize = 0,
 
     pub fn deinit(self: *GenerationReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);

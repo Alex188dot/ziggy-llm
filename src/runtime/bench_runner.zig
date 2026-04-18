@@ -12,6 +12,13 @@ pub const BenchSummary = struct {
     warm_decode_ns_avg: u64 = 0,
     warm_generated_token_count_avg: usize = 0,
     warm_reused_prompt_token_count_avg: usize = 0,
+    warm_block_accepted_prefix_len_avg: f64 = 0,
+    warm_block_rollback_count_avg: usize = 0,
+    warm_block_verify_ns_avg: u64 = 0,
+    warm_block_gpu_backup_ns_avg: u64 = 0,
+    warm_block_gpu_restore_ns_avg: u64 = 0,
+    warm_block_gpu_sequence_commits_avg: f64 = 0,
+    warm_block_gpu_fallback_count_avg: usize = 0,
     warm_startup_breakdown_avg: types.StartupBreakdown = .{},
     warm_metal_profile_summary: ?[]u8 = null,
 
@@ -54,6 +61,13 @@ pub fn runWarmBench(
     var warm_decode_total: u128 = 0;
     var warm_generated_token_total: u128 = 0;
     var warm_reused_prompt_token_total: u128 = 0;
+    var warm_block_accepted_prefix_len_total: f64 = 0;
+    var warm_block_rollback_count_total: u128 = 0;
+    var warm_block_verify_ns_total: u128 = 0;
+    var warm_block_gpu_backup_ns_total: u128 = 0;
+    var warm_block_gpu_restore_ns_total: u128 = 0;
+    var warm_block_gpu_sequence_commits_total: u128 = 0;
+    var warm_block_gpu_fallback_count_total: u128 = 0;
     var warm_startup_breakdown_total = types.StartupBreakdown{};
     var warm_metal_profile_summary: ?[]u8 = null;
 
@@ -65,6 +79,13 @@ pub fn runWarmBench(
         warm_decode_total += warm.decode_ns;
         warm_generated_token_total += warm.generated_token_count;
         warm_reused_prompt_token_total += warm.reused_prompt_token_count;
+        warm_block_accepted_prefix_len_total += warm.block_accepted_prefix_len;
+        warm_block_rollback_count_total += warm.block_rollback_count;
+        warm_block_verify_ns_total += warm.block_verify_ns;
+        warm_block_gpu_backup_ns_total += warm.block_gpu_backup_ns;
+        warm_block_gpu_restore_ns_total += warm.block_gpu_restore_ns;
+        warm_block_gpu_sequence_commits_total += warm.block_gpu_sequence_commits;
+        warm_block_gpu_fallback_count_total += warm.block_gpu_fallback_count;
         warm_startup_breakdown_total.model_load_ns += warm.startup_breakdown.model_load_ns;
         warm_startup_breakdown_total.tensor_prepare_ns += warm.startup_breakdown.tensor_prepare_ns;
         warm_startup_breakdown_total.backend_init_ns += warm.startup_breakdown.backend_init_ns;
@@ -88,6 +109,13 @@ pub fn runWarmBench(
         .warm_decode_ns_avg = @intCast(warm_decode_total / warm_runs),
         .warm_generated_token_count_avg = @intCast(warm_generated_token_total / warm_runs),
         .warm_reused_prompt_token_count_avg = @intCast(warm_reused_prompt_token_total / warm_runs),
+        .warm_block_accepted_prefix_len_avg = warm_block_accepted_prefix_len_total / @as(f64, @floatFromInt(warm_runs)),
+        .warm_block_rollback_count_avg = @intCast(warm_block_rollback_count_total / warm_runs),
+        .warm_block_verify_ns_avg = @intCast(warm_block_verify_ns_total / warm_runs),
+        .warm_block_gpu_backup_ns_avg = @intCast(warm_block_gpu_backup_ns_total / warm_runs),
+        .warm_block_gpu_restore_ns_avg = @intCast(warm_block_gpu_restore_ns_total / warm_runs),
+        .warm_block_gpu_sequence_commits_avg = @as(f64, @floatFromInt(warm_block_gpu_sequence_commits_total)) / @as(f64, @floatFromInt(warm_runs)),
+        .warm_block_gpu_fallback_count_avg = @intCast(warm_block_gpu_fallback_count_total / warm_runs),
         .warm_startup_breakdown_avg = .{
             .model_load_ns = @intCast(warm_startup_breakdown_total.model_load_ns / warm_runs),
             .tensor_prepare_ns = @intCast(warm_startup_breakdown_total.tensor_prepare_ns / warm_runs),

@@ -13,6 +13,12 @@ pub const ShortlistEntry = gpu_types.ShortlistEntry;
 pub const max_shortlist_len = gpu_types.max_shortlist_len;
 pub const max_draft_len = gpu_types.max_draft_len;
 
+pub const BatchDecodeStats = struct {
+    backup_ns: u64 = 0,
+    restore_ns: u64 = 0,
+    sequence_commits: usize = 0,
+};
+
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
     dense_lookup: DenseLookup,
@@ -843,17 +849,21 @@ pub const Session = struct {
         self: *Session,
         layers: []const LayerDesc,
         input_tokens: []const u32,
+        input_embeddings: []const f32,
         expected_tokens: []const u32,
         output_norm: TensorDesc,
         output_tensor: TensorDesc,
         base_position: usize,
         out_tokens: []u32,
+        out_stats: *BatchDecodeStats,
     ) !usize {
         if (input_tokens.len == 0 or input_tokens.len > max_draft_len + 1) return 0;
         if (expected_tokens.len + 1 != input_tokens.len) return error.InvalidTensorMetadata;
         if (out_tokens.len < input_tokens.len) return error.InvalidTensorMetadata;
         if (base_position + input_tokens.len > self.model.context_length) return 0;
+        out_stats.* = .{};
         const batch_count = input_tokens.len;
+        if (input_embeddings.len < batch_count * self.model.embedding_length) return error.InvalidTensorMetadata;
         const hidden_len_bytes = self.model.embedding_length * @sizeOf(f32);
         const kv_stride_elements = self.model.context_length * self.model.kv_projection_size;
         const kv_slot_len_bytes = self.model.kv_projection_size * @sizeOf(f16);
@@ -864,6 +874,7 @@ pub const Session = struct {
         try metal_backend.beginSequence(self.backend);
         sequence_active = true;
 
+        const backup_start = std.time.nanoTimestamp();
         for (input_tokens, 0..) |input_token, i| {
             const position = base_position + i;
             const backup_position_base_elements = i * kv_backup_stride_elements;
@@ -890,9 +901,9 @@ pub const Session = struct {
                 );
             }
 
+            _ = input_token;
             const emb_rows = self.model.embedding_length;
-            const emb_data = self.dense_lookup.getDense(self.model.token_embd_offset) orelse return error.InvalidTensorMetadata;
-            const src = emb_data[input_token * emb_rows ..][0..emb_rows];
+            const src = input_embeddings[i * emb_rows ..][0..emb_rows];
             try metal_backend.writeBufferF32(self.hidden, src);
 
             for (layers, 0..) |layer, layer_index| {
@@ -924,6 +935,7 @@ pub const Session = struct {
                 hidden_len_bytes,
             );
         }
+        out_stats.backup_ns += elapsedSince(backup_start);
 
         try metal_backend.batchArgmax(
             self.backend,
@@ -935,6 +947,7 @@ pub const Session = struct {
 
         _ = try metal_backend.commitSequenceTimed(self.backend);
         sequence_active = false;
+        out_stats.sequence_commits += 1;
 
         var token_ids: [max_draft_len + 1]u32 = undefined;
         try metal_backend.readBufferU32(self.batch_tokens, token_ids[0..batch_count]);
@@ -950,6 +963,7 @@ pub const Session = struct {
         if (accepted_count < batch_count) {
             // Batch decode can advance beyond the first mismatch; restore the hidden state
             // to the last token that is semantically committed by exact-prefix acceptance.
+            const restore_start = std.time.nanoTimestamp();
             try metal_backend.beginSequence(self.backend);
             sequence_active = true;
             try metal_backend.copyBufferRegion(
@@ -989,6 +1003,8 @@ pub const Session = struct {
             }
             _ = try metal_backend.commitSequenceTimed(self.backend);
             sequence_active = false;
+            out_stats.sequence_commits += 1;
+            out_stats.restore_ns += elapsedSince(restore_start);
         }
 
         return accepted_count;

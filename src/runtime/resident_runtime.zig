@@ -85,8 +85,7 @@ pub const ResidentRuntime = struct {
             null;
 
         const force_fresh_session = options.sampling_strategy == .gpu_topk_sample and
-            types.canUseGpuTopKSampling(options) or
-            options.exp_block_decode;
+            types.canUseGpuTopKSampling(options);
 
         var report = if (options.metal_profile or force_fresh_session)
             try llama_cpu.generateLoadedStreaming(
@@ -168,6 +167,15 @@ pub const ResidentRuntime = struct {
             .readback_mode = report.readback_mode,
             .startup_breakdown = report.startup_breakdown,
             .metal_profile_summary = combined_profile_summary,
+            .exp_block_decode = report.exp_block_decode,
+            .exp_block_k = report.exp_block_k,
+            .block_accepted_prefix_len = report.block_accepted_prefix_len,
+            .block_rollback_count = report.block_rollback_count,
+            .block_verify_ns = report.block_verify_ns,
+            .block_gpu_backup_ns = report.block_gpu_backup_ns,
+            .block_gpu_restore_ns = report.block_gpu_restore_ns,
+            .block_gpu_sequence_commits = report.block_gpu_sequence_commits,
+            .block_gpu_fallback_count = report.block_gpu_fallback_count,
         };
     }
 

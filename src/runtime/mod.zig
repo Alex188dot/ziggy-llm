@@ -107,6 +107,10 @@ pub fn generate(
             .block_accepted_prefix_len = family_report.block_accepted_prefix_len,
             .block_rollback_count = family_report.block_rollback_count,
             .block_verify_ns = family_report.block_verify_ns,
+            .block_gpu_backup_ns = family_report.block_gpu_backup_ns,
+            .block_gpu_restore_ns = family_report.block_gpu_restore_ns,
+            .block_gpu_sequence_commits = family_report.block_gpu_sequence_commits,
+            .block_gpu_fallback_count = family_report.block_gpu_fallback_count,
         };
     }
 
@@ -178,6 +182,35 @@ pub fn runCommand(
             report.decodeTokensPerSecond(),
         },
     );
+    try writer.print(
+        \\block.exp_enabled: {}
+        \\block.k: {d}
+        \\block.accepted_prefix_len: {d:.3}
+        \\block.rollback_count: {d}
+        \\block.verify_ms: {d:.3}
+        \\block.gpu_backup_ms: {d:.3}
+        \\block.gpu_restore_ms: {d:.3}
+        \\block.gpu_sequence_commits: {d}
+        \\block.gpu_fallback_count: {d}
+        \\block.gpu_commits_per_token: {d:.6}
+        \\
+    ,
+        .{
+            report.exp_block_decode,
+            report.exp_block_k,
+            report.block_accepted_prefix_len,
+            report.block_rollback_count,
+            nsToMs(report.block_verify_ns),
+            nsToMs(report.block_gpu_backup_ns),
+            nsToMs(report.block_gpu_restore_ns),
+            report.block_gpu_sequence_commits,
+            report.block_gpu_fallback_count,
+            if (report.generated_token_count > 0)
+                @as(f64, @floatFromInt(report.block_gpu_sequence_commits)) / @as(f64, @floatFromInt(report.generated_token_count))
+            else
+                0.0,
+        },
+    );
     if (report.metal_profile_summary) |summary| {
         try writer.print("metal_profile:\n{s}", .{summary});
     }
@@ -240,6 +273,31 @@ pub fn benchCommand(
             },
         );
         try writer.print(
+            \\cold.block.accepted_prefix_len={d:.3}
+            \\cold.block.rollback_count={d}
+            \\cold.block.verify_ms={d:.3}
+            \\cold.block.gpu_backup_ms={d:.3}
+            \\cold.block.gpu_restore_ms={d:.3}
+            \\cold.block.gpu_sequence_commits={d}
+            \\cold.block.gpu_fallback_count={d}
+            \\cold.block.gpu_commits_per_token={d:.6}
+            \\
+        ,
+            .{
+                summary.cold.block_accepted_prefix_len,
+                summary.cold.block_rollback_count,
+                nsToMs(summary.cold.block_verify_ns),
+                nsToMs(summary.cold.block_gpu_backup_ns),
+                nsToMs(summary.cold.block_gpu_restore_ns),
+                summary.cold.block_gpu_sequence_commits,
+                summary.cold.block_gpu_fallback_count,
+                if (summary.cold.generated_token_count > 0)
+                    @as(f64, @floatFromInt(summary.cold.block_gpu_sequence_commits)) / @as(f64, @floatFromInt(summary.cold.generated_token_count))
+                else
+                    0.0,
+            },
+        );
+        try writer.print(
             \\warm.runs={d}
             \\warm.startup_ms_avg={d:.3}
             \\warm.startup.model_load_ms_avg={d:.3}
@@ -273,6 +331,31 @@ pub fn benchCommand(
                 summary.warm_generated_token_count_avg,
                 summary.warmDecodeTokensPerSecond(),
                 summary.warmDecodeTokensPerSecond(),
+            },
+        );
+        try writer.print(
+            \\warm.block.accepted_prefix_len_avg={d:.3}
+            \\warm.block.rollback_count_avg={d}
+            \\warm.block.verify_ms_avg={d:.3}
+            \\warm.block.gpu_backup_ms_avg={d:.3}
+            \\warm.block.gpu_restore_ms_avg={d:.3}
+            \\warm.block.gpu_sequence_commits_avg={d:.3}
+            \\warm.block.gpu_fallback_count_avg={d}
+            \\warm.block.gpu_commits_per_token_avg={d:.6}
+            \\
+        ,
+            .{
+                summary.warm_block_accepted_prefix_len_avg,
+                summary.warm_block_rollback_count_avg,
+                nsToMs(summary.warm_block_verify_ns_avg),
+                nsToMs(summary.warm_block_gpu_backup_ns_avg),
+                nsToMs(summary.warm_block_gpu_restore_ns_avg),
+                summary.warm_block_gpu_sequence_commits_avg,
+                summary.warm_block_gpu_fallback_count_avg,
+                if (summary.warm_generated_token_count_avg > 0)
+                    summary.warm_block_gpu_sequence_commits_avg / @as(f64, @floatFromInt(summary.warm_generated_token_count_avg))
+                else
+                    0.0,
             },
         );
         if (summary.cold.metal_profile_summary) |summary_text| {
@@ -332,6 +415,31 @@ pub fn benchCommand(
             report.generated_token_count,
             report.decodeTokensPerSecond(),
             report.decodeTokensPerSecond(),
+        },
+    );
+    try writer.print(
+        \\block.accepted_prefix_len={d:.3}
+        \\block.rollback_count={d}
+        \\block.verify_ms={d:.3}
+        \\block.gpu_backup_ms={d:.3}
+        \\block.gpu_restore_ms={d:.3}
+        \\block.gpu_sequence_commits={d}
+        \\block.gpu_fallback_count={d}
+        \\block.gpu_commits_per_token={d:.6}
+        \\
+    ,
+        .{
+            report.block_accepted_prefix_len,
+            report.block_rollback_count,
+            nsToMs(report.block_verify_ns),
+            nsToMs(report.block_gpu_backup_ns),
+            nsToMs(report.block_gpu_restore_ns),
+            report.block_gpu_sequence_commits,
+            report.block_gpu_fallback_count,
+            if (report.generated_token_count > 0)
+                @as(f64, @floatFromInt(report.block_gpu_sequence_commits)) / @as(f64, @floatFromInt(report.generated_token_count))
+            else
+                0.0,
         },
     );
     if (report.metal_profile_summary) |summary| {

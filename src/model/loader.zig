@@ -47,6 +47,10 @@ pub const GenerateReport = struct {
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_verify_ns: u64 = 0,
+    block_gpu_backup_ns: u64 = 0,
+    block_gpu_restore_ns: u64 = 0,
+    block_gpu_sequence_commits: usize = 0,
+    block_gpu_fallback_count: usize = 0,
 
     pub fn deinit(self: *GenerateReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);
@@ -723,6 +727,7 @@ const Session = struct {
     gate: []f32,
     up: []f32,
     logits: []f32,
+    block_input_embeddings: []f32,
     pending_greedy_token: ?u32 = null,
     pending_shortlist: [gpu.max_shortlist_len]gpu.ShortlistEntry = undefined,
     pending_shortlist_len: usize = 0,
@@ -775,6 +780,7 @@ const Session = struct {
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
+            .block_input_embeddings = try allocator.alloc(f32, (gpu.max_draft_len + 1) * model.embedding_length),
             .scores = try allocator.alloc(f32, context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
             .v_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
@@ -825,6 +831,7 @@ const Session = struct {
         allocator.free(self.gate);
         allocator.free(self.up);
         allocator.free(self.logits);
+        allocator.free(self.block_input_embeddings);
         allocator.free(self.scores);
         allocator.free(self.k_cache);
         allocator.free(self.v_cache);
@@ -966,7 +973,13 @@ const Session = struct {
         return accepted_count;
     }
 
-    fn verifyDraftTokensBatchGpu(self: *Session, current_token: u32, draft_tokens: []const u32, out_accepted: []u32) !usize {
+    fn verifyDraftTokensBatchGpu(
+        self: *Session,
+        current_token: u32,
+        draft_tokens: []const u32,
+        out_accepted: []u32,
+        out_stats: *gpu.BatchDecodeStats,
+    ) !usize {
         if (self.gpu_session == null) return 0;
         if (draft_tokens.len == 0) return 0;
         if (draft_tokens.len > gpu.max_draft_len) return 0;
@@ -993,16 +1006,23 @@ const Session = struct {
             input_tokens[i + 1] = dt;
         }
         const batch_count = draft_tokens.len + 1;
+        const emb_len = self.model.embedding_length;
+        for (input_tokens[0..batch_count], 0..) |token_id, i| {
+            const emb_slice = self.block_input_embeddings[i * emb_len ..][0..emb_len];
+            try embeddingLookup(emb_slice, self.model, self.model.token_embd, token_id);
+        }
 
         var predicted: [gpu.max_draft_len + 1]u32 = undefined;
         const accepted_count = try gpu_session.runBatchSpeculativeDecode(
             layers[0..self.model.layers.len],
             input_tokens[0..batch_count],
+            self.block_input_embeddings[0 .. batch_count * emb_len],
             draft_tokens,
             adaptTensorDesc(self.model.output_norm),
             adaptTensorDesc(self.model.output),
             self.position,
             &predicted,
+            out_stats,
         );
 
         for (0..accepted_count) |i| {
@@ -1677,6 +1697,10 @@ pub fn generateLoadedStreaming(
     var block_decode_rollbacks: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
+    var block_gpu_backup_ns_total: u64 = 0;
+    var block_gpu_restore_ns_total: u64 = 0;
+    var block_gpu_sequence_commits_total: usize = 0;
+    var block_gpu_fallback_count_total: usize = 0;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -1750,8 +1774,9 @@ pub fn generateLoadedStreaming(
             if (draft_tokens.len > 0) {
                 const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
+                var batch_stats = gpu.BatchDecodeStats{};
                 var accepted_count: usize = if (use_gpu_block)
-                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens) catch 0
+                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
                 else
                     try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 if (accepted_count == 0) {
@@ -1761,9 +1786,13 @@ pub fn generateLoadedStreaming(
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
                     const accepted_prefix_len = accepted_count - 1;
                     block_verify_ns_total += verify_elapsed;
+                    block_gpu_backup_ns_total += batch_stats.backup_ns;
+                    block_gpu_restore_ns_total += batch_stats.restore_ns;
+                    block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     block_decode_total_accepted += accepted_prefix_len;
                     block_decode_step_count += 1;
                     if (accepted_prefix_len < draft_tokens.len) block_decode_rollbacks += 1;
+                    if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
                 var i: usize = 0;
@@ -1834,6 +1863,10 @@ pub fn generateLoadedStreaming(
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_verify_ns = block_verify_ns_total,
+        .block_gpu_backup_ns = block_gpu_backup_ns_total,
+        .block_gpu_restore_ns = block_gpu_restore_ns_total,
+        .block_gpu_sequence_commits = block_gpu_sequence_commits_total,
+        .block_gpu_fallback_count = block_gpu_fallback_count_total,
     };
 }
 
@@ -1928,6 +1961,10 @@ pub fn generateLoadedStreamingCached(
     var block_decode_rollbacks: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
+    var block_gpu_backup_ns_total: u64 = 0;
+    var block_gpu_restore_ns_total: u64 = 0;
+    var block_gpu_sequence_commits_total: usize = 0;
+    var block_gpu_fallback_count_total: usize = 0;
 
     const decode_begin = std.time.nanoTimestamp();
     while (generated_token_count < options.max_tokens) : (generated_token_count += 1) {
@@ -1999,10 +2036,11 @@ pub fn generateLoadedStreamingCached(
             }
             const draft_tokens = session.findDraftTokens(next_token, draft_limit);
             if (draft_tokens.len > 0) {
-                const use_gpu_block = exp_block_enabled and reused_prompt_token_count == 0;
+                const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
+                var batch_stats = gpu.BatchDecodeStats{};
                 var accepted_count: usize = if (use_gpu_block)
-                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens) catch 0
+                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
                 else
                     try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 if (accepted_count == 0) {
@@ -2012,9 +2050,13 @@ pub fn generateLoadedStreamingCached(
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
                     const accepted_prefix_len = accepted_count - 1;
                     block_verify_ns_total += verify_elapsed;
+                    block_gpu_backup_ns_total += batch_stats.backup_ns;
+                    block_gpu_restore_ns_total += batch_stats.restore_ns;
+                    block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     block_decode_total_accepted += accepted_prefix_len;
                     block_decode_step_count += 1;
                     if (accepted_prefix_len < draft_tokens.len) block_decode_rollbacks += 1;
+                    if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
                 var i: usize = 0;
@@ -2085,6 +2127,10 @@ pub fn generateLoadedStreamingCached(
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_verify_ns = block_verify_ns_total,
+        .block_gpu_backup_ns = block_gpu_backup_ns_total,
+        .block_gpu_restore_ns = block_gpu_restore_ns_total,
+        .block_gpu_sequence_commits = block_gpu_sequence_commits_total,
+        .block_gpu_fallback_count = block_gpu_fallback_count_total,
     };
 }
 

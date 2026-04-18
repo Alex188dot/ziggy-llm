@@ -52,6 +52,10 @@ fn llamaGenerate(
         .block_accepted_prefix_len = report.block_accepted_prefix_len,
         .block_rollback_count = report.block_rollback_count,
         .block_verify_ns = report.block_verify_ns,
+        .block_gpu_backup_ns = report.block_gpu_backup_ns,
+        .block_gpu_restore_ns = report.block_gpu_restore_ns,
+        .block_gpu_sequence_commits = report.block_gpu_sequence_commits,
+        .block_gpu_fallback_count = report.block_gpu_fallback_count,
     };
 }
 
