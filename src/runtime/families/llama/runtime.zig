@@ -26,6 +26,8 @@ fn llamaGenerate(
         .moon_quant = options.moon_quant,
         .metal_profile = options.metal_profile,
         .sampling_strategy = options.sampling_strategy,
+        .exp_block_decode = options.exp_block_decode,
+        .exp_block_k = options.exp_block_k,
     };
     const report = try llama_runtime.generate(allocator, model_path, prompt, gen_opts);
     return families_mod.FamilyReport{
@@ -45,6 +47,11 @@ fn llamaGenerate(
         .readback_mode = report.readback_mode,
         .startup_breakdown = report.startup_breakdown,
         .metal_profile_summary = report.metal_profile_summary,
+        .exp_block_decode = report.exp_block_decode,
+        .exp_block_k = report.exp_block_k,
+        .block_accepted_prefix_len = report.block_accepted_prefix_len,
+        .block_rollback_count = report.block_rollback_count,
+        .block_verify_ns = report.block_verify_ns,
     };
 }
 

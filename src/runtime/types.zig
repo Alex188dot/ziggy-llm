@@ -159,6 +159,8 @@ pub const GenerationOptions = struct {
     moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: SamplingStrategy = .auto,
+    exp_block_decode: bool = false,
+    exp_block_k: usize = 2,
 };
 
 pub const StartupBreakdown = struct {
@@ -187,6 +189,11 @@ pub const GenerationReport = struct {
     readback_mode: ReadbackMode = .none,
     startup_breakdown: StartupBreakdown = .{},
     metal_profile_summary: ?[]u8 = null,
+    exp_block_decode: bool = false,
+    exp_block_k: usize = 0,
+    block_accepted_prefix_len: f64 = 0,
+    block_rollback_count: usize = 0,
+    block_verify_ns: u64 = 0,
 
     pub fn deinit(self: *GenerationReport, allocator: std.mem.Allocator) void {
         allocator.free(self.generated_text);

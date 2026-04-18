@@ -31,8 +31,11 @@ pub const Session = struct {
     shortlist_entries: metal_backend.BufferHandle,
     k_cache: metal_backend.BufferHandle,
     v_cache: metal_backend.BufferHandle,
+    batch_k_backup: metal_backend.BufferHandle,
+    batch_v_backup: metal_backend.BufferHandle,
     batch_logits: metal_backend.BufferHandle,
     batch_tokens: metal_backend.BufferHandle,
+    batch_hidden: metal_backend.BufferHandle,
     profiler: ?*metal_profile.Profiler = null,
     linear_qkv: metal_backend.BufferHandle,
     linear_z: metal_backend.BufferHandle,
@@ -80,10 +83,16 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(k_cache);
         const v_cache = try metal_backend.createByteScratchBuffer(backend, cache_len * @sizeOf(f16));
         errdefer metal_backend.destroyBuffer(v_cache);
-        const batch_logits = try metal_backend.createScratchBuffer(backend, max_draft_len * model.vocab_size);
+        const batch_k_backup = try metal_backend.createByteScratchBuffer(backend, (max_draft_len + 1) * model.block_count * model.kv_projection_size * @sizeOf(f16));
+        errdefer metal_backend.destroyBuffer(batch_k_backup);
+        const batch_v_backup = try metal_backend.createByteScratchBuffer(backend, (max_draft_len + 1) * model.block_count * model.kv_projection_size * @sizeOf(f16));
+        errdefer metal_backend.destroyBuffer(batch_v_backup);
+        const batch_logits = try metal_backend.createScratchBuffer(backend, (max_draft_len + 1) * model.vocab_size);
         errdefer metal_backend.destroyBuffer(batch_logits);
-        const batch_tokens = try metal_backend.createByteScratchBuffer(backend, max_draft_len * @sizeOf(u32));
+        const batch_tokens = try metal_backend.createByteScratchBuffer(backend, (max_draft_len + 1) * @sizeOf(u32));
         errdefer metal_backend.destroyBuffer(batch_tokens);
+        const batch_hidden = try metal_backend.createScratchBuffer(backend, (max_draft_len + 1) * model.embedding_length);
+        errdefer metal_backend.destroyBuffer(batch_hidden);
 
         const linear_num_v_heads = model.linear_num_value_heads;
         const linear_value_dim_per_head = model.linear_value_head_dim;
@@ -128,8 +137,11 @@ pub const Session = struct {
             .shortlist_entries = shortlist_entries,
             .k_cache = k_cache,
             .v_cache = v_cache,
+            .batch_k_backup = batch_k_backup,
+            .batch_v_backup = batch_v_backup,
             .batch_logits = batch_logits,
             .batch_tokens = batch_tokens,
+            .batch_hidden = batch_hidden,
             .profiler = profiler,
             .linear_qkv = linear_qkv,
             .linear_z = linear_z,
@@ -157,8 +169,11 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.shortlist_entries);
         metal_backend.destroyBuffer(self.k_cache);
         metal_backend.destroyBuffer(self.v_cache);
+        metal_backend.destroyBuffer(self.batch_k_backup);
+        metal_backend.destroyBuffer(self.batch_v_backup);
         metal_backend.destroyBuffer(self.batch_logits);
         metal_backend.destroyBuffer(self.batch_tokens);
+        metal_backend.destroyBuffer(self.batch_hidden);
         metal_backend.destroyBuffer(self.linear_qkv);
         metal_backend.destroyBuffer(self.linear_z);
         metal_backend.destroyBuffer(self.linear_a);
@@ -827,101 +842,69 @@ pub const Session = struct {
     pub fn runBatchSpeculativeDecode(
         self: *Session,
         layers: []const LayerDesc,
-        draft_tokens: []const u32,
+        input_tokens: []const u32,
+        expected_tokens: []const u32,
+        output_norm: TensorDesc,
+        output_tensor: TensorDesc,
         base_position: usize,
         out_tokens: []u32,
     ) !usize {
-        if (draft_tokens.len == 0 or draft_tokens.len > max_draft_len) return 0;
-        const batch_count = draft_tokens.len;
+        if (input_tokens.len == 0 or input_tokens.len > max_draft_len + 1) return 0;
+        if (expected_tokens.len + 1 != input_tokens.len) return error.InvalidTensorMetadata;
+        if (out_tokens.len < input_tokens.len) return error.InvalidTensorMetadata;
+        if (base_position + input_tokens.len > self.model.context_length) return 0;
+        const batch_count = input_tokens.len;
+        const hidden_len_bytes = self.model.embedding_length * @sizeOf(f32);
+        const kv_stride_elements = self.model.context_length * self.model.kv_projection_size;
+        const kv_slot_len_bytes = self.model.kv_projection_size * @sizeOf(f16);
+        const kv_backup_stride_elements = self.model.block_count * self.model.kv_projection_size;
+        var sequence_active = false;
+        errdefer if (sequence_active) metal_backend.commitSequence(self.backend) catch {};
 
         try metal_backend.beginSequence(self.backend);
+        sequence_active = true;
 
-        for (draft_tokens, 0..) |draft_token, i| {
+        for (input_tokens, 0..) |input_token, i| {
             const position = base_position + i;
+            const backup_position_base_elements = i * kv_backup_stride_elements;
+
+            for (0..self.model.block_count) |layer_index| {
+                const layer_base = layer_index * kv_stride_elements;
+                const kv_src_offset_bytes = (layer_base + position * self.model.kv_projection_size) * @sizeOf(f16);
+                const kv_backup_offset_bytes = (backup_position_base_elements + layer_index * self.model.kv_projection_size) * @sizeOf(f16);
+                try metal_backend.copyBufferRegion(
+                    self.backend,
+                    self.k_cache,
+                    kv_src_offset_bytes,
+                    self.batch_k_backup,
+                    kv_backup_offset_bytes,
+                    kv_slot_len_bytes,
+                );
+                try metal_backend.copyBufferRegion(
+                    self.backend,
+                    self.v_cache,
+                    kv_src_offset_bytes,
+                    self.batch_v_backup,
+                    kv_backup_offset_bytes,
+                    kv_slot_len_bytes,
+                );
+            }
 
             const emb_rows = self.model.embedding_length;
             const emb_data = self.dense_lookup.getDense(self.model.token_embd_offset) orelse return error.InvalidTensorMetadata;
-            const src = emb_data[draft_token * emb_rows ..][0..emb_rows];
-            var values: [2048]f32 = undefined;
-            if (emb_rows > values.len) return error.InvalidTensorMetadata;
-            @memcpy(values[0..emb_rows], src);
-            try metal_backend.writeBufferF32(self.hidden, values[0..emb_rows]);
+            const src = emb_data[input_token * emb_rows ..][0..emb_rows];
+            try metal_backend.writeBufferF32(self.hidden, src);
 
             for (layers, 0..) |layer, layer_index| {
-                try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
-                try self.runProjection(layer.attn_q, self.normed, self.q);
-
-                try metal_backend.applyRoPE(
-                    self.backend,
-                    self.q,
-                    self.model.head_count,
-                    self.model.rope_dimension_count,
-                    self.model.rope_dimension_count,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
-
-                const layer_base = layer_index * self.model.context_length * self.model.kv_projection_size;
-                const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
-
-                try self.runProjection(layer.attn_k, self.normed, self.k);
-                try metal_backend.applyRoPE(
-                    self.backend,
-                    self.k,
-                    self.model.head_count_kv,
-                    self.model.rope_dimension_count,
-                    self.model.rope_dimension_count,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.k,
-                    self.k_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
-
-                try self.runProjection(layer.attn_v, self.normed, self.v);
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.v,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
-
-                try metal_backend.attentionFused(
-                    self.backend,
-                    self.q,
-                    self.k_cache,
-                    self.v_cache,
-                    self.attn,
-                    self.model.head_count,
-                    self.model.head_count_kv,
-                    self.model.rope_dimension_count,
-                    self.model.kv_projection_size,
-                    self.model.context_length,
-                    position,
-                    layer_base,
-                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.rope_dimension_count))),
-                );
-
-                try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
+                try self.runAttentionBlock(layer, layer_index, position);
             }
 
             for (layers) |layer| {
-                try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-                try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-                try self.runProjection(layer.ffn_up, self.normed, self.up);
-                try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
-                try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+                try self.runFfnBlock(layer);
             }
 
-            try self.runRmsNorm(self.model.output_norm, self.hidden, self.normed);
-            try self.runProjection(self.model.output, self.normed, self.tmp);
+            try self.runRmsNorm(output_norm, self.hidden, self.normed);
+            try self.runProjection(output_tensor, self.normed, self.tmp);
 
             const logits_offset = i * self.model.vocab_size;
             try metal_backend.copyBufferRegion(
@@ -931,6 +914,14 @@ pub const Session = struct {
                 self.batch_logits,
                 logits_offset * @sizeOf(f32),
                 self.model.vocab_size * @sizeOf(f32),
+            );
+            try metal_backend.copyBufferRegion(
+                self.backend,
+                self.hidden,
+                0,
+                self.batch_hidden,
+                i * hidden_len_bytes,
+                hidden_len_bytes,
             );
         }
 
@@ -943,20 +934,63 @@ pub const Session = struct {
         );
 
         _ = try metal_backend.commitSequenceTimed(self.backend);
+        sequence_active = false;
 
-        var token_ids: [max_draft_len]u32 = undefined;
+        var token_ids: [max_draft_len + 1]u32 = undefined;
         try metal_backend.readBufferU32(self.batch_tokens, token_ids[0..batch_count]);
 
-        var accepted: usize = 0;
-        for (draft_tokens, 0..) |draft, i| {
-            const predicted = token_ids[i];
-            out_tokens[i] = predicted;
-            accepted += 1;
-            if (predicted != draft) {
-                return accepted;
-            }
+        var accepted_prefix_len: usize = 0;
+        while (accepted_prefix_len < expected_tokens.len and token_ids[accepted_prefix_len] == expected_tokens[accepted_prefix_len]) : (accepted_prefix_len += 1) {}
+        const accepted_count = accepted_prefix_len + 1;
+        std.debug.assert(accepted_count <= batch_count);
+        for (0..accepted_count) |i| {
+            out_tokens[i] = token_ids[i];
         }
 
-        return accepted;
+        if (accepted_count < batch_count) {
+            // Batch decode can advance beyond the first mismatch; restore the hidden state
+            // to the last token that is semantically committed by exact-prefix acceptance.
+            try metal_backend.beginSequence(self.backend);
+            sequence_active = true;
+            try metal_backend.copyBufferRegion(
+                self.backend,
+                self.batch_hidden,
+                (accepted_count - 1) * hidden_len_bytes,
+                self.hidden,
+                0,
+                hidden_len_bytes,
+            );
+            // Roll back any speculative KV writes beyond the accepted prefix.
+            var rollback_i = accepted_count;
+            while (rollback_i < batch_count) : (rollback_i += 1) {
+                const position = base_position + rollback_i;
+                const backup_position_base_elements = rollback_i * kv_backup_stride_elements;
+                for (0..self.model.block_count) |layer_index| {
+                    const layer_base = layer_index * kv_stride_elements;
+                    const kv_dst_offset_bytes = (layer_base + position * self.model.kv_projection_size) * @sizeOf(f16);
+                    const kv_backup_offset_bytes = (backup_position_base_elements + layer_index * self.model.kv_projection_size) * @sizeOf(f16);
+                    try metal_backend.copyBufferRegion(
+                        self.backend,
+                        self.batch_k_backup,
+                        kv_backup_offset_bytes,
+                        self.k_cache,
+                        kv_dst_offset_bytes,
+                        kv_slot_len_bytes,
+                    );
+                    try metal_backend.copyBufferRegion(
+                        self.backend,
+                        self.batch_v_backup,
+                        kv_backup_offset_bytes,
+                        self.v_cache,
+                        kv_dst_offset_bytes,
+                        kv_slot_len_bytes,
+                    );
+                }
+            }
+            _ = try metal_backend.commitSequenceTimed(self.backend);
+            sequence_active = false;
+        }
+
+        return accepted_count;
     }
 };

@@ -32,6 +32,8 @@ pub const Config = struct {
     moon_quant: runtime.MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: runtime.SamplingStrategy = .auto,
+    exp_block_decode: bool = false,
+    exp_block_k: usize = 2,
 };
 
 pub const ParseError = error{
@@ -168,6 +170,16 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config.sampling_strategy = runtime.SamplingStrategy.parse(args[i]) orelse return error.InvalidSamplingStrategy;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-decode")) {
+            config.exp_block_decode = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-k")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_k = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {

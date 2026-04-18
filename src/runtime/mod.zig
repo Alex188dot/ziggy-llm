@@ -79,6 +79,8 @@ pub fn generate(
             .moon_quant = options.moon_quant,
             .metal_profile = options.metal_profile,
             .sampling_strategy = options.sampling_strategy,
+            .exp_block_decode = options.exp_block_decode,
+            .exp_block_k = options.exp_block_k,
         };
 
         const family_report = try runtime.generate(allocator, model_path, prompt, family_options);
@@ -100,6 +102,11 @@ pub fn generate(
             .readback_mode = family_report.readback_mode,
             .startup_breakdown = family_report.startup_breakdown,
             .metal_profile_summary = family_report.metal_profile_summary,
+            .exp_block_decode = family_report.exp_block_decode,
+            .exp_block_k = family_report.exp_block_k,
+            .block_accepted_prefix_len = family_report.block_accepted_prefix_len,
+            .block_rollback_count = family_report.block_rollback_count,
+            .block_verify_ns = family_report.block_verify_ns,
         };
     }
 

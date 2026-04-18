@@ -81,6 +81,11 @@ pub fn generate(
         .readback_mode = llama_report.readback_mode,
         .startup_breakdown = llama_report.startup_breakdown,
         .metal_profile_summary = combined_profile_summary,
+        .exp_block_decode = llama_report.exp_block_decode,
+        .exp_block_k = llama_report.exp_block_k,
+        .block_accepted_prefix_len = llama_report.block_accepted_prefix_len,
+        .block_rollback_count = llama_report.block_rollback_count,
+        .block_verify_ns = llama_report.block_verify_ns,
     };
 }
 

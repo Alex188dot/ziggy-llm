@@ -103,6 +103,8 @@ fn generationOptions(config: cli.Config, max_tokens: usize) runtime.GenerationOp
         .backend = config.backend,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
+        .exp_block_decode = config.exp_block_decode,
+        .exp_block_k = config.exp_block_k,
     };
 }
 

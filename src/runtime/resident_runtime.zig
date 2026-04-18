@@ -85,7 +85,8 @@ pub const ResidentRuntime = struct {
             null;
 
         const force_fresh_session = options.sampling_strategy == .gpu_topk_sample and
-            types.canUseGpuTopKSampling(options);
+            types.canUseGpuTopKSampling(options) or
+            options.exp_block_decode;
 
         var report = if (options.metal_profile or force_fresh_session)
             try llama_cpu.generateLoadedStreaming(
