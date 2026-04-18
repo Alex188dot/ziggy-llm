@@ -3,6 +3,7 @@ const terminal = @import("../terminal.zig");
 const backend_api = @import("../runtime/backend.zig");
 const gpu = @import("../runtime/gpu/session.zig");
 const block_policy = @import("../runtime/block_policy.zig");
+const draft_proposer = @import("../runtime/draft_proposer.zig");
 const metal_profile = @import("../runtime/metal_profile.zig");
 const moon_quant_calibration = @import("../moon_quant_calibration.zig");
 const runtime_types = @import("../runtime/types.zig");
@@ -1698,6 +1699,7 @@ pub fn generateLoadedStreaming(
     } else null;
     const default_draft_len: usize = @min(@as(usize, 3), gpu.max_draft_len);
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
+    var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
@@ -1785,7 +1787,14 @@ pub fn generateLoadedStreaming(
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
                 }
             }
-            const draft_tokens = session.findDraftTokens(next_token, draft_limit);
+            const draft_len = draft_proposer.proposeDraftTokens(
+                next_token,
+                session.token_buffer[0..session.position],
+                session.logits,
+                draft_limit,
+                &drafted_tokens,
+            );
+            const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
                 const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
@@ -1979,6 +1988,7 @@ pub fn generateLoadedStreamingCached(
 
     const default_draft_len: usize = @min(@as(usize, 3), gpu.max_draft_len);
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
+    var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
@@ -2066,7 +2076,14 @@ pub fn generateLoadedStreamingCached(
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
                 }
             }
-            const draft_tokens = session.findDraftTokens(next_token, draft_limit);
+            const draft_len = draft_proposer.proposeDraftTokens(
+                next_token,
+                session.token_buffer[0..session.position],
+                session.logits,
+                draft_limit,
+                &drafted_tokens,
+            );
+            const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
                 const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
