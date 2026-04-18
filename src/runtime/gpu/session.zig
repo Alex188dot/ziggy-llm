@@ -874,31 +874,35 @@ pub const Session = struct {
         try metal_backend.beginSequence(self.backend);
         sequence_active = true;
 
-        const backup_start = std.time.nanoTimestamp();
+        var backup_ns_total: u64 = 0;
         for (input_tokens, 0..) |input_token, i| {
             const position = base_position + i;
-            const backup_position_base_elements = i * kv_backup_stride_elements;
-
-            for (0..self.model.block_count) |layer_index| {
-                const layer_base = layer_index * kv_stride_elements;
-                const kv_src_offset_bytes = (layer_base + position * self.model.kv_projection_size) * @sizeOf(f16);
-                const kv_backup_offset_bytes = (backup_position_base_elements + layer_index * self.model.kv_projection_size) * @sizeOf(f16);
-                try metal_backend.copyBufferRegion(
-                    self.backend,
-                    self.k_cache,
-                    kv_src_offset_bytes,
-                    self.batch_k_backup,
-                    kv_backup_offset_bytes,
-                    kv_slot_len_bytes,
-                );
-                try metal_backend.copyBufferRegion(
-                    self.backend,
-                    self.v_cache,
-                    kv_src_offset_bytes,
-                    self.batch_v_backup,
-                    kv_backup_offset_bytes,
-                    kv_slot_len_bytes,
-                );
+            if (i > 0) {
+                // The first token in the batch is always accepted, so only backup speculative suffix slots.
+                const backup_start = std.time.nanoTimestamp();
+                const backup_position_base_elements = i * kv_backup_stride_elements;
+                for (0..self.model.block_count) |layer_index| {
+                    const layer_base = layer_index * kv_stride_elements;
+                    const kv_src_offset_bytes = (layer_base + position * self.model.kv_projection_size) * @sizeOf(f16);
+                    const kv_backup_offset_bytes = (backup_position_base_elements + layer_index * self.model.kv_projection_size) * @sizeOf(f16);
+                    try metal_backend.copyBufferRegion(
+                        self.backend,
+                        self.k_cache,
+                        kv_src_offset_bytes,
+                        self.batch_k_backup,
+                        kv_backup_offset_bytes,
+                        kv_slot_len_bytes,
+                    );
+                    try metal_backend.copyBufferRegion(
+                        self.backend,
+                        self.v_cache,
+                        kv_src_offset_bytes,
+                        self.batch_v_backup,
+                        kv_backup_offset_bytes,
+                        kv_slot_len_bytes,
+                    );
+                }
+                backup_ns_total += elapsedSince(backup_start);
             }
 
             _ = input_token;
@@ -935,7 +939,7 @@ pub const Session = struct {
                 hidden_len_bytes,
             );
         }
-        out_stats.backup_ns += elapsedSince(backup_start);
+        out_stats.backup_ns += backup_ns_total;
 
         try metal_backend.batchArgmax(
             self.backend,
