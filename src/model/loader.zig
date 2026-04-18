@@ -195,47 +195,56 @@ fn traceBlockAttempt(
 fn traceBlockProposals(
     enabled: bool,
     step: usize,
+    tokenizer: Tokenizer,
     draft_tokens: []const u32,
     accepted_tokens: []const u32,
     accepted_prefix_len: usize,
+    precheck_attempted: bool,
+    precheck_failed: bool,
 ) void {
     if (!enabled) return;
     if (draft_tokens.len == 0) return;
 
     std.debug.print(
-        "BLOCK_PROPOSAL step={d} draft_len={d} accepted_prefix_len={d} draft={any} verified={any}\n",
-        .{ step, draft_tokens.len, accepted_prefix_len, draft_tokens, accepted_tokens },
+        "BLOCK_PROPOSAL step={d} draft_len={d} accepted_prefix_len={d} draft={any} verified={any} precheck={any} precheck_failed={any}\n",
+        .{ step, draft_tokens.len, accepted_prefix_len, draft_tokens, accepted_tokens, precheck_attempted, precheck_failed },
     );
 
     var i: usize = 0;
     while (i < draft_tokens.len) : (i += 1) {
         const proposed = draft_tokens[i];
+        const proposed_piece: []const u8 = if (proposed < tokenizer.tokens.len) tokenizer.tokens[proposed] else "<oov>";
         if (i < accepted_prefix_len) {
+            const verified_piece: []const u8 = if (accepted_tokens[i] < tokenizer.tokens.len) tokenizer.tokens[accepted_tokens[i]] else "<oov>";
             std.debug.print(
-                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified={d} decision=ACCEPT reason=prefix_match\n",
-                .{ step, i, proposed, accepted_tokens[i] },
+                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} proposed_piece=\"{s}\" verified={d} verified_piece=\"{s}\" decision=ACCEPT reason=prefix_match\n",
+                .{ step, i, proposed, proposed_piece, accepted_tokens[i], verified_piece },
             );
             continue;
         }
 
         if (i == accepted_prefix_len and accepted_prefix_len < draft_tokens.len and i < accepted_tokens.len) {
+            const verified_piece: []const u8 = if (accepted_tokens[i] < tokenizer.tokens.len) tokenizer.tokens[accepted_tokens[i]] else "<oov>";
+            const reason: []const u8 = if (i == 0 and precheck_attempted and precheck_failed) "precheck_mismatch" else "verify_mismatch";
             std.debug.print(
-                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified={d} decision=DISCARD reason=mismatch\n",
-                .{ step, i, proposed, accepted_tokens[i] },
+                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} proposed_piece=\"{s}\" verified={d} verified_piece=\"{s}\" decision=DISCARD reason={s}\n",
+                .{ step, i, proposed, proposed_piece, accepted_tokens[i], verified_piece, reason },
             );
             continue;
         }
 
         std.debug.print(
-            "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified=-1 decision=DISCARD reason=rollback_after_mismatch\n",
-            .{ step, i, proposed },
+            "BLOCK_PROPOSAL step={d} idx={d} proposed={d} proposed_piece=\"{s}\" verified=-1 decision=DISCARD reason=rollback_tail\n",
+            .{ step, i, proposed, proposed_piece },
         );
     }
 
     if (accepted_tokens.len > draft_tokens.len) {
+        const bonus = accepted_tokens[draft_tokens.len];
+        const bonus_piece: []const u8 = if (bonus < tokenizer.tokens.len) tokenizer.tokens[bonus] else "<oov>";
         std.debug.print(
-            "BLOCK_PROPOSAL step={d} bonus_token={d} decision=APPEND reason=verified_next\n",
-            .{ step, accepted_tokens[draft_tokens.len] },
+            "BLOCK_PROPOSAL step={d} bonus_token={d} bonus_piece=\"{s}\" decision=APPEND reason=verified_next\n",
+            .{ step, bonus, bonus_piece },
         );
     }
 }
@@ -2055,9 +2064,12 @@ pub fn generateLoadedStreaming(
                 traceBlockProposals(
                     options.exp_block_trace,
                     block_decode_step_count,
+                    model.tokenizer,
                     draft_tokens,
                     accepted_tokens[0..accepted_count],
                     accepted_prefix_len,
+                    precheck_attempted,
+                    precheck_failed,
                 );
 
                 var i: usize = 0;
@@ -2470,9 +2482,12 @@ pub fn generateLoadedStreamingCached(
                 traceBlockProposals(
                     options.exp_block_trace,
                     block_decode_step_count,
+                    model.tokenizer,
                     draft_tokens,
                     accepted_tokens[0..accepted_count],
                     accepted_prefix_len,
+                    precheck_attempted,
+                    precheck_failed,
                 );
 
                 var i: usize = 0;
