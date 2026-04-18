@@ -1312,6 +1312,82 @@ const Session = struct {
         return accepted_count;
     }
 
+    fn supportsLogitsAlignedChaining(self: *const Session) bool {
+        if (self.gpu_session == null) return false;
+        for (self.model.layers) |layer| {
+            if (layer.linear_attn != null) return false;
+        }
+        return true;
+    }
+
+    fn proposeTailTokensLogitsAligned(
+        self: *Session,
+        current_token: u32,
+        max_draft: usize,
+        out: []u32,
+        trace_out: ?[]draft_proposer.TailProposalTrace,
+        trace_enabled: bool,
+    ) !usize {
+        if (max_draft == 0 or out.len == 0) return 0;
+        if (!self.supportsLogitsAlignedChaining()) return 0;
+
+        const draft_cap = @min(max_draft, out.len);
+        const base_position = self.position;
+        const base_pending_greedy = self.pending_greedy_token;
+        const base_pending_shortlist_len = self.pending_shortlist_len;
+        const base_pending_shortlist = self.pending_shortlist;
+
+        try self.gpu_session.?.backupKvSlots(base_position, draft_cap);
+        defer self.gpu_session.?.restoreKvSlots(base_position, draft_cap) catch {};
+        defer {
+            self.position = base_position;
+            self.pending_greedy_token = base_pending_greedy;
+            self.pending_shortlist_len = base_pending_shortlist_len;
+            self.pending_shortlist = base_pending_shortlist;
+        }
+
+        var next_input = current_token;
+        var produced: usize = 0;
+        while (produced < draft_cap) {
+            const drafted = try self.stepGreedy(next_input);
+            out[produced] = drafted;
+            if (trace_out) |trace| {
+                if (produced < trace.len) {
+                    const margin = if (self.pending_shortlist_len >= 2)
+                        shortlistTop1Top2Margin(self.pending_shortlist[0..self.pending_shortlist_len])
+                    else
+                        block_policy.top1Top2Margin(self.logits);
+                    trace[produced] = .{
+                        .source = .logits_chain,
+                        .matched_context_tokens = 0,
+                        .match_count = @intCast(self.pending_shortlist_len),
+                        .weighted_score = margin,
+                    };
+                }
+            }
+            next_input = drafted;
+            produced += 1;
+
+            if (produced >= draft_cap) break;
+            const margin = if (self.pending_shortlist_len >= 2)
+                shortlistTop1Top2Margin(self.pending_shortlist[0..self.pending_shortlist_len])
+            else
+                block_policy.top1Top2Margin(self.logits);
+            if (margin <= block_flat_logits_margin_eps) {
+                if (trace_enabled) {
+                    std.debug.print(
+                        "BLOCK_PROPOSER_GUARD decision=STOP reason=flat_logits_chain margin={d:.6} drafted={d}\n",
+                        .{ margin, drafted },
+                    );
+                }
+                produced += 1;
+                break;
+            }
+        }
+
+        return produced;
+    }
+
     fn step(self: *Session, token_id: u32) ![]const f32 {
         try self.runTokenCore(token_id);
         self.pending_greedy_token = null;
@@ -2107,15 +2183,16 @@ pub fn generateLoadedStreaming(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail_len = draft_proposer.proposeTailTokensFromAcceptedContext(
-                        session.token_buffer[0..session.position],
+                    const logits_tail_len = try session.proposeTailTokensLogitsAligned(
+                        bootstrap_token,
                         tail_limit,
                         drafted_tokens[1..],
                         tail_trace[0..],
+                        options.exp_block_trace,
                     );
-                    if (history_tail_len > 0) {
+                    if (logits_tail_len > 0) {
                         var tail_idx: usize = 0;
-                        while (tail_idx < history_tail_len) : (tail_idx += 1) {
+                        while (tail_idx < logits_tail_len) : (tail_idx += 1) {
                             traceTailProposal(
                                 options.exp_block_trace,
                                 model.tokenizer,
@@ -2124,10 +2201,10 @@ pub fn generateLoadedStreaming(
                                 tail_trace[tail_idx],
                             );
                         }
-                        draft_len += history_tail_len;
+                        draft_len += logits_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
-                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_history_tail_evidence bootstrap_token={d}\n",
+                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_logits_chain_tail bootstrap_token={d}\n",
                             .{bootstrap_token},
                         );
                     }
@@ -2573,15 +2650,16 @@ pub fn generateLoadedStreamingCached(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail_len = draft_proposer.proposeTailTokensFromAcceptedContext(
-                        session.token_buffer[0..session.position],
+                    const logits_tail_len = try session.proposeTailTokensLogitsAligned(
+                        bootstrap_token,
                         tail_limit,
                         drafted_tokens[1..],
                         tail_trace[0..],
+                        options.exp_block_trace,
                     );
-                    if (history_tail_len > 0) {
+                    if (logits_tail_len > 0) {
                         var tail_idx: usize = 0;
-                        while (tail_idx < history_tail_len) : (tail_idx += 1) {
+                        while (tail_idx < logits_tail_len) : (tail_idx += 1) {
                             traceTailProposal(
                                 options.exp_block_trace,
                                 model.tokenizer,
@@ -2590,10 +2668,10 @@ pub fn generateLoadedStreamingCached(
                                 tail_trace[tail_idx],
                             );
                         }
-                        draft_len += history_tail_len;
+                        draft_len += logits_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
-                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_history_tail_evidence bootstrap_token={d}\n",
+                            "BLOCK_PROPOSER_GUARD decision=STOP reason=no_logits_chain_tail bootstrap_token={d}\n",
                             .{bootstrap_token},
                         );
                     }

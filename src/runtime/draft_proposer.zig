@@ -28,6 +28,7 @@ pub const ProposeResult = struct {
 pub const TailProposalSource = enum {
     exact_suffix,
     suffix_backoff,
+    logits_chain,
 };
 
 pub const TailProposalTrace = struct {
@@ -40,6 +41,7 @@ pub const TailProposalTrace = struct {
         return switch (self.source) {
             .exact_suffix => "exact_suffix",
             .suffix_backoff => "suffix_backoff",
+            .logits_chain => "logits_chain",
         };
     }
 };
