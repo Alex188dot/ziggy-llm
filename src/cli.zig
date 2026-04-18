@@ -37,6 +37,11 @@ pub const Config = struct {
     exp_block_confidence_margin: f32 = 0.75,
     exp_block_cooldown_tokens: usize = 8,
     exp_block_gpu_verifier: bool = false,
+    exp_block_trace: bool = false,
+    exp_block_acceptance_threshold: f32 = 0.6,
+    exp_block_acceptance_window: usize = 8,
+    exp_block_disable_steps: usize = 16,
+    exp_block_precheck_margin_multiplier: f32 = 2.0,
 };
 
 pub const ParseError = error{
@@ -202,6 +207,36 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.exp_block_gpu_verifier = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--exp-block-trace")) {
+            config.exp_block_trace = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-acceptance-threshold")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_acceptance_threshold = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
+            if (config.exp_block_acceptance_threshold < 0) return error.InvalidTemperature;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-acceptance-window")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_acceptance_window = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-disable-steps")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_disable_steps = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exp-block-precheck-margin-multiplier")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_precheck_margin_multiplier = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
+            if (config.exp_block_precheck_margin_multiplier < 1.0) return error.InvalidTemperature;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -267,6 +302,11 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --exp-block-confidence-margin Minimum top1-top2 logit margin to speculate (default: {d:.2})
         \\      --exp-block-cooldown-tokens Tokens to keep reduced speculation after rollback (default: {d})
         \\      --exp-block-gpu-verifier Use experimental GPU verifier (default: off, sequential verifier is exactness-safe)
+        \\      --exp-block-trace Print per-step speculation trace (debug)
+        \\      --exp-block-acceptance-threshold Disable threshold for rolling accepted-prefix average (default: {d:.2})
+        \\      --exp-block-acceptance-window Rolling window size for acceptance gate (default: {d})
+        \\      --exp-block-disable-steps Tokens to keep speculation disabled after quality-gate trigger (default: {d})
+        \\      --exp-block-precheck-margin-multiplier Apply single-token precheck below threshold*multiplier (default: {d:.2})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -294,6 +334,10 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.exp_block_k,
             configDefaults.exp_block_confidence_margin,
             configDefaults.exp_block_cooldown_tokens,
+            configDefaults.exp_block_acceptance_threshold,
+            configDefaults.exp_block_acceptance_window,
+            configDefaults.exp_block_disable_steps,
+            configDefaults.exp_block_precheck_margin_multiplier,
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
@@ -320,7 +364,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--exp-block-decode", "--exp-block-k", "4", "--exp-block-confidence-margin", "1.25", "--exp-block-cooldown-tokens", "11", "--exp-block-gpu-verifier" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--exp-block-decode", "--exp-block-k", "4", "--exp-block-confidence-margin", "1.25", "--exp-block-cooldown-tokens", "11", "--exp-block-gpu-verifier", "--exp-block-trace", "--exp-block-acceptance-threshold", "0.7", "--exp-block-acceptance-window", "6", "--exp-block-disable-steps", "9", "--exp-block-precheck-margin-multiplier", "1.8" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
@@ -339,4 +383,9 @@ test "runtime flags parse correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), config.exp_block_confidence_margin, 0.0001);
     try std.testing.expectEqual(@as(usize, 11), config.exp_block_cooldown_tokens);
     try std.testing.expect(config.exp_block_gpu_verifier);
+    try std.testing.expect(config.exp_block_trace);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), config.exp_block_acceptance_threshold, 0.0001);
+    try std.testing.expectEqual(@as(usize, 6), config.exp_block_acceptance_window);
+    try std.testing.expectEqual(@as(usize, 9), config.exp_block_disable_steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.8), config.exp_block_precheck_margin_multiplier, 0.0001);
 }

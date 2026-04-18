@@ -44,6 +44,11 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .exp_block_confidence_margin = config.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = config.exp_block_cooldown_tokens,
         .exp_block_gpu_verifier = config.exp_block_gpu_verifier,
+        .exp_block_trace = config.exp_block_trace,
+        .exp_block_acceptance_threshold = config.exp_block_acceptance_threshold,
+        .exp_block_acceptance_window = config.exp_block_acceptance_window,
+        .exp_block_disable_steps = config.exp_block_disable_steps,
+        .exp_block_precheck_margin_multiplier = config.exp_block_precheck_margin_multiplier,
     });
 }
 
@@ -69,6 +74,11 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .exp_block_confidence_margin = config.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = config.exp_block_cooldown_tokens,
         .exp_block_gpu_verifier = config.exp_block_gpu_verifier,
+        .exp_block_trace = config.exp_block_trace,
+        .exp_block_acceptance_threshold = config.exp_block_acceptance_threshold,
+        .exp_block_acceptance_window = config.exp_block_acceptance_window,
+        .exp_block_disable_steps = config.exp_block_disable_steps,
+        .exp_block_precheck_margin_multiplier = config.exp_block_precheck_margin_multiplier,
     }, config.bench_runs);
 }
 

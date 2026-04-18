@@ -49,10 +49,24 @@ pub const GenerateReport = struct {
     exp_block_confidence_margin: f32 = block_policy.default_confidence_margin_threshold,
     exp_block_cooldown_tokens: usize = 8,
     exp_block_gpu_verifier: bool = false,
+    exp_block_trace: bool = false,
+    exp_block_acceptance_threshold: f32 = 0.6,
+    exp_block_acceptance_window: usize = 8,
+    exp_block_disable_steps: usize = 16,
+    exp_block_precheck_margin_multiplier: f32 = 2.0,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_confidence_gated_count: usize = 0,
     block_cooldown_active_count: usize = 0,
+    block_quality_gate_active_count: usize = 0,
+    block_quality_gate_trigger_count: usize = 0,
+    block_precheck_count: usize = 0,
+    block_precheck_fail_count: usize = 0,
+    block_mismatch_pos0_count: usize = 0,
+    block_mismatch_pos1_count: usize = 0,
+    block_mismatch_pos2_count: usize = 0,
+    block_mismatch_pos3_count: usize = 0,
+    block_full_accept_count: usize = 0,
     block_verify_ns: u64 = 0,
     block_gpu_backup_ns: u64 = 0,
     block_gpu_restore_ns: u64 = 0,
@@ -101,6 +115,7 @@ const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
+const block_acceptance_window_cap: usize = 64;
 
 pub const LayerType = enum {
     full_attention,
@@ -112,6 +127,69 @@ fn chooseSamplingPath(has_gpu_session: bool, options: runtime_types.GenerationOp
     const path = runtime_types.resolveSamplingPath(has_gpu_session, options.temperature, options.sampling_strategy);
     if (path == .gpu_topk_sampler and !runtime_types.canUseGpuTopKSampling(options)) return .cpu_logits;
     return path;
+}
+
+fn recordBlockMismatchBuckets(
+    draft_len: usize,
+    accepted_prefix_len: usize,
+    mismatch_pos0_count: *usize,
+    mismatch_pos1_count: *usize,
+    mismatch_pos2_count: *usize,
+    mismatch_pos3_count: *usize,
+    full_accept_count: *usize,
+) void {
+    if (draft_len == 0) return;
+    if (accepted_prefix_len >= draft_len) {
+        full_accept_count.* += 1;
+        return;
+    }
+    switch (accepted_prefix_len) {
+        0 => mismatch_pos0_count.* += 1,
+        1 => mismatch_pos1_count.* += 1,
+        2 => mismatch_pos2_count.* += 1,
+        else => mismatch_pos3_count.* += 1,
+    }
+}
+
+fn traceBlockAttempt(
+    enabled: bool,
+    step: usize,
+    confidence_margin: f32,
+    draft_tokens: []const u32,
+    accepted_tokens: []const u32,
+    accepted_prefix_len: usize,
+    precheck_attempted: bool,
+    precheck_failed: bool,
+) void {
+    if (!enabled) return;
+    if (accepted_prefix_len < draft_tokens.len and accepted_prefix_len < accepted_tokens.len) {
+        std.debug.print(
+            "BLOCK_TRACE step={d} margin={d:.3} draft_len={d} accepted_prefix_len={d} mismatch_pos={d} draft_token={d} verified_token={d} precheck={any} precheck_failed={any}\n",
+            .{
+                step,
+                confidence_margin,
+                draft_tokens.len,
+                accepted_prefix_len,
+                accepted_prefix_len,
+                draft_tokens[accepted_prefix_len],
+                accepted_tokens[accepted_prefix_len],
+                precheck_attempted,
+                precheck_failed,
+            },
+        );
+        return;
+    }
+    std.debug.print(
+        "BLOCK_TRACE step={d} margin={d:.3} draft_len={d} accepted_prefix_len={d} mismatch_pos=-1 precheck={any} precheck_failed={any}\n",
+        .{
+            step,
+            confidence_margin,
+            draft_tokens.len,
+            accepted_prefix_len,
+            precheck_attempted,
+            precheck_failed,
+        },
+    );
 }
 
 const ValueType = enum(u32) {
@@ -1706,9 +1784,23 @@ pub fn generateLoadedStreaming(
     var block_decode_confidence_gated: usize = 0;
     var block_decode_cooldown_active: usize = 0;
     var block_decode_cooldown_remaining: usize = 0;
+    var block_decode_quality_gate_active: usize = 0;
+    var block_decode_quality_gate_trigger_count: usize = 0;
+    var block_decode_precheck_count: usize = 0;
+    var block_decode_precheck_fail_count: usize = 0;
+    var block_decode_mismatch_pos0_count: usize = 0;
+    var block_decode_mismatch_pos1_count: usize = 0;
+    var block_decode_mismatch_pos2_count: usize = 0;
+    var block_decode_mismatch_pos3_count: usize = 0;
+    var block_decode_full_accept_count: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_recent_accepted_ema: f64 = 0.0;
     var block_recent_rollback_ema: f64 = 1.0;
+    var block_acceptance_window: [block_acceptance_window_cap]f64 = [_]f64{0} ** block_acceptance_window_cap;
+    var block_acceptance_window_sum: f64 = 0;
+    var block_acceptance_window_len: usize = 0;
+    var block_acceptance_window_cursor: usize = 0;
+    var block_spec_disable_remaining: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
     var block_gpu_restore_ns_total: u64 = 0;
@@ -1766,8 +1858,9 @@ pub fn generateLoadedStreaming(
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
+            var confidence_margin: f32 = 0;
             if (exp_block_enabled) {
-                const confidence_margin = block_policy.top1Top2Margin(session.logits);
+                confidence_margin = block_policy.top1Top2Margin(session.logits);
                 draft_limit = block_policy.selectAdaptiveDraftLimit(
                     exp_block_cap,
                     confidence_margin,
@@ -1782,6 +1875,11 @@ pub fn generateLoadedStreaming(
                 if (block_decode_cooldown_remaining > 0) {
                     block_decode_cooldown_active += 1;
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
+                }
+                if (block_spec_disable_remaining > 0) {
+                    block_decode_quality_gate_active += 1;
+                    block_spec_disable_remaining -= 1;
+                    draft_limit = 0;
                 }
                 if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
                     // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
@@ -1802,10 +1900,45 @@ pub fn generateLoadedStreaming(
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
-                var accepted_count: usize = if (use_gpu_block)
-                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
+                const precheck_base_margin = if (options.exp_block_confidence_margin > 0)
+                    options.exp_block_confidence_margin
                 else
-                    try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                    block_policy.default_confidence_margin_threshold;
+                const precheck_margin_threshold = precheck_base_margin * options.exp_block_precheck_margin_multiplier;
+                const run_precheck = exp_block_enabled and draft_tokens.len > 0 and confidence_margin < precheck_margin_threshold;
+                var precheck_attempted = false;
+                var precheck_failed = false;
+                var accepted_count: usize = 0;
+
+                if (run_precheck) {
+                    precheck_attempted = true;
+                    block_decode_precheck_count += 1;
+                    const precheck_predicted = try session.stepGreedy(next_token);
+                    accepted_tokens[0] = precheck_predicted;
+                    if (precheck_predicted != draft_tokens[0]) {
+                        accepted_count = 1;
+                        precheck_failed = true;
+                        block_decode_precheck_fail_count += 1;
+                    } else if (draft_tokens.len == 1) {
+                        accepted_tokens[1] = try session.stepGreedy(precheck_predicted);
+                        accepted_count = 2;
+                    } else {
+                        const tail_draft = draft_tokens[1..];
+                        var tail_count: usize = if (use_gpu_block)
+                            session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
+                        else
+                            try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                        if (tail_count == 0) {
+                            tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                        }
+                        accepted_count = tail_count + 1;
+                    }
+                } else {
+                    accepted_count = if (use_gpu_block)
+                        session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
+                    else
+                        try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                }
                 if (accepted_count == 0) {
                     accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 }
@@ -1828,12 +1961,49 @@ pub fn generateLoadedStreaming(
                     block_decode_rollbacks += 1;
                     block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
                 }
+                recordBlockMismatchBuckets(
+                    draft_tokens.len,
+                    accepted_prefix_len,
+                    &block_decode_mismatch_pos0_count,
+                    &block_decode_mismatch_pos1_count,
+                    &block_decode_mismatch_pos2_count,
+                    &block_decode_mismatch_pos3_count,
+                    &block_decode_full_accept_count,
+                );
+                const acceptance_window = @max(@as(usize, 1), @min(options.exp_block_acceptance_window, block_acceptance_window_cap));
+                if (block_acceptance_window_len < acceptance_window) {
+                    block_acceptance_window[block_acceptance_window_len] = accepted_prefix_f;
+                    block_acceptance_window_sum += accepted_prefix_f;
+                    block_acceptance_window_len += 1;
+                } else {
+                    block_acceptance_window_sum -= block_acceptance_window[block_acceptance_window_cursor];
+                    block_acceptance_window[block_acceptance_window_cursor] = accepted_prefix_f;
+                    block_acceptance_window_sum += accepted_prefix_f;
+                    block_acceptance_window_cursor = (block_acceptance_window_cursor + 1) % acceptance_window;
+                }
+                if (block_acceptance_window_len == acceptance_window) {
+                    const rolling_avg = block_acceptance_window_sum / @as(f64, @floatFromInt(acceptance_window));
+                    if (rolling_avg < @as(f64, options.exp_block_acceptance_threshold) and block_spec_disable_remaining == 0) {
+                        block_spec_disable_remaining = options.exp_block_disable_steps;
+                        block_decode_quality_gate_trigger_count += 1;
+                    }
+                }
                 if (use_gpu_block) {
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
+                traceBlockAttempt(
+                    options.exp_block_trace,
+                    block_decode_step_count,
+                    confidence_margin,
+                    draft_tokens,
+                    accepted_tokens[0..accepted_count],
+                    accepted_prefix_len,
+                    precheck_attempted,
+                    precheck_failed,
+                );
 
                 var i: usize = 0;
                 while (i < accepted_count - 1) : (i += 1) {
@@ -1903,10 +2073,24 @@ pub fn generateLoadedStreaming(
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
         .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
+        .exp_block_trace = options.exp_block_trace,
+        .exp_block_acceptance_threshold = options.exp_block_acceptance_threshold,
+        .exp_block_acceptance_window = options.exp_block_acceptance_window,
+        .exp_block_disable_steps = options.exp_block_disable_steps,
+        .exp_block_precheck_margin_multiplier = options.exp_block_precheck_margin_multiplier,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,
         .block_cooldown_active_count = block_decode_cooldown_active,
+        .block_quality_gate_active_count = block_decode_quality_gate_active,
+        .block_quality_gate_trigger_count = block_decode_quality_gate_trigger_count,
+        .block_precheck_count = block_decode_precheck_count,
+        .block_precheck_fail_count = block_decode_precheck_fail_count,
+        .block_mismatch_pos0_count = block_decode_mismatch_pos0_count,
+        .block_mismatch_pos1_count = block_decode_mismatch_pos1_count,
+        .block_mismatch_pos2_count = block_decode_mismatch_pos2_count,
+        .block_mismatch_pos3_count = block_decode_mismatch_pos3_count,
+        .block_full_accept_count = block_decode_full_accept_count,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,
@@ -2008,9 +2192,23 @@ pub fn generateLoadedStreamingCached(
     var block_decode_confidence_gated: usize = 0;
     var block_decode_cooldown_active: usize = 0;
     var block_decode_cooldown_remaining: usize = 0;
+    var block_decode_quality_gate_active: usize = 0;
+    var block_decode_quality_gate_trigger_count: usize = 0;
+    var block_decode_precheck_count: usize = 0;
+    var block_decode_precheck_fail_count: usize = 0;
+    var block_decode_mismatch_pos0_count: usize = 0;
+    var block_decode_mismatch_pos1_count: usize = 0;
+    var block_decode_mismatch_pos2_count: usize = 0;
+    var block_decode_mismatch_pos3_count: usize = 0;
+    var block_decode_full_accept_count: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_recent_accepted_ema: f64 = 0.0;
     var block_recent_rollback_ema: f64 = 1.0;
+    var block_acceptance_window: [block_acceptance_window_cap]f64 = [_]f64{0} ** block_acceptance_window_cap;
+    var block_acceptance_window_sum: f64 = 0;
+    var block_acceptance_window_len: usize = 0;
+    var block_acceptance_window_cursor: usize = 0;
+    var block_spec_disable_remaining: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
     var block_gpu_restore_ns_total: u64 = 0;
@@ -2068,8 +2266,9 @@ pub fn generateLoadedStreamingCached(
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
+            var confidence_margin: f32 = 0;
             if (exp_block_enabled) {
-                const confidence_margin = block_policy.top1Top2Margin(session.logits);
+                confidence_margin = block_policy.top1Top2Margin(session.logits);
                 draft_limit = block_policy.selectAdaptiveDraftLimit(
                     exp_block_cap,
                     confidence_margin,
@@ -2084,6 +2283,11 @@ pub fn generateLoadedStreamingCached(
                 if (block_decode_cooldown_remaining > 0) {
                     block_decode_cooldown_active += 1;
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
+                }
+                if (block_spec_disable_remaining > 0) {
+                    block_decode_quality_gate_active += 1;
+                    block_spec_disable_remaining -= 1;
+                    draft_limit = 0;
                 }
                 if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
                     // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
@@ -2104,10 +2308,45 @@ pub fn generateLoadedStreamingCached(
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
-                var accepted_count: usize = if (use_gpu_block)
-                    session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
+                const precheck_base_margin = if (options.exp_block_confidence_margin > 0)
+                    options.exp_block_confidence_margin
                 else
-                    try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                    block_policy.default_confidence_margin_threshold;
+                const precheck_margin_threshold = precheck_base_margin * options.exp_block_precheck_margin_multiplier;
+                const run_precheck = exp_block_enabled and draft_tokens.len > 0 and confidence_margin < precheck_margin_threshold;
+                var precheck_attempted = false;
+                var precheck_failed = false;
+                var accepted_count: usize = 0;
+
+                if (run_precheck) {
+                    precheck_attempted = true;
+                    block_decode_precheck_count += 1;
+                    const precheck_predicted = try session.stepGreedy(next_token);
+                    accepted_tokens[0] = precheck_predicted;
+                    if (precheck_predicted != draft_tokens[0]) {
+                        accepted_count = 1;
+                        precheck_failed = true;
+                        block_decode_precheck_fail_count += 1;
+                    } else if (draft_tokens.len == 1) {
+                        accepted_tokens[1] = try session.stepGreedy(precheck_predicted);
+                        accepted_count = 2;
+                    } else {
+                        const tail_draft = draft_tokens[1..];
+                        var tail_count: usize = if (use_gpu_block)
+                            session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
+                        else
+                            try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                        if (tail_count == 0) {
+                            tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                        }
+                        accepted_count = tail_count + 1;
+                    }
+                } else {
+                    accepted_count = if (use_gpu_block)
+                        session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
+                    else
+                        try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                }
                 if (accepted_count == 0) {
                     accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 }
@@ -2130,12 +2369,49 @@ pub fn generateLoadedStreamingCached(
                     block_decode_rollbacks += 1;
                     block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
                 }
+                recordBlockMismatchBuckets(
+                    draft_tokens.len,
+                    accepted_prefix_len,
+                    &block_decode_mismatch_pos0_count,
+                    &block_decode_mismatch_pos1_count,
+                    &block_decode_mismatch_pos2_count,
+                    &block_decode_mismatch_pos3_count,
+                    &block_decode_full_accept_count,
+                );
+                const acceptance_window = @max(@as(usize, 1), @min(options.exp_block_acceptance_window, block_acceptance_window_cap));
+                if (block_acceptance_window_len < acceptance_window) {
+                    block_acceptance_window[block_acceptance_window_len] = accepted_prefix_f;
+                    block_acceptance_window_sum += accepted_prefix_f;
+                    block_acceptance_window_len += 1;
+                } else {
+                    block_acceptance_window_sum -= block_acceptance_window[block_acceptance_window_cursor];
+                    block_acceptance_window[block_acceptance_window_cursor] = accepted_prefix_f;
+                    block_acceptance_window_sum += accepted_prefix_f;
+                    block_acceptance_window_cursor = (block_acceptance_window_cursor + 1) % acceptance_window;
+                }
+                if (block_acceptance_window_len == acceptance_window) {
+                    const rolling_avg = block_acceptance_window_sum / @as(f64, @floatFromInt(acceptance_window));
+                    if (rolling_avg < @as(f64, options.exp_block_acceptance_threshold) and block_spec_disable_remaining == 0) {
+                        block_spec_disable_remaining = options.exp_block_disable_steps;
+                        block_decode_quality_gate_trigger_count += 1;
+                    }
+                }
                 if (use_gpu_block) {
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
+                traceBlockAttempt(
+                    options.exp_block_trace,
+                    block_decode_step_count,
+                    confidence_margin,
+                    draft_tokens,
+                    accepted_tokens[0..accepted_count],
+                    accepted_prefix_len,
+                    precheck_attempted,
+                    precheck_failed,
+                );
 
                 var i: usize = 0;
                 while (i < accepted_count - 1) : (i += 1) {
@@ -2205,10 +2481,24 @@ pub fn generateLoadedStreamingCached(
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
         .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
+        .exp_block_trace = options.exp_block_trace,
+        .exp_block_acceptance_threshold = options.exp_block_acceptance_threshold,
+        .exp_block_acceptance_window = options.exp_block_acceptance_window,
+        .exp_block_disable_steps = options.exp_block_disable_steps,
+        .exp_block_precheck_margin_multiplier = options.exp_block_precheck_margin_multiplier,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,
         .block_cooldown_active_count = block_decode_cooldown_active,
+        .block_quality_gate_active_count = block_decode_quality_gate_active,
+        .block_quality_gate_trigger_count = block_decode_quality_gate_trigger_count,
+        .block_precheck_count = block_decode_precheck_count,
+        .block_precheck_fail_count = block_decode_precheck_fail_count,
+        .block_mismatch_pos0_count = block_decode_mismatch_pos0_count,
+        .block_mismatch_pos1_count = block_decode_mismatch_pos1_count,
+        .block_mismatch_pos2_count = block_decode_mismatch_pos2_count,
+        .block_mismatch_pos3_count = block_decode_mismatch_pos3_count,
+        .block_full_accept_count = block_decode_full_accept_count,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,

@@ -84,6 +84,11 @@ pub fn generate(
             .exp_block_confidence_margin = options.exp_block_confidence_margin,
             .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
             .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
+            .exp_block_trace = options.exp_block_trace,
+            .exp_block_acceptance_threshold = options.exp_block_acceptance_threshold,
+            .exp_block_acceptance_window = options.exp_block_acceptance_window,
+            .exp_block_disable_steps = options.exp_block_disable_steps,
+            .exp_block_precheck_margin_multiplier = options.exp_block_precheck_margin_multiplier,
         };
 
         const family_report = try runtime.generate(allocator, model_path, prompt, family_options);
@@ -110,10 +115,24 @@ pub fn generate(
             .exp_block_confidence_margin = family_report.exp_block_confidence_margin,
             .exp_block_cooldown_tokens = family_report.exp_block_cooldown_tokens,
             .exp_block_gpu_verifier = family_report.exp_block_gpu_verifier,
+            .exp_block_trace = family_report.exp_block_trace,
+            .exp_block_acceptance_threshold = family_report.exp_block_acceptance_threshold,
+            .exp_block_acceptance_window = family_report.exp_block_acceptance_window,
+            .exp_block_disable_steps = family_report.exp_block_disable_steps,
+            .exp_block_precheck_margin_multiplier = family_report.exp_block_precheck_margin_multiplier,
             .block_accepted_prefix_len = family_report.block_accepted_prefix_len,
             .block_rollback_count = family_report.block_rollback_count,
             .block_confidence_gated_count = family_report.block_confidence_gated_count,
             .block_cooldown_active_count = family_report.block_cooldown_active_count,
+            .block_quality_gate_active_count = family_report.block_quality_gate_active_count,
+            .block_quality_gate_trigger_count = family_report.block_quality_gate_trigger_count,
+            .block_precheck_count = family_report.block_precheck_count,
+            .block_precheck_fail_count = family_report.block_precheck_fail_count,
+            .block_mismatch_pos0_count = family_report.block_mismatch_pos0_count,
+            .block_mismatch_pos1_count = family_report.block_mismatch_pos1_count,
+            .block_mismatch_pos2_count = family_report.block_mismatch_pos2_count,
+            .block_mismatch_pos3_count = family_report.block_mismatch_pos3_count,
+            .block_full_accept_count = family_report.block_full_accept_count,
             .block_verify_ns = family_report.block_verify_ns,
             .block_gpu_backup_ns = family_report.block_gpu_backup_ns,
             .block_gpu_restore_ns = family_report.block_gpu_restore_ns,
@@ -200,6 +219,15 @@ pub fn runCommand(
         \\block.rollback_count: {d}
         \\block.confidence_gated_count: {d}
         \\block.cooldown_active_count: {d}
+        \\block.quality_gate_active_count: {d}
+        \\block.quality_gate_trigger_count: {d}
+        \\block.precheck_count: {d}
+        \\block.precheck_fail_count: {d}
+        \\block.mismatch_pos0_count: {d}
+        \\block.mismatch_pos1_count: {d}
+        \\block.mismatch_pos2_count: {d}
+        \\block.mismatch_pos3_count: {d}
+        \\block.full_accept_count: {d}
         \\block.verify_ms: {d:.3}
         \\block.gpu_backup_ms: {d:.3}
         \\block.gpu_restore_ms: {d:.3}
@@ -218,6 +246,15 @@ pub fn runCommand(
             report.block_rollback_count,
             report.block_confidence_gated_count,
             report.block_cooldown_active_count,
+            report.block_quality_gate_active_count,
+            report.block_quality_gate_trigger_count,
+            report.block_precheck_count,
+            report.block_precheck_fail_count,
+            report.block_mismatch_pos0_count,
+            report.block_mismatch_pos1_count,
+            report.block_mismatch_pos2_count,
+            report.block_mismatch_pos3_count,
+            report.block_full_accept_count,
             nsToMs(report.block_verify_ns),
             nsToMs(report.block_gpu_backup_ns),
             nsToMs(report.block_gpu_restore_ns),
@@ -298,6 +335,15 @@ pub fn benchCommand(
             \\cold.block.rollback_count={d}
             \\cold.block.confidence_gated_count={d}
             \\cold.block.cooldown_active_count={d}
+            \\cold.block.quality_gate_active_count={d}
+            \\cold.block.quality_gate_trigger_count={d}
+            \\cold.block.precheck_count={d}
+            \\cold.block.precheck_fail_count={d}
+            \\cold.block.mismatch_pos0_count={d}
+            \\cold.block.mismatch_pos1_count={d}
+            \\cold.block.mismatch_pos2_count={d}
+            \\cold.block.mismatch_pos3_count={d}
+            \\cold.block.full_accept_count={d}
             \\cold.block.verify_ms={d:.3}
             \\cold.block.gpu_backup_ms={d:.3}
             \\cold.block.gpu_restore_ms={d:.3}
@@ -314,6 +360,15 @@ pub fn benchCommand(
                 summary.cold.block_rollback_count,
                 summary.cold.block_confidence_gated_count,
                 summary.cold.block_cooldown_active_count,
+                summary.cold.block_quality_gate_active_count,
+                summary.cold.block_quality_gate_trigger_count,
+                summary.cold.block_precheck_count,
+                summary.cold.block_precheck_fail_count,
+                summary.cold.block_mismatch_pos0_count,
+                summary.cold.block_mismatch_pos1_count,
+                summary.cold.block_mismatch_pos2_count,
+                summary.cold.block_mismatch_pos3_count,
+                summary.cold.block_full_accept_count,
                 nsToMs(summary.cold.block_verify_ns),
                 nsToMs(summary.cold.block_gpu_backup_ns),
                 nsToMs(summary.cold.block_gpu_restore_ns),
@@ -366,6 +421,15 @@ pub fn benchCommand(
             \\warm.block.rollback_count_avg={d}
             \\warm.block.confidence_gated_count_avg={d}
             \\warm.block.cooldown_active_count_avg={d}
+            \\warm.block.quality_gate_active_count_avg={d}
+            \\warm.block.quality_gate_trigger_count_avg={d}
+            \\warm.block.precheck_count_avg={d}
+            \\warm.block.precheck_fail_count_avg={d}
+            \\warm.block.mismatch_pos0_count_avg={d}
+            \\warm.block.mismatch_pos1_count_avg={d}
+            \\warm.block.mismatch_pos2_count_avg={d}
+            \\warm.block.mismatch_pos3_count_avg={d}
+            \\warm.block.full_accept_count_avg={d}
             \\warm.block.verify_ms_avg={d:.3}
             \\warm.block.gpu_backup_ms_avg={d:.3}
             \\warm.block.gpu_restore_ms_avg={d:.3}
@@ -379,6 +443,15 @@ pub fn benchCommand(
                 summary.warm_block_rollback_count_avg,
                 summary.warm_block_confidence_gated_count_avg,
                 summary.warm_block_cooldown_active_count_avg,
+                summary.warm_block_quality_gate_active_count_avg,
+                summary.warm_block_quality_gate_trigger_count_avg,
+                summary.warm_block_precheck_count_avg,
+                summary.warm_block_precheck_fail_count_avg,
+                summary.warm_block_mismatch_pos0_count_avg,
+                summary.warm_block_mismatch_pos1_count_avg,
+                summary.warm_block_mismatch_pos2_count_avg,
+                summary.warm_block_mismatch_pos3_count_avg,
+                summary.warm_block_full_accept_count_avg,
                 nsToMs(summary.warm_block_verify_ns_avg),
                 nsToMs(summary.warm_block_gpu_backup_ns_avg),
                 nsToMs(summary.warm_block_gpu_restore_ns_avg),
@@ -457,6 +530,15 @@ pub fn benchCommand(
         \\block.rollback_count={d}
         \\block.confidence_gated_count={d}
         \\block.cooldown_active_count={d}
+        \\block.quality_gate_active_count={d}
+        \\block.quality_gate_trigger_count={d}
+        \\block.precheck_count={d}
+        \\block.precheck_fail_count={d}
+        \\block.mismatch_pos0_count={d}
+        \\block.mismatch_pos1_count={d}
+        \\block.mismatch_pos2_count={d}
+        \\block.mismatch_pos3_count={d}
+        \\block.full_accept_count={d}
         \\block.verify_ms={d:.3}
         \\block.gpu_backup_ms={d:.3}
         \\block.gpu_restore_ms={d:.3}
@@ -473,6 +555,15 @@ pub fn benchCommand(
             report.block_rollback_count,
             report.block_confidence_gated_count,
             report.block_cooldown_active_count,
+            report.block_quality_gate_active_count,
+            report.block_quality_gate_trigger_count,
+            report.block_precheck_count,
+            report.block_precheck_fail_count,
+            report.block_mismatch_pos0_count,
+            report.block_mismatch_pos1_count,
+            report.block_mismatch_pos2_count,
+            report.block_mismatch_pos3_count,
+            report.block_full_accept_count,
             nsToMs(report.block_verify_ns),
             nsToMs(report.block_gpu_backup_ns),
             nsToMs(report.block_gpu_restore_ns),
