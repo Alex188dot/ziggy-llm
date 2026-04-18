@@ -3,10 +3,12 @@ const std = @import("std");
 // Conservative default: only speculate when the top-1 token is clearly separated.
 pub const default_confidence_margin_threshold: f32 = 0.75;
 pub const cooldown_draft_cap: usize = 1;
-const rollback_ema_unstable: f64 = 0.45;
+const rollback_ema_unstable: f64 = 0.35;
+const rollback_ema_disable: f64 = 0.55;
+const accepted_ema_min_for_medium: f64 = 0.9;
 const accepted_ema_high: f64 = 1.8;
 const high_confidence_multiplier: f32 = 2.0;
-const medium_confidence_multiplier: f32 = 1.25;
+const medium_confidence_multiplier: f32 = 1.35;
 
 pub fn top1Top2Margin(logits: []const f32) f32 {
     std.debug.assert(logits.len > 0);
@@ -44,22 +46,28 @@ pub fn selectAdaptiveDraftLimit(
     confidence_threshold: f32,
     recent_accepted_ema: f64,
     recent_rollback_ema: f64,
+    observed_steps: usize,
 ) usize {
     if (exp_block_cap == 0) return 0;
     if (confidence_margin < confidence_threshold) return 0;
     if (exp_block_cap == 1) return 1;
+
+    // After warmup, avoid speculative work in clearly unstable regions.
+    if (observed_steps >= 8 and recent_rollback_ema >= rollback_ema_disable and recent_accepted_ema < 0.5) {
+        return 0;
+    }
 
     if (recent_rollback_ema >= rollback_ema_unstable) {
         return @min(exp_block_cap, @as(usize, 1));
     }
 
     const high_confidence_threshold = confidence_threshold * high_confidence_multiplier;
-    if (exp_block_cap >= 4 and confidence_margin >= high_confidence_threshold and recent_accepted_ema >= accepted_ema_high) {
+    if (exp_block_cap >= 4 and confidence_margin >= high_confidence_threshold and recent_accepted_ema >= accepted_ema_high and recent_rollback_ema <= 0.15) {
         return @min(exp_block_cap, @as(usize, 4));
     }
 
     const medium_confidence_threshold = confidence_threshold * medium_confidence_multiplier;
-    if (confidence_margin >= medium_confidence_threshold) {
+    if (confidence_margin >= medium_confidence_threshold and recent_accepted_ema >= accepted_ema_min_for_medium) {
         return @min(exp_block_cap, @as(usize, 2));
     }
 
@@ -104,10 +112,11 @@ test "applyCooldownDraftLimit clamps while countdown is active" {
 }
 
 test "selectAdaptiveDraftLimit gates low confidence and scales on stable high confidence" {
-    try std.testing.expectEqual(@as(usize, 0), selectAdaptiveDraftLimit(4, 0.6, 0.75, 2.0, 0.1));
-    try std.testing.expectEqual(@as(usize, 2), selectAdaptiveDraftLimit(4, 1.0, 0.75, 1.6, 0.1));
-    try std.testing.expectEqual(@as(usize, 4), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.1));
-    try std.testing.expectEqual(@as(usize, 1), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.5));
+    try std.testing.expectEqual(@as(usize, 0), selectAdaptiveDraftLimit(4, 0.6, 0.75, 2.0, 0.1, 10));
+    try std.testing.expectEqual(@as(usize, 2), selectAdaptiveDraftLimit(4, 1.1, 0.75, 1.6, 0.1, 10));
+    try std.testing.expectEqual(@as(usize, 4), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.1, 10));
+    try std.testing.expectEqual(@as(usize, 1), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.5, 10));
+    try std.testing.expectEqual(@as(usize, 0), selectAdaptiveDraftLimit(4, 1.2, 0.75, 0.3, 0.7, 12));
 }
 
 test "acceptedPrefixInvariantHolds enforces prefix semantics" {

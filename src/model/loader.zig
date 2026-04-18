@@ -1774,6 +1774,7 @@ pub fn generateLoadedStreaming(
                     options.exp_block_confidence_margin,
                     block_recent_accepted_ema,
                     block_recent_rollback_ema,
+                    block_decode_step_count,
                 );
                 if (draft_limit == 0 and confidence_margin < options.exp_block_confidence_margin) {
                     block_decode_confidence_gated += 1;
@@ -1782,11 +1783,16 @@ pub fn generateLoadedStreaming(
                     block_decode_cooldown_active += 1;
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
                 }
+                if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
+                    // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
+                    draft_limit = 1;
+                }
             }
             const draft_len = draft_proposer.proposeDraftTokens(
                 next_token,
                 session.token_buffer[0..session.position],
                 session.logits,
+                options.repeat_penalty,
                 draft_limit,
                 &drafted_tokens,
             );
@@ -2070,6 +2076,7 @@ pub fn generateLoadedStreamingCached(
                     options.exp_block_confidence_margin,
                     block_recent_accepted_ema,
                     block_recent_rollback_ema,
+                    block_decode_step_count,
                 );
                 if (draft_limit == 0 and confidence_margin < options.exp_block_confidence_margin) {
                     block_decode_confidence_gated += 1;
@@ -2078,11 +2085,16 @@ pub fn generateLoadedStreamingCached(
                     block_decode_cooldown_active += 1;
                     draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
                 }
+                if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
+                    // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
+                    draft_limit = 1;
+                }
             }
             const draft_len = draft_proposer.proposeDraftTokens(
                 next_token,
                 session.token_buffer[0..session.position],
                 session.logits,
+                options.repeat_penalty,
                 draft_limit,
                 &drafted_tokens,
             );
