@@ -352,3 +352,16 @@ Current implementation note:
 | ---------- | --------------------------------------------------- | ------------------- | ------- | ---------------------- | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
 | 2026-04-06 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `Qwen3-8B-Q4_K_M.gguf` |             7 |              128 |   8142.864 |  1710.644 | 9854.502 |     17.789 |
 | 2026-04-06 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits  | MacBook Pro M3 18GB | `metal` | `Qwen3-8B-Q4_K_M.gguf` |             7 |              128 |      0.052 |   358.597 |  359.690 |     17.575 |
+
+## Benchmark Table — Gemma 2 2B
+
+| Date       | Mode                                                | Machine             | Backend | Model                          | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
+| ---------- | --------------------------------------------------- | ------------------- | ------- | ------------------------------ | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
+| 2026-04-18 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |   1746.644 |   388.895 | 2136.813 |     43.890 |
+| 2026-04-18 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits  | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |      0.003 |   348.031 |  349.321 |     44.060 |
+
+## Benchmark Table — Gemma 3 4B
+
+| Date       | Mode                                                | Machine             | Backend | Model                            | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
+| ---------- | --------------------------------------------------- | ------------------- | ------- | -------------------------------- | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
+| 2026-04-18 | GPU inference not yet working (InvalidTensorMetadata) | MacBook Pro M3 18GB | `metal` | `gemma-3-4b-it-Q4_K_M.gguf` |           - |              - |         - |         - |       - |          - |
