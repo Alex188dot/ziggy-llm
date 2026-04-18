@@ -28,6 +28,7 @@ fn llamaGenerate(
         .sampling_strategy = options.sampling_strategy,
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
+        .exp_block_confidence_margin = options.exp_block_confidence_margin,
     };
     const report = try llama_runtime.generate(allocator, model_path, prompt, gen_opts);
     return families_mod.FamilyReport{
@@ -49,8 +50,10 @@ fn llamaGenerate(
         .metal_profile_summary = report.metal_profile_summary,
         .exp_block_decode = report.exp_block_decode,
         .exp_block_k = report.exp_block_k,
+        .exp_block_confidence_margin = report.exp_block_confidence_margin,
         .block_accepted_prefix_len = report.block_accepted_prefix_len,
         .block_rollback_count = report.block_rollback_count,
+        .block_confidence_gated_count = report.block_confidence_gated_count,
         .block_verify_ns = report.block_verify_ns,
         .block_gpu_backup_ns = report.block_gpu_backup_ns,
         .block_gpu_restore_ns = report.block_gpu_restore_ns,

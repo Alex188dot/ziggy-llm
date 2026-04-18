@@ -41,6 +41,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .sampling_strategy = config.sampling_strategy,
         .exp_block_decode = config.exp_block_decode,
         .exp_block_k = config.exp_block_k,
+        .exp_block_confidence_margin = config.exp_block_confidence_margin,
     });
 }
 
@@ -63,6 +64,7 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .sampling_strategy = config.sampling_strategy,
         .exp_block_decode = config.exp_block_decode,
         .exp_block_k = config.exp_block_k,
+        .exp_block_confidence_margin = config.exp_block_confidence_margin,
     }, config.bench_runs);
 }
 

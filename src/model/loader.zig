@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal = @import("../terminal.zig");
 const backend_api = @import("../runtime/backend.zig");
 const gpu = @import("../runtime/gpu/session.zig");
+const block_policy = @import("../runtime/block_policy.zig");
 const metal_profile = @import("../runtime/metal_profile.zig");
 const moon_quant_calibration = @import("../moon_quant_calibration.zig");
 const runtime_types = @import("../runtime/types.zig");
@@ -44,8 +45,10 @@ pub const GenerateReport = struct {
     metal_profile_summary: ?[]u8 = null,
     exp_block_decode: bool = false,
     exp_block_k: usize = 0,
+    exp_block_confidence_margin: f32 = block_policy.default_confidence_margin_threshold,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
+    block_confidence_gated_count: usize = 0,
     block_verify_ns: u64 = 0,
     block_gpu_backup_ns: u64 = 0,
     block_gpu_restore_ns: u64 = 0,
@@ -1695,6 +1698,7 @@ pub fn generateLoadedStreaming(
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
+    var block_decode_confidence_gated: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
@@ -1754,6 +1758,10 @@ pub fn generateLoadedStreaming(
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = default_draft_len;
             if (exp_block_enabled) {
+                if (!block_policy.shouldSpeculateFromLogits(session.logits, options.exp_block_confidence_margin)) {
+                    block_decode_confidence_gated += 1;
+                    draft_limit = 0;
+                }
                 if (exp_block_cap >= @as(usize, 4)) {
                     const mean_accepted = if (block_decode_step_count > 0)
                         @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count))
@@ -1764,11 +1772,10 @@ pub fn generateLoadedStreaming(
                     else
                         1.0;
                     const adaptive_k: usize = if (block_decode_step_count >= 8 and mean_accepted >= 2.5 and rollback_ratio <= 0.25) @as(usize, 4) else @as(usize, 2);
-                    draft_limit = @min(exp_block_cap, adaptive_k);
+                    if (draft_limit > 0) draft_limit = @min(exp_block_cap, adaptive_k);
                 } else {
-                    draft_limit = exp_block_cap;
+                    if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
-                if (draft_limit == 0) draft_limit = @as(usize, 1);
             }
             const draft_tokens = session.findDraftTokens(next_token, draft_limit);
             if (draft_tokens.len > 0) {
@@ -1860,8 +1867,10 @@ pub fn generateLoadedStreaming(
         .metal_profile_summary = profile_summary,
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
+        .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
+        .block_confidence_gated_count = block_decode_confidence_gated,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,
@@ -1959,6 +1968,7 @@ pub fn generateLoadedStreamingCached(
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
+    var block_decode_confidence_gated: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
@@ -2018,6 +2028,10 @@ pub fn generateLoadedStreamingCached(
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = default_draft_len;
             if (exp_block_enabled) {
+                if (!block_policy.shouldSpeculateFromLogits(session.logits, options.exp_block_confidence_margin)) {
+                    block_decode_confidence_gated += 1;
+                    draft_limit = 0;
+                }
                 if (exp_block_cap >= @as(usize, 4)) {
                     const mean_accepted = if (block_decode_step_count > 0)
                         @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count))
@@ -2028,11 +2042,10 @@ pub fn generateLoadedStreamingCached(
                     else
                         1.0;
                     const adaptive_k: usize = if (block_decode_step_count >= 8 and mean_accepted >= 2.5 and rollback_ratio <= 0.25) @as(usize, 4) else @as(usize, 2);
-                    draft_limit = @min(exp_block_cap, adaptive_k);
+                    if (draft_limit > 0) draft_limit = @min(exp_block_cap, adaptive_k);
                 } else {
-                    draft_limit = exp_block_cap;
+                    if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
-                if (draft_limit == 0) draft_limit = @as(usize, 1);
             }
             const draft_tokens = session.findDraftTokens(next_token, draft_limit);
             if (draft_tokens.len > 0) {
@@ -2124,8 +2137,10 @@ pub fn generateLoadedStreamingCached(
         .metal_profile_summary = profile_summary,
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
+        .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
+        .block_confidence_gated_count = block_decode_confidence_gated,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,

@@ -34,6 +34,7 @@ pub const Config = struct {
     sampling_strategy: runtime.SamplingStrategy = .auto,
     exp_block_decode: bool = false,
     exp_block_k: usize = 2,
+    exp_block_confidence_margin: f32 = 0.75,
 };
 
 pub const ParseError = error{
@@ -182,6 +183,13 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.exp_block_k = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--exp-block-confidence-margin")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.exp_block_confidence_margin = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidTemperature;
+            if (config.exp_block_confidence_margin < 0) return error.InvalidTemperature;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -242,6 +250,9 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
         \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-topk-sample, gpu-shortlist, cpu-full-logits (default: {s})
+        \\      --exp-block-decode Enable speculative block decode experiment (deterministic only)
+        \\      --exp-block-k <n> Maximum speculative draft length (default: {d})
+        \\      --exp-block-confidence-margin Minimum top1-top2 logit margin to speculate (default: {d:.2})
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -266,6 +277,8 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
             configDefaults.backend.label(),
             configDefaults.moon_quant.label(),
             configDefaults.sampling_strategy.label(),
+            configDefaults.exp_block_k,
+            configDefaults.exp_block_confidence_margin,
             server.default_port,
             if (build_options.enable_metal) "yes" else "no",
         },
@@ -292,7 +305,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--exp-block-decode", "--exp-block-k", "4", "--exp-block-confidence-margin", "1.25" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
@@ -306,4 +319,7 @@ test "runtime flags parse correctly" {
     try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
     try std.testing.expect(config.metal_profile);
     try std.testing.expectEqual(runtime.SamplingStrategy.gpu_shortlist, config.sampling_strategy);
+    try std.testing.expect(config.exp_block_decode);
+    try std.testing.expectEqual(@as(usize, 4), config.exp_block_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), config.exp_block_confidence_margin, 0.0001);
 }
