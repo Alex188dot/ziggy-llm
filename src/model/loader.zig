@@ -192,6 +192,54 @@ fn traceBlockAttempt(
     );
 }
 
+fn traceBlockProposals(
+    enabled: bool,
+    step: usize,
+    draft_tokens: []const u32,
+    accepted_tokens: []const u32,
+    accepted_prefix_len: usize,
+) void {
+    if (!enabled) return;
+    if (draft_tokens.len == 0) return;
+
+    std.debug.print(
+        "BLOCK_PROPOSAL step={d} draft_len={d} accepted_prefix_len={d} draft={any} verified={any}\n",
+        .{ step, draft_tokens.len, accepted_prefix_len, draft_tokens, accepted_tokens },
+    );
+
+    var i: usize = 0;
+    while (i < draft_tokens.len) : (i += 1) {
+        const proposed = draft_tokens[i];
+        if (i < accepted_prefix_len) {
+            std.debug.print(
+                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified={d} decision=ACCEPT reason=prefix_match\n",
+                .{ step, i, proposed, accepted_tokens[i] },
+            );
+            continue;
+        }
+
+        if (i == accepted_prefix_len and accepted_prefix_len < draft_tokens.len and i < accepted_tokens.len) {
+            std.debug.print(
+                "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified={d} decision=DISCARD reason=mismatch\n",
+                .{ step, i, proposed, accepted_tokens[i] },
+            );
+            continue;
+        }
+
+        std.debug.print(
+            "BLOCK_PROPOSAL step={d} idx={d} proposed={d} verified=-1 decision=DISCARD reason=rollback_after_mismatch\n",
+            .{ step, i, proposed },
+        );
+    }
+
+    if (accepted_tokens.len > draft_tokens.len) {
+        std.debug.print(
+            "BLOCK_PROPOSAL step={d} bonus_token={d} decision=APPEND reason=verified_next\n",
+            .{ step, accepted_tokens[draft_tokens.len] },
+        );
+    }
+}
+
 const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
@@ -2004,6 +2052,13 @@ pub fn generateLoadedStreaming(
                     precheck_attempted,
                     precheck_failed,
                 );
+                traceBlockProposals(
+                    options.exp_block_trace,
+                    block_decode_step_count,
+                    draft_tokens,
+                    accepted_tokens[0..accepted_count],
+                    accepted_prefix_len,
+                );
 
                 var i: usize = 0;
                 while (i < accepted_count - 1) : (i += 1) {
@@ -2411,6 +2466,13 @@ pub fn generateLoadedStreamingCached(
                     accepted_prefix_len,
                     precheck_attempted,
                     precheck_failed,
+                );
+                traceBlockProposals(
+                    options.exp_block_trace,
+                    block_decode_step_count,
+                    draft_tokens,
+                    accepted_tokens[0..accepted_count],
+                    accepted_prefix_len,
                 );
 
                 var i: usize = 0;
