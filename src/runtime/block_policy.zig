@@ -66,6 +66,21 @@ pub fn selectAdaptiveDraftLimit(
     return 1;
 }
 
+pub fn acceptedPrefixInvariantHolds(draft_tokens: []const u32, verified_tokens: []const u32, accepted_count: usize) bool {
+    if (accepted_count == 0) return false;
+    if (accepted_count > draft_tokens.len + 1) return false;
+    if (verified_tokens.len < accepted_count) return false;
+
+    const accepted_prefix_len = accepted_count - 1;
+    for (0..accepted_prefix_len) |i| {
+        if (verified_tokens[i] != draft_tokens[i]) return false;
+    }
+    if (accepted_prefix_len < draft_tokens.len and verified_tokens[accepted_prefix_len] == draft_tokens[accepted_prefix_len]) {
+        return false;
+    }
+    return true;
+}
+
 test "top1Top2Margin returns best-second gap" {
     const logits = [_]f32{ -2.0, 0.5, 1.75, 1.0 };
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), top1Top2Margin(&logits), 1e-6);
@@ -93,4 +108,15 @@ test "selectAdaptiveDraftLimit gates low confidence and scales on stable high co
     try std.testing.expectEqual(@as(usize, 2), selectAdaptiveDraftLimit(4, 1.0, 0.75, 1.6, 0.1));
     try std.testing.expectEqual(@as(usize, 4), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.1));
     try std.testing.expectEqual(@as(usize, 1), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.5));
+}
+
+test "acceptedPrefixInvariantHolds enforces prefix semantics" {
+    const draft = [_]u32{ 10, 11, 12 };
+    const verified_match_then_mismatch = [_]u32{ 10, 11, 9 };
+    const verified_full_accept = [_]u32{ 10, 11, 12, 13 };
+    const bad_prefix = [_]u32{ 10, 11 };
+
+    try std.testing.expect(acceptedPrefixInvariantHolds(&draft, &verified_match_then_mismatch, 3));
+    try std.testing.expect(acceptedPrefixInvariantHolds(&draft, &verified_full_accept, 4));
+    try std.testing.expect(!acceptedPrefixInvariantHolds(&draft, &bad_prefix, 2));
 }

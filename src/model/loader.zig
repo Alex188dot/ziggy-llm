@@ -1794,12 +1794,19 @@ pub fn generateLoadedStreaming(
                 const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
+                const position_before_verify = session.position;
                 var accepted_count: usize = if (use_gpu_block)
                     session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
                 else
                     try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 if (accepted_count == 0) {
                     accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                }
+                if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
+                    return error.InvalidTensorMetadata;
+                }
+                if (session.position != position_before_verify + accepted_count) {
+                    return error.InvalidTensorMetadata;
                 }
                 if (use_gpu_block) {
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
@@ -2082,12 +2089,19 @@ pub fn generateLoadedStreamingCached(
                 const use_gpu_block = exp_block_enabled;
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
+                const position_before_verify = session.position;
                 var accepted_count: usize = if (use_gpu_block)
                     session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
                 else
                     try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
                 if (accepted_count == 0) {
                     accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                }
+                if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
+                    return error.InvalidTensorMetadata;
+                }
+                if (session.position != position_before_verify + accepted_count) {
+                    return error.InvalidTensorMetadata;
                 }
                 if (use_gpu_block) {
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
