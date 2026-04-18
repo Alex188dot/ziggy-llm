@@ -43,6 +43,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .exp_block_k = config.exp_block_k,
         .exp_block_confidence_margin = config.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = config.exp_block_cooldown_tokens,
+        .exp_block_gpu_verifier = config.exp_block_gpu_verifier,
     });
 }
 
@@ -67,6 +68,7 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .exp_block_k = config.exp_block_k,
         .exp_block_confidence_margin = config.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = config.exp_block_cooldown_tokens,
+        .exp_block_gpu_verifier = config.exp_block_gpu_verifier,
     }, config.bench_runs);
 }
 

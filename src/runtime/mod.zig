@@ -83,6 +83,7 @@ pub fn generate(
             .exp_block_k = options.exp_block_k,
             .exp_block_confidence_margin = options.exp_block_confidence_margin,
             .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
+            .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
         };
 
         const family_report = try runtime.generate(allocator, model_path, prompt, family_options);
@@ -108,6 +109,7 @@ pub fn generate(
             .exp_block_k = family_report.exp_block_k,
             .exp_block_confidence_margin = family_report.exp_block_confidence_margin,
             .exp_block_cooldown_tokens = family_report.exp_block_cooldown_tokens,
+            .exp_block_gpu_verifier = family_report.exp_block_gpu_verifier,
             .block_accepted_prefix_len = family_report.block_accepted_prefix_len,
             .block_rollback_count = family_report.block_rollback_count,
             .block_confidence_gated_count = family_report.block_confidence_gated_count,
@@ -193,6 +195,7 @@ pub fn runCommand(
         \\block.k: {d}
         \\block.confidence_margin: {d:.3}
         \\block.cooldown_tokens: {d}
+        \\block.gpu_verifier: {}
         \\block.accepted_prefix_len: {d:.3}
         \\block.rollback_count: {d}
         \\block.confidence_gated_count: {d}
@@ -210,6 +213,7 @@ pub fn runCommand(
             report.exp_block_k,
             report.exp_block_confidence_margin,
             report.exp_block_cooldown_tokens,
+            report.exp_block_gpu_verifier,
             report.block_accepted_prefix_len,
             report.block_rollback_count,
             report.block_confidence_gated_count,
@@ -289,6 +293,7 @@ pub fn benchCommand(
         try writer.print(
             \\cold.block.confidence_margin={d:.3}
             \\cold.block.cooldown_tokens={d}
+            \\cold.block.gpu_verifier={}
             \\cold.block.accepted_prefix_len={d:.3}
             \\cold.block.rollback_count={d}
             \\cold.block.confidence_gated_count={d}
@@ -304,6 +309,7 @@ pub fn benchCommand(
             .{
                 summary.cold.exp_block_confidence_margin,
                 summary.cold.exp_block_cooldown_tokens,
+                summary.cold.exp_block_gpu_verifier,
                 summary.cold.block_accepted_prefix_len,
                 summary.cold.block_rollback_count,
                 summary.cold.block_confidence_gated_count,
@@ -446,6 +452,7 @@ pub fn benchCommand(
     try writer.print(
         \\block.confidence_margin={d:.3}
         \\block.cooldown_tokens={d}
+        \\block.gpu_verifier={}
         \\block.accepted_prefix_len={d:.3}
         \\block.rollback_count={d}
         \\block.confidence_gated_count={d}
@@ -461,6 +468,7 @@ pub fn benchCommand(
         .{
             report.exp_block_confidence_margin,
             report.exp_block_cooldown_tokens,
+            report.exp_block_gpu_verifier,
             report.block_accepted_prefix_len,
             report.block_rollback_count,
             report.block_confidence_gated_count,

@@ -36,6 +36,7 @@ pub const Config = struct {
     exp_block_k: usize = 2,
     exp_block_confidence_margin: f32 = 0.75,
     exp_block_cooldown_tokens: usize = 8,
+    exp_block_gpu_verifier: bool = false,
 };
 
 pub const ParseError = error{
@@ -197,6 +198,10 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.exp_block_cooldown_tokens = std.fmt.parseUnsigned(usize, args[i], 10) catch return error.InvalidMaxTokens;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--exp-block-gpu-verifier")) {
+            config.exp_block_gpu_verifier = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -261,6 +266,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --exp-block-k <n> Maximum speculative draft length (default: {d})
         \\      --exp-block-confidence-margin Minimum top1-top2 logit margin to speculate (default: {d:.2})
         \\      --exp-block-cooldown-tokens Tokens to keep reduced speculation after rollback (default: {d})
+        \\      --exp-block-gpu-verifier Use experimental GPU verifier (default: off, sequential verifier is exactness-safe)
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -314,7 +320,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--exp-block-decode", "--exp-block-k", "4", "--exp-block-confidence-margin", "1.25", "--exp-block-cooldown-tokens", "11" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--exp-block-decode", "--exp-block-k", "4", "--exp-block-confidence-margin", "1.25", "--exp-block-cooldown-tokens", "11", "--exp-block-gpu-verifier" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
@@ -332,4 +338,5 @@ test "runtime flags parse correctly" {
     try std.testing.expectEqual(@as(usize, 4), config.exp_block_k);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), config.exp_block_confidence_margin, 0.0001);
     try std.testing.expectEqual(@as(usize, 11), config.exp_block_cooldown_tokens);
+    try std.testing.expect(config.exp_block_gpu_verifier);
 }

@@ -48,6 +48,7 @@ pub const GenerateReport = struct {
     exp_block_k: usize = 0,
     exp_block_confidence_margin: f32 = block_policy.default_confidence_margin_threshold,
     exp_block_cooldown_tokens: usize = 8,
+    exp_block_gpu_verifier: bool = false,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_confidence_gated_count: usize = 0,
@@ -1764,7 +1765,7 @@ pub fn generateLoadedStreaming(
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
-            var draft_limit: usize = default_draft_len;
+            var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
             if (exp_block_enabled) {
                 const confidence_margin = block_policy.top1Top2Margin(session.logits);
                 draft_limit = block_policy.selectAdaptiveDraftLimit(
@@ -1791,7 +1792,7 @@ pub fn generateLoadedStreaming(
             );
             const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
-                const use_gpu_block = exp_block_enabled;
+                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
@@ -1808,23 +1809,23 @@ pub fn generateLoadedStreaming(
                 if (session.position != position_before_verify + accepted_count) {
                     return error.InvalidTensorMetadata;
                 }
+                const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
+                const accepted_prefix_len = accepted_count - 1;
+                const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
+                const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
+                block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
+                block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
+                block_verify_ns_total += verify_elapsed;
+                block_decode_total_accepted += accepted_prefix_len;
+                block_decode_step_count += 1;
+                if (accepted_prefix_len < draft_tokens.len) {
+                    block_decode_rollbacks += 1;
+                    block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
+                }
                 if (use_gpu_block) {
-                    const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
-                    const accepted_prefix_len = accepted_count - 1;
-                    const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
-                    const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
-                    block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
-                    block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
-                    block_verify_ns_total += verify_elapsed;
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
-                    block_decode_total_accepted += accepted_prefix_len;
-                    block_decode_step_count += 1;
-                    if (accepted_prefix_len < draft_tokens.len) {
-                        block_decode_rollbacks += 1;
-                        block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
-                    }
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
@@ -1895,6 +1896,7 @@ pub fn generateLoadedStreaming(
         .exp_block_k = options.exp_block_k,
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
+        .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,
@@ -2059,7 +2061,7 @@ pub fn generateLoadedStreamingCached(
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
-            var draft_limit: usize = default_draft_len;
+            var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
             if (exp_block_enabled) {
                 const confidence_margin = block_policy.top1Top2Margin(session.logits);
                 draft_limit = block_policy.selectAdaptiveDraftLimit(
@@ -2086,7 +2088,7 @@ pub fn generateLoadedStreamingCached(
             );
             const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
-                const use_gpu_block = exp_block_enabled;
+                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
                 const verify_begin = std.time.nanoTimestamp();
                 var batch_stats = gpu.BatchDecodeStats{};
                 const position_before_verify = session.position;
@@ -2103,23 +2105,23 @@ pub fn generateLoadedStreamingCached(
                 if (session.position != position_before_verify + accepted_count) {
                     return error.InvalidTensorMetadata;
                 }
+                const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
+                const accepted_prefix_len = accepted_count - 1;
+                const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
+                const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
+                block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
+                block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
+                block_verify_ns_total += verify_elapsed;
+                block_decode_total_accepted += accepted_prefix_len;
+                block_decode_step_count += 1;
+                if (accepted_prefix_len < draft_tokens.len) {
+                    block_decode_rollbacks += 1;
+                    block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
+                }
                 if (use_gpu_block) {
-                    const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
-                    const accepted_prefix_len = accepted_count - 1;
-                    const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
-                    const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
-                    block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
-                    block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
-                    block_verify_ns_total += verify_elapsed;
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
-                    block_decode_total_accepted += accepted_prefix_len;
-                    block_decode_step_count += 1;
-                    if (accepted_prefix_len < draft_tokens.len) {
-                        block_decode_rollbacks += 1;
-                        block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
-                    }
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
@@ -2190,6 +2192,7 @@ pub fn generateLoadedStreamingCached(
         .exp_block_k = options.exp_block_k,
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
+        .exp_block_gpu_verifier = options.exp_block_gpu_verifier,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,

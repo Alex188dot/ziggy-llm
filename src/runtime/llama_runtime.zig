@@ -85,6 +85,7 @@ pub fn generate(
         .exp_block_k = llama_report.exp_block_k,
         .exp_block_confidence_margin = llama_report.exp_block_confidence_margin,
         .exp_block_cooldown_tokens = llama_report.exp_block_cooldown_tokens,
+        .exp_block_gpu_verifier = llama_report.exp_block_gpu_verifier,
         .block_accepted_prefix_len = llama_report.block_accepted_prefix_len,
         .block_rollback_count = llama_report.block_rollback_count,
         .block_confidence_gated_count = llama_report.block_confidence_gated_count,

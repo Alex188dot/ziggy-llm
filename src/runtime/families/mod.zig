@@ -68,6 +68,7 @@ pub const FamilyGenerateOptions = struct {
     exp_block_k: usize = 2,
     exp_block_confidence_margin: f32 = 0.75,
     exp_block_cooldown_tokens: usize = 8,
+    exp_block_gpu_verifier: bool = false,
 };
 
 pub const FamilyReport = struct {
@@ -91,6 +92,7 @@ pub const FamilyReport = struct {
     exp_block_k: usize = 0,
     exp_block_confidence_margin: f32 = 0.75,
     exp_block_cooldown_tokens: usize = 8,
+    exp_block_gpu_verifier: bool = false,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_confidence_gated_count: usize = 0,

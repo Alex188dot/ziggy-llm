@@ -171,6 +171,7 @@ pub const ResidentRuntime = struct {
             .exp_block_k = report.exp_block_k,
             .exp_block_confidence_margin = report.exp_block_confidence_margin,
             .exp_block_cooldown_tokens = report.exp_block_cooldown_tokens,
+            .exp_block_gpu_verifier = report.exp_block_gpu_verifier,
             .block_accepted_prefix_len = report.block_accepted_prefix_len,
             .block_rollback_count = report.block_rollback_count,
             .block_confidence_gated_count = report.block_confidence_gated_count,
