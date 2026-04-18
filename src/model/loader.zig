@@ -116,6 +116,7 @@ const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
 const block_acceptance_window_cap: usize = 64;
+const block_flat_logits_margin_eps: f32 = 1e-6;
 
 pub const LayerType = enum {
     full_attention,
@@ -1942,15 +1943,33 @@ pub fn generateLoadedStreaming(
                     // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
                     draft_limit = 1;
                 }
+                if (draft_limit > 0 and confidence_margin <= block_flat_logits_margin_eps) {
+                    // Flat logits imply unavailable/low-signal proposer inputs; skip speculation for this step.
+                    draft_limit = 0;
+                    block_decode_confidence_gated += 1;
+                    if (options.exp_block_trace) {
+                        std.debug.print(
+                            "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
+                            .{confidence_margin},
+                        );
+                    }
+                }
             }
-            const draft_len = draft_proposer.proposeDraftTokens(
+            const propose_result = draft_proposer.proposeDraftTokensDetailed(
                 next_token,
                 session.token_buffer[0..session.position],
                 session.logits,
                 options.repeat_penalty,
                 draft_limit,
                 &drafted_tokens,
+                .{
+                    .trace = options.exp_block_trace,
+                },
             );
+            if (propose_result.first_token_guard_reject) {
+                block_decode_confidence_gated += 1;
+            }
+            const draft_len = propose_result.drafted_len;
             const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
                 const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
@@ -2360,15 +2379,33 @@ pub fn generateLoadedStreamingCached(
                     // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
                     draft_limit = 1;
                 }
+                if (draft_limit > 0 and confidence_margin <= block_flat_logits_margin_eps) {
+                    // Flat logits imply unavailable/low-signal proposer inputs; skip speculation for this step.
+                    draft_limit = 0;
+                    block_decode_confidence_gated += 1;
+                    if (options.exp_block_trace) {
+                        std.debug.print(
+                            "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
+                            .{confidence_margin},
+                        );
+                    }
+                }
             }
-            const draft_len = draft_proposer.proposeDraftTokens(
+            const propose_result = draft_proposer.proposeDraftTokensDetailed(
                 next_token,
                 session.token_buffer[0..session.position],
                 session.logits,
                 options.repeat_penalty,
                 draft_limit,
                 &drafted_tokens,
+                .{
+                    .trace = options.exp_block_trace,
+                },
             );
+            if (propose_result.first_token_guard_reject) {
+                block_decode_confidence_gated += 1;
+            }
+            const draft_len = propose_result.drafted_len;
             const draft_tokens = drafted_tokens[0..draft_len];
             if (draft_tokens.len > 0) {
                 const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;

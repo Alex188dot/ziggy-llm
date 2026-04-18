@@ -3,6 +3,37 @@ const std = @import("std");
 const max_candidates: usize = 32;
 const shortlist_capacity: usize = 16;
 
+pub const ProposalSettings = struct {
+    trace: bool = false,
+    trace_top_n: usize = 5,
+    prefer_conservative_first_token: bool = true,
+    enable_first_token_sanity_guard: bool = true,
+    // If the drafted first token's penalized-logit is far below shortlist top-1,
+    // skip speculation for this step.
+    first_token_penalized_gap_limit: f32 = 1.25,
+    first_token_transition_weight: f64 = 0.08,
+    tail_transition_weight: f64 = 0.20,
+    fallback_override_margin: f64 = 0.05,
+    min_first_token_raw_gap: f32 = 1e-4,
+};
+
+pub const ProposeResult = struct {
+    drafted_len: usize = 0,
+    first_token_guard_reject: bool = false,
+    first_token_gap: f32 = 0.0,
+    top1_token: u32 = 0,
+};
+
+const ScoredToken = struct {
+    token_id: u32,
+    raw_logit: f32,
+    penalized_logit: f32,
+    transition_count: u16,
+    transition_bonus: f64,
+    total_score: f64,
+    in_shortlist: bool,
+};
+
 pub fn proposeDraftTokens(
     current_token: u32,
     history: []const u32,
@@ -11,43 +42,153 @@ pub fn proposeDraftTokens(
     max_draft: usize,
     out: []u32,
 ) usize {
-    if (max_draft == 0 or out.len == 0 or logits.len == 0) return 0;
+    const result = proposeDraftTokensDetailed(
+        current_token,
+        history,
+        logits,
+        repeat_penalty,
+        max_draft,
+        out,
+        .{},
+    );
+    return result.drafted_len;
+}
+
+pub fn proposeDraftTokensDetailed(
+    current_token: u32,
+    history: []const u32,
+    logits: []const f32,
+    repeat_penalty: f32,
+    max_draft: usize,
+    out: []u32,
+    settings: ProposalSettings,
+) ProposeResult {
+    var result = ProposeResult{};
+    if (max_draft == 0 or out.len == 0 or logits.len == 0) return result;
 
     const draft_cap = @min(max_draft, out.len);
     var shortlist_ids: [shortlist_capacity]u32 = undefined;
     const shortlist_len = buildTopShortlist(logits, &shortlist_ids);
-    if (shortlist_len == 0) return 0;
+    if (shortlist_len == 0) return result;
+    const top1_id = shortlist_ids[0];
+    result.top1_token = top1_id;
+    if (shortlist_len >= 2) {
+        const gap = logits[shortlist_ids[0]] - logits[shortlist_ids[1]];
+        if (settings.enable_first_token_sanity_guard and gap <= settings.min_first_token_raw_gap) {
+            result.first_token_guard_reject = true;
+            result.first_token_gap = gap;
+            if (settings.trace) {
+                std.debug.print(
+                    "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits raw_gap={d:.6} limit={d:.6} top1={d} top2={d}\n",
+                    .{
+                        gap,
+                        settings.min_first_token_raw_gap,
+                        shortlist_ids[0],
+                        shortlist_ids[1],
+                    },
+                );
+            }
+            return result;
+        }
+    }
 
     var prev = current_token;
     var produced: usize = 0;
 
     while (produced < draft_cap) : (produced += 1) {
-        const next = chooseSuccessor(
+        const choose = chooseSuccessorDetailed(
             prev,
             history,
             logits,
             shortlist_ids[0..shortlist_len],
             out[0..produced],
             repeat_penalty,
+            settings,
         ) orelse break;
-        out[produced] = next;
-        prev = next;
+
+        if (produced == 0) {
+            result.top1_token = choose.shortlist_top1.token_id;
+            result.first_token_gap = choose.first_token_penalized_gap;
+            if (settings.enable_first_token_sanity_guard and choose.first_token_penalized_gap > settings.first_token_penalized_gap_limit) {
+                result.first_token_guard_reject = true;
+                if (settings.trace) {
+                    std.debug.print(
+                        "BLOCK_PROPOSER_GUARD decision=REJECT reason=first_token_gap gap={d:.3} limit={d:.3} chosen={d} shortlist_top1={d}\n",
+                        .{
+                            choose.first_token_penalized_gap,
+                            settings.first_token_penalized_gap_limit,
+                            choose.chosen.token_id,
+                            choose.shortlist_top1.token_id,
+                        },
+                    );
+                }
+                return result;
+            }
+        }
+
+        if (settings.trace) {
+            traceChoice(produced, choose, settings.trace_top_n);
+        }
+
+        out[produced] = choose.chosen.token_id;
+        prev = choose.chosen.token_id;
     }
 
-    return produced;
+    result.drafted_len = produced;
+    return result;
 }
 
-fn chooseSuccessor(
+const ChoiceResult = struct {
+    chosen: ScoredToken,
+    shortlist_top1: ScoredToken,
+    first_token_penalized_gap: f32,
+    shortlist_ranked: [shortlist_capacity]ScoredToken,
+    shortlist_ranked_len: usize,
+};
+
+fn chooseSuccessorDetailed(
     prev: u32,
     history: []const u32,
     logits: []const f32,
     shortlist: []const u32,
     drafted_prefix: []const u32,
     repeat_penalty: f32,
-) ?u32 {
-    const fallback = topShortlistByPenalizedLogit(shortlist, logits, history, drafted_prefix, repeat_penalty) orelse return null;
+    settings: ProposalSettings,
+) ?ChoiceResult {
+    const is_first = drafted_prefix.len == 0;
+    const transition_weight: f64 = if (is_first) settings.first_token_transition_weight else settings.tail_transition_weight;
 
-    if (history.len < 2) return fallback;
+    var shortlist_ranked: [shortlist_capacity]ScoredToken = undefined;
+    var shortlist_ranked_len: usize = 0;
+    for (shortlist) |token_id| {
+        if (shortlist_ranked_len >= shortlist_ranked.len) break;
+        shortlist_ranked[shortlist_ranked_len] = scoreCandidateDetailed(
+            token_id,
+            transitionCount(prev, token_id, history),
+            true,
+            logits,
+            history,
+            drafted_prefix,
+            repeat_penalty,
+            transition_weight,
+        );
+        shortlist_ranked_len += 1;
+    }
+    sortScoredDescending(shortlist_ranked[0..shortlist_ranked_len]);
+    if (shortlist_ranked_len == 0) return null;
+
+    const shortlist_top1 = shortlist_ranked[0];
+    const fallback = shortlist_top1;
+
+    if (history.len < 2) {
+        return .{
+            .chosen = fallback,
+            .shortlist_top1 = shortlist_top1,
+            .first_token_penalized_gap = 0,
+            .shortlist_ranked = shortlist_ranked,
+            .shortlist_ranked_len = shortlist_ranked_len,
+        };
+    }
 
     var candidate_ids: [max_candidates]u32 = undefined;
     var candidate_counts: [max_candidates]u16 = undefined;
@@ -68,89 +209,151 @@ fn chooseSuccessor(
         candidate_len += 1;
     }
 
-    if (candidate_len == 0) return fallback;
+    if (candidate_len == 0) {
+        return .{
+            .chosen = fallback,
+            .shortlist_top1 = shortlist_top1,
+            .first_token_penalized_gap = 0,
+            .shortlist_ranked = shortlist_ranked,
+            .shortlist_ranked_len = shortlist_ranked_len,
+        };
+    }
 
-    var best_idx: usize = 0;
-    var i: usize = 1;
-    while (i < candidate_len) : (i += 1) {
-        if (isBetter(
+    var history_best = scoreCandidateDetailed(
+        candidate_ids[0],
+        candidate_counts[0],
+        inShortlist(candidate_ids[0], shortlist),
+        logits,
+        history,
+        drafted_prefix,
+        repeat_penalty,
+        transition_weight,
+    );
+    for (1..candidate_len) |i| {
+        const scored = scoreCandidateDetailed(
             candidate_ids[i],
             candidate_counts[i],
-            candidate_ids[best_idx],
-            candidate_counts[best_idx],
+            inShortlist(candidate_ids[i], shortlist),
             logits,
-            shortlist,
             history,
             drafted_prefix,
             repeat_penalty,
-        )) {
-            best_idx = i;
+            transition_weight,
+        );
+        if (isBetterScored(scored, history_best)) history_best = scored;
+    }
+
+    if (is_first and settings.prefer_conservative_first_token) {
+        // First drafted token should remain close to current logits top-1.
+        const history_gap = shortlist_top1.penalized_logit - history_best.penalized_logit;
+        if (!history_best.in_shortlist or history_gap > settings.first_token_penalized_gap_limit) {
+            return .{
+                .chosen = fallback,
+                .shortlist_top1 = shortlist_top1,
+                .first_token_penalized_gap = 0,
+                .shortlist_ranked = shortlist_ranked,
+                .shortlist_ranked_len = shortlist_ranked_len,
+            };
         }
     }
 
-    const history_best = candidate_ids[best_idx];
-    const history_best_score = scoreCandidate(history_best, candidate_counts[best_idx], logits, history, drafted_prefix, repeat_penalty);
-    const fallback_score = scoreCandidate(fallback, 0, logits, history, drafted_prefix, repeat_penalty);
-    return if (fallback_score > history_best_score + 0.1) fallback else history_best;
+    const chosen = if (fallback.total_score > history_best.total_score + settings.fallback_override_margin)
+        fallback
+    else
+        history_best;
+
+    const first_gap = if (is_first) shortlist_top1.penalized_logit - chosen.penalized_logit else @as(f32, 0);
+    return .{
+        .chosen = chosen,
+        .shortlist_top1 = shortlist_top1,
+        .first_token_penalized_gap = first_gap,
+        .shortlist_ranked = shortlist_ranked,
+        .shortlist_ranked_len = shortlist_ranked_len,
+    };
 }
 
-fn isBetter(
-    lhs_id: u32,
-    lhs_count: u16,
-    rhs_id: u32,
-    rhs_count: u16,
-    logits: []const f32,
-    shortlist: []const u32,
-    history: []const u32,
-    drafted_prefix: []const u32,
-    repeat_penalty: f32,
-) bool {
-    const lhs_score = scoreCandidate(lhs_id, lhs_count, logits, history, drafted_prefix, repeat_penalty);
-    const rhs_score = scoreCandidate(rhs_id, rhs_count, logits, history, drafted_prefix, repeat_penalty);
-    if (lhs_score != rhs_score) return lhs_score > rhs_score;
+fn traceChoice(step_idx: usize, choice: ChoiceResult, top_n: usize) void {
+    std.debug.print(
+        "BLOCK_PROPOSER step_idx={d} chosen={d} raw={d:.4} penalized={d:.4} trans_count={d} trans_bonus={d:.4} total={d:.4} top1={d} top1_penalized={d:.4} gap={d:.4}\n",
+        .{
+            step_idx,
+            choice.chosen.token_id,
+            choice.chosen.raw_logit,
+            choice.chosen.penalized_logit,
+            choice.chosen.transition_count,
+            choice.chosen.transition_bonus,
+            choice.chosen.total_score,
+            choice.shortlist_top1.token_id,
+            choice.shortlist_top1.penalized_logit,
+            choice.first_token_penalized_gap,
+        },
+    );
 
-    const lhs_short = inShortlist(lhs_id, shortlist);
-    const rhs_short = inShortlist(rhs_id, shortlist);
-    if (lhs_short != rhs_short) return lhs_short;
-
-    return lhs_id < rhs_id;
+    const n = @min(top_n, choice.shortlist_ranked_len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const s = choice.shortlist_ranked[i];
+        std.debug.print(
+            "BLOCK_PROPOSER_CAND step_idx={d} rank={d} token={d} raw={d:.4} penalized={d:.4} trans_count={d} trans_bonus={d:.4} total={d:.4}\n",
+            .{ step_idx, i + 1, s.token_id, s.raw_logit, s.penalized_logit, s.transition_count, s.transition_bonus, s.total_score },
+        );
+    }
 }
 
-fn scoreCandidate(
+fn scoreCandidateDetailed(
     token_id: u32,
     count: u16,
+    shortlist_hit: bool,
     logits: []const f32,
     history: []const u32,
     drafted_prefix: []const u32,
     repeat_penalty: f32,
-) f64 {
+    transition_weight: f64,
+) ScoredToken {
     const raw_logit = if (token_id < logits.len) logits[token_id] else -std.math.inf(f32);
     const penalized = applyRepeatPenalty(raw_logit, token_id, history, drafted_prefix, repeat_penalty);
-    // Favor local transition evidence, but let logit dominate if history is weak.
-    return @as(f64, penalized) + @as(f64, @floatFromInt(count)) * 0.25;
+    const transition_bonus = @as(f64, @floatFromInt(count)) * transition_weight;
+    return .{
+        .token_id = token_id,
+        .raw_logit = raw_logit,
+        .penalized_logit = penalized,
+        .transition_count = count,
+        .transition_bonus = transition_bonus,
+        .total_score = @as(f64, penalized) + transition_bonus,
+        .in_shortlist = shortlist_hit,
+    };
 }
 
-fn topShortlistByPenalizedLogit(
-    shortlist: []const u32,
-    logits: []const f32,
-    history: []const u32,
-    drafted_prefix: []const u32,
-    repeat_penalty: f32,
-) ?u32 {
-    if (shortlist.len == 0) return null;
+fn transitionCount(prev: u32, next: u32, history: []const u32) u16 {
+    if (history.len < 2) return 0;
+    var count: u16 = 0;
+    for (0..history.len - 1) |i| {
+        if (history[i] == prev and history[i + 1] == next) count +|= 1;
+    }
+    return count;
+}
 
-    var best_id = shortlist[0];
-    var best_score = applyRepeatPenalty(logits[best_id], best_id, history, drafted_prefix, repeat_penalty);
+fn isBetterScored(lhs: ScoredToken, rhs: ScoredToken) bool {
+    if (lhs.total_score != rhs.total_score) return lhs.total_score > rhs.total_score;
+    if (lhs.in_shortlist != rhs.in_shortlist) return lhs.in_shortlist;
+    return lhs.token_id < rhs.token_id;
+}
 
-    for (shortlist[1..]) |token_id| {
-        const score = applyRepeatPenalty(logits[token_id], token_id, history, drafted_prefix, repeat_penalty);
-        if (score > best_score or (score == best_score and token_id < best_id)) {
-            best_id = token_id;
-            best_score = score;
+fn sortScoredDescending(tokens: []ScoredToken) void {
+    if (tokens.len < 2) return;
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        var best = i;
+        var j = i + 1;
+        while (j < tokens.len) : (j += 1) {
+            if (tokens[j].total_score > tokens[best].total_score) best = j;
+        }
+        if (best != i) {
+            const tmp = tokens[i];
+            tokens[i] = tokens[best];
+            tokens[best] = tmp;
         }
     }
-
-    return best_id;
 }
 
 fn applyRepeatPenalty(
@@ -234,16 +437,44 @@ test "proposeDraftTokens favors logits fallback when no transition exists" {
     try std.testing.expectEqual(@as(u32, 2), out[0]);
 }
 
-test "proposeDraftTokens uses transition evidence but respects repeat penalty" {
-    const history = [_]u32{ 4, 7, 4, 7, 4, 7, 9 };
-    const logits = [_]f32{ 0, 0, 0, 0, 0, 0, 0.2, 3.0, 0.1, 2.5 };
+test "conservative first token resists off-shortlist history pick" {
+    const history = [_]u32{ 5, 0, 5, 0, 5, 0 };
+    const logits = [_]f32{ 1.0, 0.2, 0.1, 0.0, -0.5, -0.8, 1.9, 1.7 };
+    var out: [2]u32 = undefined;
+    const res = proposeDraftTokensDetailed(5, &history, &logits, 1.0, 2, &out, .{
+        .enable_first_token_sanity_guard = true,
+        .prefer_conservative_first_token = true,
+    });
+    try std.testing.expect(res.drafted_len >= 1);
+    try std.testing.expect(out[0] == 6 or out[0] == 7);
+}
+
+test "first token sanity guard can reject speculation" {
+    const history = [_]u32{ 9, 0, 9, 0, 9, 0, 9, 0 };
+    var logits = [_]f32{0} ** 32;
+    logits[0] = -1.0;
+    logits[9] = 0.2;
+    logits[31] = 2.0;
     var out: [2]u32 = undefined;
 
-    const drafted_no_penalty = proposeDraftTokens(4, &history, &logits, 1.0, 2, &out);
-    try std.testing.expect(drafted_no_penalty >= 1);
-    try std.testing.expectEqual(@as(u32, 7), out[0]);
+    const res = proposeDraftTokensDetailed(9, &history, &logits, 1.0, 2, &out, .{
+        .enable_first_token_sanity_guard = true,
+        .prefer_conservative_first_token = false,
+        .first_token_transition_weight = 2.0,
+        .first_token_penalized_gap_limit = 0.25,
+    });
+    try std.testing.expect(res.first_token_guard_reject);
+    try std.testing.expectEqual(@as(usize, 0), res.drafted_len);
+}
 
-    const drafted_with_penalty = proposeDraftTokens(4, &history, &logits, 1.5, 2, &out);
-    try std.testing.expect(drafted_with_penalty >= 1);
-    try std.testing.expect(out[0] == 7 or out[0] == 9);
+test "flat logits guard rejects draft step" {
+    const history = [_]u32{ 1, 2, 3, 4 };
+    const logits = [_]f32{ 0.0, 0.0, 0.0, 0.0, 0.0 };
+    var out: [2]u32 = undefined;
+    const res = proposeDraftTokensDetailed(4, &history, &logits, 1.0, 2, &out, .{
+        .enable_first_token_sanity_guard = true,
+        .min_first_token_raw_gap = 1e-6,
+    });
+    try std.testing.expect(res.first_token_guard_reject);
+    try std.testing.expectEqual(@as(usize, 0), res.drafted_len);
 }

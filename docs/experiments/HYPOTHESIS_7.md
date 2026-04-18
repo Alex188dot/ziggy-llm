@@ -759,3 +759,30 @@ Conclusion: primary bottleneck is proposer token ranking/selection quality, not 
 - Position-0 mismatch is no longer dominant bucket.
 - `precheck_fail_count` drops materially on canonical neutral prompt.
 - Forced speculation TPS is no longer clearly below baseline by verifier overhead alone.
+
+### 18.1) Implementation Status (2026-04-18)
+
+- [x] Added proposer score decomposition tracing:
+  - `BLOCK_PROPOSER` line prints chosen token and score components (`raw`, `penalized`, `transition_count`, `transition_bonus`, `total`).
+  - `BLOCK_PROPOSER_CAND` lines print ranked shortlist candidates and full score decomposition.
+- [x] Added explicit proposer guard traces:
+  - `BLOCK_PROPOSER_GUARD` lines with reject reason and thresholds (`flat_logits`, `first_token_gap`, `flat_logits_fastpath`).
+- [x] Implemented conservative first-token policy:
+  - first drafted token now strongly prefers shortlist/logit-consistent candidates.
+  - off-shortlist/history-only first-token picks are prevented when they conflict with shortlist confidence.
+- [x] Implemented first-token sanity gate:
+  - if first drafted token falls below top-1 penalized confidence envelope, speculation is rejected for that step (`k=0` effective).
+- [x] Implemented flat-logits runtime fast path:
+  - if proposer input margin is effectively zero (`top1-top2 ~= 0`), speculation is skipped before drafting.
+  - this prevents repeated bad proposals like punctuation loops when logits carry no usable signal in this path.
+
+### 18.2) Observed Result After Implementation
+
+- On canonical neutral prompt with forced mode (`--exp-block-confidence-margin 0`):
+  - `rollback_count` dropped to `0`
+  - `precheck_fail_count` dropped to `0`
+  - `confidence_gated_count` rose to generated token count (speculation mostly disabled when logits are flat)
+- Interpretation:
+  - dominant failure mode was proposer input quality (flat logits), not verifier correctness.
+  - this change stabilizes behavior and removes rollback/precheck overhead from bad drafts.
+  - next step is enabling a proposer input path with real logit signal before expecting acceptance gains.
