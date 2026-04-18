@@ -250,6 +250,12 @@ fn traceBlockProposals(
     }
 }
 
+fn shortlistTop1Top2Margin(shortlist: []const gpu.ShortlistEntry) f32 {
+    if (shortlist.len == 0) return 0;
+    if (shortlist.len == 1) return shortlist[0].logit;
+    return shortlist[0].logit - shortlist[1].logit;
+}
+
 const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
@@ -874,6 +880,7 @@ const Session = struct {
     pending_greedy_token: ?u32 = null,
     pending_shortlist: [gpu.max_shortlist_len]gpu.ShortlistEntry = undefined,
     pending_shortlist_len: usize = 0,
+    greedy_shortlist_len: usize = 0,
     scores: []f32,
     k_cache: []f32,
     v_cache: []f32,
@@ -1058,7 +1065,19 @@ const Session = struct {
         }
         try self.runTokenCore(token_id);
         const gpu_session = &self.gpu_session.?;
-        const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
+        const next_token = if (self.greedy_shortlist_len > 0) blk: {
+            const shortlist = try gpu_session.runOutputShortlist(
+                adaptTensorDesc(self.model.output_norm),
+                adaptTensorDesc(self.model.output),
+                self.greedy_shortlist_len,
+                self.pending_shortlist[0..self.greedy_shortlist_len],
+            );
+            self.pending_shortlist_len = shortlist.len;
+            break :blk shortlist[0].token_id;
+        } else blk: {
+            self.pending_shortlist_len = 0;
+            break :blk try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
+        };
         self.pending_greedy_token = next_token;
         self.finishToken(token_id);
         return next_token;
@@ -1798,6 +1817,9 @@ pub fn generateLoadedStreaming(
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
     const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    if (sampling_path == .gpu_greedy_argmax and options.exp_block_decode) {
+        session.greedy_shortlist_len = @max(@as(usize, 2), shortlist_len);
+    }
     const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
     const prompt_begin = std.time.nanoTimestamp();
@@ -1834,7 +1856,6 @@ pub fn generateLoadedStreaming(
         }
         break :blk argmax(session.logits);
     } else null;
-    const default_draft_len: usize = @min(@as(usize, 3), gpu.max_draft_len);
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
@@ -1844,8 +1865,8 @@ pub fn generateLoadedStreaming(
     var block_decode_cooldown_remaining: usize = 0;
     var block_decode_quality_gate_active: usize = 0;
     var block_decode_quality_gate_trigger_count: usize = 0;
-    var block_decode_precheck_count: usize = 0;
-    var block_decode_precheck_fail_count: usize = 0;
+    const block_decode_precheck_count: usize = 0;
+    const block_decode_precheck_fail_count: usize = 0;
     var block_decode_mismatch_pos0_count: usize = 0;
     var block_decode_mismatch_pos1_count: usize = 0;
     var block_decode_mismatch_pos2_count: usize = 0;
@@ -1914,12 +1935,18 @@ pub fn generateLoadedStreaming(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
-            const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
-            var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
-            var confidence_margin: f32 = 0;
             if (exp_block_enabled) {
-                confidence_margin = block_policy.top1Top2Margin(session.logits);
-                draft_limit = block_policy.selectAdaptiveDraftLimit(
+                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
+                const verify_begin = std.time.nanoTimestamp();
+                var batch_stats = gpu.BatchDecodeStats{};
+                const position_before_verify = session.position;
+                const exp_block_cap: usize = @min(gpu.max_draft_len, options.exp_block_k);
+                const bootstrap_token = try session.stepGreedy(next_token);
+                const confidence_margin: f32 = if (session.pending_shortlist_len >= 2)
+                    shortlistTop1Top2Margin(session.pending_shortlist[0..session.pending_shortlist_len])
+                else
+                    block_policy.top1Top2Margin(session.logits);
+                var draft_limit: usize = block_policy.selectAdaptiveDraftLimit(
                     exp_block_cap,
                     confidence_margin,
                     options.exp_block_confidence_margin,
@@ -1940,83 +1967,73 @@ pub fn generateLoadedStreaming(
                     draft_limit = 0;
                 }
                 if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
-                    // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
                     draft_limit = 1;
                 }
-                if (draft_limit > 0 and confidence_margin <= block_flat_logits_margin_eps) {
-                    // Flat logits imply unavailable/low-signal proposer inputs; skip speculation for this step.
-                    draft_limit = 0;
-                    block_decode_confidence_gated += 1;
-                    if (options.exp_block_trace) {
-                        std.debug.print(
-                            "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
-                            .{confidence_margin},
-                        );
-                    }
-                }
-            }
-            const propose_result = draft_proposer.proposeDraftTokensDetailed(
-                next_token,
-                session.token_buffer[0..session.position],
-                session.logits,
-                options.repeat_penalty,
-                draft_limit,
-                &drafted_tokens,
-                .{
-                    .trace = options.exp_block_trace,
-                },
-            );
-            if (propose_result.first_token_guard_reject) {
-                block_decode_confidence_gated += 1;
-            }
-            const draft_len = propose_result.drafted_len;
-            const draft_tokens = drafted_tokens[0..draft_len];
-            if (draft_tokens.len > 0) {
-                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
-                const verify_begin = std.time.nanoTimestamp();
-                var batch_stats = gpu.BatchDecodeStats{};
-                const position_before_verify = session.position;
-                const precheck_base_margin = if (options.exp_block_confidence_margin > 0)
-                    options.exp_block_confidence_margin
-                else
-                    block_policy.default_confidence_margin_threshold;
-                const precheck_margin_threshold = precheck_base_margin * options.exp_block_precheck_margin_multiplier;
-                const run_precheck = exp_block_enabled and draft_tokens.len > 0 and confidence_margin < precheck_margin_threshold;
-                var precheck_attempted = false;
-                var precheck_failed = false;
-                var accepted_count: usize = 0;
-
-                if (run_precheck) {
-                    precheck_attempted = true;
-                    block_decode_precheck_count += 1;
-                    const precheck_predicted = try session.stepGreedy(next_token);
-                    accepted_tokens[0] = precheck_predicted;
-                    if (precheck_predicted != draft_tokens[0]) {
-                        accepted_count = 1;
-                        precheck_failed = true;
-                        block_decode_precheck_fail_count += 1;
-                    } else if (draft_tokens.len == 1) {
-                        accepted_tokens[1] = try session.stepGreedy(precheck_predicted);
-                        accepted_count = 2;
-                    } else {
-                        const tail_draft = draft_tokens[1..];
-                        var tail_count: usize = if (use_gpu_block)
-                            session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
-                        else
-                            try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                        if (tail_count == 0) {
-                            tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                if (draft_limit == 0 or confidence_margin <= block_flat_logits_margin_eps) {
+                    if (confidence_margin <= block_flat_logits_margin_eps) {
+                        block_decode_confidence_gated += 1;
+                        if (options.exp_block_trace) {
+                            std.debug.print(
+                                "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
+                                .{confidence_margin},
+                            );
                         }
-                        accepted_count = tail_count + 1;
                     }
-                } else {
-                    accepted_count = if (use_gpu_block)
-                        session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
-                    else
-                        try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                    greedy_next_token = bootstrap_token;
+                    if (generated_token_count == 0) {
+                        first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
+                    }
+                    profiler.endDecodeToken();
+                    continue;
                 }
-                if (accepted_count == 0) {
-                    accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+
+                drafted_tokens[0] = bootstrap_token;
+                var draft_len: usize = 1;
+                const tail_limit = draft_limit - 1;
+                if (tail_limit > 0) {
+                    const history_tail = session.findDraftTokens(bootstrap_token, tail_limit);
+                    if (history_tail.len > 0) {
+                        @memcpy(drafted_tokens[1 .. 1 + history_tail.len], history_tail);
+                        draft_len += history_tail.len;
+                    } else {
+                        const proposer_shortlist = session.pending_shortlist[0..session.pending_shortlist_len];
+                        if (proposer_shortlist.len > 0) {
+                            const propose_result = draft_proposer.proposeDraftTokensFromShortlistDetailed(
+                                bootstrap_token,
+                                session.token_buffer[0..session.position],
+                                proposer_shortlist,
+                                options.repeat_penalty,
+                                tail_limit,
+                                drafted_tokens[1..],
+                                .{
+                                    .trace = options.exp_block_trace,
+                                },
+                            );
+                            if (propose_result.first_token_guard_reject) {
+                                block_decode_confidence_gated += 1;
+                            }
+                            draft_len += propose_result.drafted_len;
+                        }
+                    }
+                }
+                const draft_tokens = drafted_tokens[0..draft_len];
+                var accepted_count: usize = 1;
+                const precheck_attempted = false;
+                const precheck_failed = false;
+                accepted_tokens[0] = bootstrap_token;
+                if (draft_tokens.len == 1) {
+                    accepted_tokens[1] = try session.stepGreedy(bootstrap_token);
+                    accepted_count = 2;
+                } else {
+                    const tail_draft = draft_tokens[1..];
+                    var tail_count: usize = if (use_gpu_block)
+                        session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
+                    else
+                        try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                    if (tail_count == 0) {
+                        tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                    }
+                    accepted_count = tail_count + 1;
                 }
                 if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
                     return error.InvalidTensorMetadata;
@@ -2232,6 +2249,9 @@ pub fn generateLoadedStreamingCached(
     if (session.position < prompt_token_count) {
         const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
         const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+        if (sampling_path == .gpu_greedy_argmax and options.exp_block_decode) {
+            session.greedy_shortlist_len = @max(@as(usize, 2), shortlist_len);
+        }
         const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
         if (sampling_path == .gpu_topk_sampler) {
             const remaining = prompt_tokens[session.position..prompt_token_count];
@@ -2268,9 +2288,11 @@ pub fn generateLoadedStreamingCached(
         break :blk argmax(session.logits);
     } else null;
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
+    if (sampling_path == .gpu_greedy_argmax and options.exp_block_decode) {
+        session.greedy_shortlist_len = @max(@as(usize, 2), shortlist_len);
+    }
     const gpu_top_k = if (options.top_k == 0) @min(gpu.max_shortlist_len, session.logits.len) else @min(options.top_k, session.logits.len);
 
-    const default_draft_len: usize = @min(@as(usize, 3), gpu.max_draft_len);
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
     var block_decode_total_accepted: usize = 0;
@@ -2280,8 +2302,8 @@ pub fn generateLoadedStreamingCached(
     var block_decode_cooldown_remaining: usize = 0;
     var block_decode_quality_gate_active: usize = 0;
     var block_decode_quality_gate_trigger_count: usize = 0;
-    var block_decode_precheck_count: usize = 0;
-    var block_decode_precheck_fail_count: usize = 0;
+    const block_decode_precheck_count: usize = 0;
+    const block_decode_precheck_fail_count: usize = 0;
     var block_decode_mismatch_pos0_count: usize = 0;
     var block_decode_mismatch_pos1_count: usize = 0;
     var block_decode_mismatch_pos2_count: usize = 0;
@@ -2350,12 +2372,18 @@ pub fn generateLoadedStreamingCached(
         const step_begin = std.time.nanoTimestamp();
         if (gpu_greedy) {
             const exp_block_enabled = options.exp_block_decode and options.temperature == 0 and options.exp_block_k > 0;
-            const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
-            var draft_limit: usize = if (exp_block_enabled) default_draft_len else 0;
-            var confidence_margin: f32 = 0;
             if (exp_block_enabled) {
-                confidence_margin = block_policy.top1Top2Margin(session.logits);
-                draft_limit = block_policy.selectAdaptiveDraftLimit(
+                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
+                const verify_begin = std.time.nanoTimestamp();
+                var batch_stats = gpu.BatchDecodeStats{};
+                const position_before_verify = session.position;
+                const exp_block_cap: usize = @min(gpu.max_draft_len, options.exp_block_k);
+                const bootstrap_token = try session.stepGreedy(next_token);
+                const confidence_margin: f32 = if (session.pending_shortlist_len >= 2)
+                    shortlistTop1Top2Margin(session.pending_shortlist[0..session.pending_shortlist_len])
+                else
+                    block_policy.top1Top2Margin(session.logits);
+                var draft_limit: usize = block_policy.selectAdaptiveDraftLimit(
                     exp_block_cap,
                     confidence_margin,
                     options.exp_block_confidence_margin,
@@ -2376,83 +2404,73 @@ pub fn generateLoadedStreamingCached(
                     draft_limit = 0;
                 }
                 if (!options.exp_block_gpu_verifier and block_decode_step_count >= 8 and block_recent_accepted_ema < 0.75 and draft_limit > 1) {
-                    // Sequential verifier overhead dominates when acceptance is low; keep speculative depth minimal.
                     draft_limit = 1;
                 }
-                if (draft_limit > 0 and confidence_margin <= block_flat_logits_margin_eps) {
-                    // Flat logits imply unavailable/low-signal proposer inputs; skip speculation for this step.
-                    draft_limit = 0;
-                    block_decode_confidence_gated += 1;
-                    if (options.exp_block_trace) {
-                        std.debug.print(
-                            "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
-                            .{confidence_margin},
-                        );
-                    }
-                }
-            }
-            const propose_result = draft_proposer.proposeDraftTokensDetailed(
-                next_token,
-                session.token_buffer[0..session.position],
-                session.logits,
-                options.repeat_penalty,
-                draft_limit,
-                &drafted_tokens,
-                .{
-                    .trace = options.exp_block_trace,
-                },
-            );
-            if (propose_result.first_token_guard_reject) {
-                block_decode_confidence_gated += 1;
-            }
-            const draft_len = propose_result.drafted_len;
-            const draft_tokens = drafted_tokens[0..draft_len];
-            if (draft_tokens.len > 0) {
-                const use_gpu_block = exp_block_enabled and options.exp_block_gpu_verifier;
-                const verify_begin = std.time.nanoTimestamp();
-                var batch_stats = gpu.BatchDecodeStats{};
-                const position_before_verify = session.position;
-                const precheck_base_margin = if (options.exp_block_confidence_margin > 0)
-                    options.exp_block_confidence_margin
-                else
-                    block_policy.default_confidence_margin_threshold;
-                const precheck_margin_threshold = precheck_base_margin * options.exp_block_precheck_margin_multiplier;
-                const run_precheck = exp_block_enabled and draft_tokens.len > 0 and confidence_margin < precheck_margin_threshold;
-                var precheck_attempted = false;
-                var precheck_failed = false;
-                var accepted_count: usize = 0;
-
-                if (run_precheck) {
-                    precheck_attempted = true;
-                    block_decode_precheck_count += 1;
-                    const precheck_predicted = try session.stepGreedy(next_token);
-                    accepted_tokens[0] = precheck_predicted;
-                    if (precheck_predicted != draft_tokens[0]) {
-                        accepted_count = 1;
-                        precheck_failed = true;
-                        block_decode_precheck_fail_count += 1;
-                    } else if (draft_tokens.len == 1) {
-                        accepted_tokens[1] = try session.stepGreedy(precheck_predicted);
-                        accepted_count = 2;
-                    } else {
-                        const tail_draft = draft_tokens[1..];
-                        var tail_count: usize = if (use_gpu_block)
-                            session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
-                        else
-                            try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
-                        if (tail_count == 0) {
-                            tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                if (draft_limit == 0 or confidence_margin <= block_flat_logits_margin_eps) {
+                    if (confidence_margin <= block_flat_logits_margin_eps) {
+                        block_decode_confidence_gated += 1;
+                        if (options.exp_block_trace) {
+                            std.debug.print(
+                                "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_logits_fastpath margin={d:.6}\n",
+                                .{confidence_margin},
+                            );
                         }
-                        accepted_count = tail_count + 1;
                     }
-                } else {
-                    accepted_count = if (use_gpu_block)
-                        session.verifyDraftTokensBatchGpu(next_token, draft_tokens, &accepted_tokens, &batch_stats) catch 0
-                    else
-                        try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+                    greedy_next_token = bootstrap_token;
+                    if (generated_token_count == 0) {
+                        first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
+                    }
+                    profiler.endDecodeToken();
+                    continue;
                 }
-                if (accepted_count == 0) {
-                    accepted_count = try session.verifyDraftTokensSequential(next_token, draft_tokens, &accepted_tokens);
+
+                drafted_tokens[0] = bootstrap_token;
+                var draft_len: usize = 1;
+                const tail_limit = draft_limit - 1;
+                if (tail_limit > 0) {
+                    const history_tail = session.findDraftTokens(bootstrap_token, tail_limit);
+                    if (history_tail.len > 0) {
+                        @memcpy(drafted_tokens[1 .. 1 + history_tail.len], history_tail);
+                        draft_len += history_tail.len;
+                    } else {
+                        const proposer_shortlist = session.pending_shortlist[0..session.pending_shortlist_len];
+                        if (proposer_shortlist.len > 0) {
+                            const propose_result = draft_proposer.proposeDraftTokensFromShortlistDetailed(
+                                bootstrap_token,
+                                session.token_buffer[0..session.position],
+                                proposer_shortlist,
+                                options.repeat_penalty,
+                                tail_limit,
+                                drafted_tokens[1..],
+                                .{
+                                    .trace = options.exp_block_trace,
+                                },
+                            );
+                            if (propose_result.first_token_guard_reject) {
+                                block_decode_confidence_gated += 1;
+                            }
+                            draft_len += propose_result.drafted_len;
+                        }
+                    }
+                }
+                const draft_tokens = drafted_tokens[0..draft_len];
+                var accepted_count: usize = 1;
+                const precheck_attempted = false;
+                const precheck_failed = false;
+                accepted_tokens[0] = bootstrap_token;
+                if (draft_tokens.len == 1) {
+                    accepted_tokens[1] = try session.stepGreedy(bootstrap_token);
+                    accepted_count = 2;
+                } else {
+                    const tail_draft = draft_tokens[1..];
+                    var tail_count: usize = if (use_gpu_block)
+                        session.verifyDraftTokensBatchGpu(draft_tokens[0], tail_draft, accepted_tokens[1..], &batch_stats) catch 0
+                    else
+                        try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                    if (tail_count == 0) {
+                        tail_count = try session.verifyDraftTokensSequential(draft_tokens[0], tail_draft, accepted_tokens[1..]);
+                    }
+                    accepted_count = tail_count + 1;
                 }
                 if (!block_policy.acceptedPrefixInvariantHolds(draft_tokens, accepted_tokens[0..accepted_count], accepted_count)) {
                     return error.InvalidTensorMetadata;

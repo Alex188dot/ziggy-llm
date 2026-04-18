@@ -786,3 +786,18 @@ Conclusion: primary bottleneck is proposer token ranking/selection quality, not 
   - dominant failure mode was proposer input quality (flat logits), not verifier correctness.
   - this change stabilizes behavior and removes rollback/precheck overhead from bad drafts.
   - next step is enabling a proposer input path with real logit signal before expecting acceptance gains.
+
+### 18.3) Follow-up Fix: Post-Token Shortlist Bootstrap
+
+- [x] Root bug fixed:
+  - the proposer had been reading the distribution before consuming the current emitted token, so it was effectively one token behind.
+  - greedy block mode now advances one exact step first, then drafts from the fresh post-token GPU shortlist.
+- [x] Result:
+  - canonical forced run now reaches `accepted_prefix_len ~= 1.0` instead of `0.0`
+  - first drafted token is usually exact and accepted
+  - rollback count drops materially versus the original broken proposer path
+- [ ] Remaining problem:
+  - TPS is still below baseline because tail drafting is weak and verifier work is still expensive
+  - current tail proposer often only contributes one exact token plus a verifier bonus, which is not enough amortization
+
+Interpretation: the major correctness/selection bug is fixed. The next optimization target is no longer "why is position-0 wrong?" but "how do we raise accepted tail length above 1 without reintroducing mismatch churn?"

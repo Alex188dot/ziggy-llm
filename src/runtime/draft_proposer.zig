@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpu = @import("gpu/session.zig");
 
 const max_candidates: usize = 32;
 const shortlist_capacity: usize = 16;
@@ -52,6 +53,81 @@ pub fn proposeDraftTokens(
         .{},
     );
     return result.drafted_len;
+}
+
+pub fn proposeDraftTokensFromShortlistDetailed(
+    current_token: u32,
+    history: []const u32,
+    shortlist: []const gpu.ShortlistEntry,
+    repeat_penalty: f32,
+    max_draft: usize,
+    out: []u32,
+    settings: ProposalSettings,
+) ProposeResult {
+    var result = ProposeResult{};
+    if (max_draft == 0 or out.len == 0 or shortlist.len == 0) return result;
+
+    const draft_cap = @min(max_draft, out.len);
+    result.top1_token = shortlist[0].token_id;
+    if (shortlist.len >= 2) {
+        const gap = shortlist[0].logit - shortlist[1].logit;
+        if (settings.enable_first_token_sanity_guard and gap <= settings.min_first_token_raw_gap) {
+            result.first_token_guard_reject = true;
+            result.first_token_gap = gap;
+            if (settings.trace) {
+                std.debug.print(
+                    "BLOCK_PROPOSER_GUARD decision=REJECT reason=flat_shortlist raw_gap={d:.6} limit={d:.6} top1={d} top2={d}\n",
+                    .{
+                        gap,
+                        settings.min_first_token_raw_gap,
+                        shortlist[0].token_id,
+                        shortlist[1].token_id,
+                    },
+                );
+            }
+            return result;
+        }
+    }
+
+    var prev = current_token;
+    var produced: usize = 0;
+    while (produced < draft_cap) : (produced += 1) {
+        const choose = chooseSuccessorFromShortlistDetailed(
+            prev,
+            history,
+            shortlist,
+            out[0..produced],
+            repeat_penalty,
+            settings,
+        ) orelse break;
+
+        if (produced == 0) {
+            result.top1_token = choose.shortlist_top1.token_id;
+            result.first_token_gap = choose.first_token_penalized_gap;
+            if (settings.enable_first_token_sanity_guard and choose.first_token_penalized_gap > settings.first_token_penalized_gap_limit) {
+                result.first_token_guard_reject = true;
+                if (settings.trace) {
+                    std.debug.print(
+                        "BLOCK_PROPOSER_GUARD decision=REJECT reason=first_token_gap gap={d:.3} limit={d:.3} chosen={d} shortlist_top1={d}\n",
+                        .{
+                            choose.first_token_penalized_gap,
+                            settings.first_token_penalized_gap_limit,
+                            choose.chosen.token_id,
+                            choose.shortlist_top1.token_id,
+                        },
+                    );
+                }
+                return result;
+            }
+        }
+
+        if (settings.trace) traceChoice(produced, choose, settings.trace_top_n);
+        out[produced] = choose.chosen.token_id;
+        prev = choose.chosen.token_id;
+    }
+
+    result.drafted_len = produced;
+    return result;
 }
 
 pub fn proposeDraftTokensDetailed(
@@ -272,6 +348,124 @@ fn chooseSuccessorDetailed(
     };
 }
 
+fn chooseSuccessorFromShortlistDetailed(
+    prev: u32,
+    history: []const u32,
+    shortlist: []const gpu.ShortlistEntry,
+    drafted_prefix: []const u32,
+    repeat_penalty: f32,
+    settings: ProposalSettings,
+) ?ChoiceResult {
+    const is_first = drafted_prefix.len == 0;
+    const transition_weight: f64 = if (is_first) settings.first_token_transition_weight else settings.tail_transition_weight;
+
+    var shortlist_ranked: [shortlist_capacity]ScoredToken = undefined;
+    var shortlist_ranked_len: usize = 0;
+    for (shortlist) |entry| {
+        if (shortlist_ranked_len >= shortlist_ranked.len) break;
+        shortlist_ranked[shortlist_ranked_len] = scoreCandidateFromShortlistDetailed(
+            entry.token_id,
+            transitionCount(prev, entry.token_id, history),
+            true,
+            shortlist,
+            history,
+            drafted_prefix,
+            repeat_penalty,
+            transition_weight,
+        );
+        shortlist_ranked_len += 1;
+    }
+    sortScoredDescending(shortlist_ranked[0..shortlist_ranked_len]);
+    if (shortlist_ranked_len == 0) return null;
+
+    const shortlist_top1 = shortlist_ranked[0];
+    const fallback = shortlist_top1;
+    if (history.len < 2) {
+        return .{
+            .chosen = fallback,
+            .shortlist_top1 = shortlist_top1,
+            .first_token_penalized_gap = 0,
+            .shortlist_ranked = shortlist_ranked,
+            .shortlist_ranked_len = shortlist_ranked_len,
+        };
+    }
+
+    var candidate_ids: [max_candidates]u32 = undefined;
+    var candidate_counts: [max_candidates]u16 = undefined;
+    var candidate_len: usize = 0;
+    for (0..history.len - 1) |i| {
+        if (history[i] != prev) continue;
+        const next = history[i + 1];
+        var slot: usize = 0;
+        while (slot < candidate_len and candidate_ids[slot] != next) : (slot += 1) {}
+        if (slot < candidate_len) {
+            candidate_counts[slot] +|= 1;
+            continue;
+        }
+        if (candidate_len >= max_candidates) continue;
+        candidate_ids[candidate_len] = next;
+        candidate_counts[candidate_len] = 1;
+        candidate_len += 1;
+    }
+
+    if (candidate_len == 0) {
+        return .{
+            .chosen = fallback,
+            .shortlist_top1 = shortlist_top1,
+            .first_token_penalized_gap = 0,
+            .shortlist_ranked = shortlist_ranked,
+            .shortlist_ranked_len = shortlist_ranked_len,
+        };
+    }
+
+    var history_best = scoreCandidateFromShortlistDetailed(
+        candidate_ids[0],
+        candidate_counts[0],
+        inShortlistEntry(candidate_ids[0], shortlist),
+        shortlist,
+        history,
+        drafted_prefix,
+        repeat_penalty,
+        transition_weight,
+    );
+    for (1..candidate_len) |i| {
+        const scored = scoreCandidateFromShortlistDetailed(
+            candidate_ids[i],
+            candidate_counts[i],
+            inShortlistEntry(candidate_ids[i], shortlist),
+            shortlist,
+            history,
+            drafted_prefix,
+            repeat_penalty,
+            transition_weight,
+        );
+        if (isBetterScored(scored, history_best)) history_best = scored;
+    }
+
+    if (is_first and settings.prefer_conservative_first_token) {
+        const history_gap = shortlist_top1.penalized_logit - history_best.penalized_logit;
+        if (!history_best.in_shortlist or history_gap > settings.first_token_penalized_gap_limit) {
+            return .{
+                .chosen = fallback,
+                .shortlist_top1 = shortlist_top1,
+                .first_token_penalized_gap = 0,
+                .shortlist_ranked = shortlist_ranked,
+                .shortlist_ranked_len = shortlist_ranked_len,
+            };
+        }
+    }
+
+    const chosen = if (fallback.total_score > history_best.total_score + settings.fallback_override_margin) fallback else history_best;
+    const first_gap = if (is_first) shortlist_top1.penalized_logit - chosen.penalized_logit else @as(f32, 0);
+    return .{
+        .chosen = chosen,
+        .shortlist_top1 = shortlist_top1,
+        .first_token_penalized_gap = first_gap,
+        .shortlist_ranked = shortlist_ranked,
+        .shortlist_ranked_len = shortlist_ranked_len,
+    };
+}
+
 fn traceChoice(step_idx: usize, choice: ChoiceResult, top_n: usize) void {
     std.debug.print(
         "BLOCK_PROPOSER step_idx={d} chosen={d} raw={d:.4} penalized={d:.4} trans_count={d} trans_bonus={d:.4} total={d:.4} top1={d} top1_penalized={d:.4} gap={d:.4}\n",
@@ -311,6 +505,30 @@ fn scoreCandidateDetailed(
     transition_weight: f64,
 ) ScoredToken {
     const raw_logit = if (token_id < logits.len) logits[token_id] else -std.math.inf(f32);
+    const penalized = applyRepeatPenalty(raw_logit, token_id, history, drafted_prefix, repeat_penalty);
+    const transition_bonus = @as(f64, @floatFromInt(count)) * transition_weight;
+    return .{
+        .token_id = token_id,
+        .raw_logit = raw_logit,
+        .penalized_logit = penalized,
+        .transition_count = count,
+        .transition_bonus = transition_bonus,
+        .total_score = @as(f64, penalized) + transition_bonus,
+        .in_shortlist = shortlist_hit,
+    };
+}
+
+fn scoreCandidateFromShortlistDetailed(
+    token_id: u32,
+    count: u16,
+    shortlist_hit: bool,
+    shortlist: []const gpu.ShortlistEntry,
+    history: []const u32,
+    drafted_prefix: []const u32,
+    repeat_penalty: f32,
+    transition_weight: f64,
+) ScoredToken {
+    const raw_logit = shortlistLogitOf(token_id, shortlist);
     const penalized = applyRepeatPenalty(raw_logit, token_id, history, drafted_prefix, repeat_penalty);
     const transition_bonus = @as(f64, @floatFromInt(count)) * transition_weight;
     return .{
@@ -382,6 +600,20 @@ fn inShortlist(token_id: u32, shortlist: []const u32) bool {
         if (candidate == token_id) return true;
     }
     return false;
+}
+
+fn inShortlistEntry(token_id: u32, shortlist: []const gpu.ShortlistEntry) bool {
+    for (shortlist) |entry| {
+        if (entry.token_id == token_id) return true;
+    }
+    return false;
+}
+
+fn shortlistLogitOf(token_id: u32, shortlist: []const gpu.ShortlistEntry) f32 {
+    for (shortlist) |entry| {
+        if (entry.token_id == token_id) return entry.logit;
+    }
+    return -std.math.inf(f32);
 }
 
 fn buildTopShortlist(logits: []const f32, out: []u32) usize {
