@@ -816,3 +816,99 @@ Interpretation: the major correctness/selection bug is fixed. The next optimizat
   - TPS improved versus the previous post-shortlist-bootstrap state, though still below baseline
 
 Interpretation: stale/fake tail speculation is now suppressed. The remaining path to a real speedup is stronger token-2+ proposal quality, not more permissive drafting.
+
+---
+
+## 19) Summary So Far (2026-04-18)
+
+- Phase 0/1 proved the basic speculative block-decode loop could work with a CPU verifier, but it was slower than baseline because verifier and rollback overhead dominated.
+- Early block runs had very low acceptance and frequent rollbacks, so increasing `k` was not justified.
+- Section 12 work improved gating, fallback behavior, acceptance guards, and instrumentation, but did not create a net speedup.
+- Section 15 tightened adaptive `k` policy and verifier pressure; equality stayed correct, but forced speculation still had near-zero acceptance on the canonical prompt.
+- Section 16 added the missing observability:
+  - mismatch histograms
+  - single-token precheck
+  - rolling acceptance quality gate
+  - trace mode and prompt-suite benchmarking
+- Section 18 identified the real token-selection failure:
+  - the proposer was often wrong at position 0
+  - traces showed obviously bad proposals and immediate mismatches
+- The first major correctness fix was post-token shortlist bootstrap:
+  - speculative drafting now starts from the fresh distribution after consuming the current token
+  - this moved `accepted_prefix_len` from roughly `0.0` to roughly `1.0`
+  - position-0 acceptance became mostly correct
+- The second cleanup was trace and tail discipline:
+  - trace output now prints human-readable token text instead of raw tokenizer internals
+  - weak token-2+ guesses are no longer forced when there is no continuation evidence
+  - repeated garbage tails were removed
+- Current state:
+  - correctness is materially better than the original speculative path
+  - the first drafted token is usually correct
+  - tail acceptance is still too weak
+  - verifier cost is still too high relative to useful accepted speculative work
+  - throughput is still below baseline on the canonical benchmark
+
+### 19.1) Short Diagnosis
+
+- The original blocker was not "Metal verifier is broken".
+- The original blocker was "the proposer was drafting from the wrong or weak signal".
+- That bug is now fixed for token 1 of each block.
+- The remaining blocker is narrower and clearer:
+  - token 2+ drafting is not strong enough to amortize verifier cost
+  - current block decode behaves more like "1 exact drafted token + verifier bonus" than true multi-token speculation
+
+---
+
+## 20) Plan To Achieve A Real Speedup: Build A Stronger Token-2+ Proposer
+
+The next speedup will not come from more permissive guessing. It will come from raising accepted tail length beyond `1` while keeping exactness and rollback rate under control.
+
+### 20.1) Objective
+
+Raise accepted speculative tail length at positions `2+` so that each verify pass accepts multiple useful drafted tokens, not just the first one.
+
+### 20.2) Execution Plan
+
+1. Build a real tail proposer from exact accepted context:
+   - after the exact bootstrap token is accepted, draft token 2+ from the actual accepted sequence prefix, not from stale or fallback heuristics
+   - make the proposer stateful over the accepted draft prefix inside the current block
+
+2. Separate token-2+ proposal sources by reliability:
+   - first preference: exact local continuation evidence from recent accepted history
+   - second preference: transition/n-gram continuation statistics only when they clearly agree
+   - last resort: stop drafting the tail rather than inventing a weak token
+
+3. Add tail-quality instrumentation:
+   - track acceptance separately for position 1, 2, 3, 4 within the draft
+   - print per-position proposer source and score reason in trace mode
+   - expose metrics showing where tail acceptance collapses
+
+4. Add offline proposer evaluation before full TPS benchmarking:
+   - on fixed prompts, measure top-1 match rate for drafted position 2, 3, 4 against verifier tokens
+   - require visible improvement in those match rates before spending time on end-to-end benchmark tuning
+
+5. Re-benchmark only after tail quality improves:
+   - canonical neutral prompt
+   - repetitive prompt
+   - unstable/adversarial prompt
+   - compare baseline, default gated block mode, and forced block mode
+
+6. Only raise `k` after tail acceptance proves durable:
+   - do not move to `k=6/8/10/12` until token-2+ acceptance is materially improved at `k<=4`
+   - otherwise verifier overhead will grow faster than useful accepted work
+
+### 20.3) Success Criteria
+
+- `accepted_prefix_len_avg` rises materially above `1.0`
+- mismatch buckets shift away from position `1`
+- rollback count falls or stays low while accepted work rises
+- verify time per generated token is amortized enough to beat baseline TPS
+
+### 20.4) Practical Next Implementation
+
+If continuing immediately, the next implementation should be:
+
+1. add per-position acceptance metrics for draft positions `1..k`
+2. make the tail proposer explicitly consume the accepted in-block prefix when proposing token 2+
+3. keep "stop drafting" as the default when tail evidence is weak
+4. benchmark again before touching larger `k`
