@@ -62,6 +62,14 @@ pub const GenerateReport = struct {
     block_quality_gate_trigger_count: usize = 0,
     block_precheck_count: usize = 0,
     block_precheck_fail_count: usize = 0,
+    block_draft_pos1_count: usize = 0,
+    block_draft_pos2_count: usize = 0,
+    block_draft_pos3_count: usize = 0,
+    block_draft_pos4_count: usize = 0,
+    block_accept_pos1_count: usize = 0,
+    block_accept_pos2_count: usize = 0,
+    block_accept_pos3_count: usize = 0,
+    block_accept_pos4_count: usize = 0,
     block_mismatch_pos0_count: usize = 0,
     block_mismatch_pos1_count: usize = 0,
     block_mismatch_pos2_count: usize = 0,
@@ -150,6 +158,52 @@ fn recordBlockMismatchBuckets(
         2 => mismatch_pos2_count.* += 1,
         else => mismatch_pos3_count.* += 1,
     }
+}
+
+fn recordBlockPositionAcceptance(
+    draft_len: usize,
+    accepted_prefix_len: usize,
+    draft_pos1_count: *usize,
+    draft_pos2_count: *usize,
+    draft_pos3_count: *usize,
+    draft_pos4_count: *usize,
+    accept_pos1_count: *usize,
+    accept_pos2_count: *usize,
+    accept_pos3_count: *usize,
+    accept_pos4_count: *usize,
+) void {
+    if (draft_len >= 1) {
+        draft_pos1_count.* += 1;
+        if (accepted_prefix_len >= 1) accept_pos1_count.* += 1;
+    }
+    if (draft_len >= 2) {
+        draft_pos2_count.* += 1;
+        if (accepted_prefix_len >= 2) accept_pos2_count.* += 1;
+    }
+    if (draft_len >= 3) {
+        draft_pos3_count.* += 1;
+        if (accepted_prefix_len >= 3) accept_pos3_count.* += 1;
+    }
+    if (draft_len >= 4) {
+        draft_pos4_count.* += 1;
+        if (accepted_prefix_len >= 4) accept_pos4_count.* += 1;
+    }
+}
+
+fn traceTailProposal(
+    enabled: bool,
+    tokenizer: Tokenizer,
+    position: usize,
+    token_id: u32,
+    trace: draft_proposer.TailProposalTrace,
+) void {
+    if (!enabled) return;
+    var piece_buf: [64]u8 = undefined;
+    const piece = tokenTracePiece(tokenizer, token_id, &piece_buf);
+    std.debug.print(
+        "BLOCK_TAIL_PROPOSAL pos={d} token={d} piece=\"{s}\" source={s} matched_context={d} matches={d}\n",
+        .{ position, token_id, piece, trace.label(), trace.matched_context_tokens, trace.match_count },
+    );
 }
 
 fn traceBlockAttempt(
@@ -1911,6 +1965,7 @@ pub fn generateLoadedStreaming(
     } else null;
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
+    var tail_trace: [gpu.max_draft_len]draft_proposer.TailProposalTrace = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
@@ -1920,6 +1975,14 @@ pub fn generateLoadedStreaming(
     var block_decode_quality_gate_trigger_count: usize = 0;
     const block_decode_precheck_count: usize = 0;
     const block_decode_precheck_fail_count: usize = 0;
+    var block_decode_draft_pos1_count: usize = 0;
+    var block_decode_draft_pos2_count: usize = 0;
+    var block_decode_draft_pos3_count: usize = 0;
+    var block_decode_draft_pos4_count: usize = 0;
+    var block_decode_accept_pos1_count: usize = 0;
+    var block_decode_accept_pos2_count: usize = 0;
+    var block_decode_accept_pos3_count: usize = 0;
+    var block_decode_accept_pos4_count: usize = 0;
     var block_decode_mismatch_pos0_count: usize = 0;
     var block_decode_mismatch_pos1_count: usize = 0;
     var block_decode_mismatch_pos2_count: usize = 0;
@@ -2044,13 +2107,23 @@ pub fn generateLoadedStreaming(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail_len = draft_proposer.proposeDraftTokensFromHistoryChain(
-                        bootstrap_token,
+                    const history_tail_len = draft_proposer.proposeTailTokensFromAcceptedContext(
                         session.token_buffer[0..session.position],
                         tail_limit,
                         drafted_tokens[1..],
+                        tail_trace[0..],
                     );
                     if (history_tail_len > 0) {
+                        var tail_idx: usize = 0;
+                        while (tail_idx < history_tail_len) : (tail_idx += 1) {
+                            traceTailProposal(
+                                options.exp_block_trace,
+                                model.tokenizer,
+                                tail_idx + 2,
+                                drafted_tokens[1 + tail_idx],
+                                tail_trace[tail_idx],
+                            );
+                        }
                         draft_len += history_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
@@ -2097,6 +2170,18 @@ pub fn generateLoadedStreaming(
                     block_decode_rollbacks += 1;
                     block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
                 }
+                recordBlockPositionAcceptance(
+                    draft_tokens.len,
+                    accepted_prefix_len,
+                    &block_decode_draft_pos1_count,
+                    &block_decode_draft_pos2_count,
+                    &block_decode_draft_pos3_count,
+                    &block_decode_draft_pos4_count,
+                    &block_decode_accept_pos1_count,
+                    &block_decode_accept_pos2_count,
+                    &block_decode_accept_pos3_count,
+                    &block_decode_accept_pos4_count,
+                );
                 recordBlockMismatchBuckets(
                     draft_tokens.len,
                     accepted_prefix_len,
@@ -2232,6 +2317,14 @@ pub fn generateLoadedStreaming(
         .block_quality_gate_trigger_count = block_decode_quality_gate_trigger_count,
         .block_precheck_count = block_decode_precheck_count,
         .block_precheck_fail_count = block_decode_precheck_fail_count,
+        .block_draft_pos1_count = block_decode_draft_pos1_count,
+        .block_draft_pos2_count = block_decode_draft_pos2_count,
+        .block_draft_pos3_count = block_decode_draft_pos3_count,
+        .block_draft_pos4_count = block_decode_draft_pos4_count,
+        .block_accept_pos1_count = block_decode_accept_pos1_count,
+        .block_accept_pos2_count = block_decode_accept_pos2_count,
+        .block_accept_pos3_count = block_decode_accept_pos3_count,
+        .block_accept_pos4_count = block_decode_accept_pos4_count,
         .block_mismatch_pos0_count = block_decode_mismatch_pos0_count,
         .block_mismatch_pos1_count = block_decode_mismatch_pos1_count,
         .block_mismatch_pos2_count = block_decode_mismatch_pos2_count,
@@ -2338,6 +2431,7 @@ pub fn generateLoadedStreamingCached(
 
     var accepted_tokens: [gpu.max_draft_len + 1]u32 = undefined;
     var drafted_tokens: [gpu.max_draft_len]u32 = undefined;
+    var tail_trace: [gpu.max_draft_len]draft_proposer.TailProposalTrace = undefined;
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
@@ -2347,6 +2441,14 @@ pub fn generateLoadedStreamingCached(
     var block_decode_quality_gate_trigger_count: usize = 0;
     const block_decode_precheck_count: usize = 0;
     const block_decode_precheck_fail_count: usize = 0;
+    var block_decode_draft_pos1_count: usize = 0;
+    var block_decode_draft_pos2_count: usize = 0;
+    var block_decode_draft_pos3_count: usize = 0;
+    var block_decode_draft_pos4_count: usize = 0;
+    var block_decode_accept_pos1_count: usize = 0;
+    var block_decode_accept_pos2_count: usize = 0;
+    var block_decode_accept_pos3_count: usize = 0;
+    var block_decode_accept_pos4_count: usize = 0;
     var block_decode_mismatch_pos0_count: usize = 0;
     var block_decode_mismatch_pos1_count: usize = 0;
     var block_decode_mismatch_pos2_count: usize = 0;
@@ -2471,13 +2573,23 @@ pub fn generateLoadedStreamingCached(
                 var draft_len: usize = 1;
                 const tail_limit = draft_limit - 1;
                 if (tail_limit > 0) {
-                    const history_tail_len = draft_proposer.proposeDraftTokensFromHistoryChain(
-                        bootstrap_token,
+                    const history_tail_len = draft_proposer.proposeTailTokensFromAcceptedContext(
                         session.token_buffer[0..session.position],
                         tail_limit,
                         drafted_tokens[1..],
+                        tail_trace[0..],
                     );
                     if (history_tail_len > 0) {
+                        var tail_idx: usize = 0;
+                        while (tail_idx < history_tail_len) : (tail_idx += 1) {
+                            traceTailProposal(
+                                options.exp_block_trace,
+                                model.tokenizer,
+                                tail_idx + 2,
+                                drafted_tokens[1 + tail_idx],
+                                tail_trace[tail_idx],
+                            );
+                        }
                         draft_len += history_tail_len;
                     } else if (options.exp_block_trace) {
                         std.debug.print(
@@ -2524,6 +2636,18 @@ pub fn generateLoadedStreamingCached(
                     block_decode_rollbacks += 1;
                     block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
                 }
+                recordBlockPositionAcceptance(
+                    draft_tokens.len,
+                    accepted_prefix_len,
+                    &block_decode_draft_pos1_count,
+                    &block_decode_draft_pos2_count,
+                    &block_decode_draft_pos3_count,
+                    &block_decode_draft_pos4_count,
+                    &block_decode_accept_pos1_count,
+                    &block_decode_accept_pos2_count,
+                    &block_decode_accept_pos3_count,
+                    &block_decode_accept_pos4_count,
+                );
                 recordBlockMismatchBuckets(
                     draft_tokens.len,
                     accepted_prefix_len,
@@ -2659,6 +2783,14 @@ pub fn generateLoadedStreamingCached(
         .block_quality_gate_trigger_count = block_decode_quality_gate_trigger_count,
         .block_precheck_count = block_decode_precheck_count,
         .block_precheck_fail_count = block_decode_precheck_fail_count,
+        .block_draft_pos1_count = block_decode_draft_pos1_count,
+        .block_draft_pos2_count = block_decode_draft_pos2_count,
+        .block_draft_pos3_count = block_decode_draft_pos3_count,
+        .block_draft_pos4_count = block_decode_draft_pos4_count,
+        .block_accept_pos1_count = block_decode_accept_pos1_count,
+        .block_accept_pos2_count = block_decode_accept_pos2_count,
+        .block_accept_pos3_count = block_decode_accept_pos3_count,
+        .block_accept_pos4_count = block_decode_accept_pos4_count,
         .block_mismatch_pos0_count = block_decode_mismatch_pos0_count,
         .block_mismatch_pos1_count = block_decode_mismatch_pos1_count,
         .block_mismatch_pos2_count = block_decode_mismatch_pos2_count,

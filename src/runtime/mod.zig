@@ -128,6 +128,14 @@ pub fn generate(
             .block_quality_gate_trigger_count = family_report.block_quality_gate_trigger_count,
             .block_precheck_count = family_report.block_precheck_count,
             .block_precheck_fail_count = family_report.block_precheck_fail_count,
+            .block_draft_pos1_count = family_report.block_draft_pos1_count,
+            .block_draft_pos2_count = family_report.block_draft_pos2_count,
+            .block_draft_pos3_count = family_report.block_draft_pos3_count,
+            .block_draft_pos4_count = family_report.block_draft_pos4_count,
+            .block_accept_pos1_count = family_report.block_accept_pos1_count,
+            .block_accept_pos2_count = family_report.block_accept_pos2_count,
+            .block_accept_pos3_count = family_report.block_accept_pos3_count,
+            .block_accept_pos4_count = family_report.block_accept_pos4_count,
             .block_mismatch_pos0_count = family_report.block_mismatch_pos0_count,
             .block_mismatch_pos1_count = family_report.block_mismatch_pos1_count,
             .block_mismatch_pos2_count = family_report.block_mismatch_pos2_count,
@@ -223,6 +231,14 @@ pub fn runCommand(
         \\block.quality_gate_trigger_count: {d}
         \\block.precheck_count: {d}
         \\block.precheck_fail_count: {d}
+        \\block.draft_pos1_count: {d}
+        \\block.draft_pos2_count: {d}
+        \\block.draft_pos3_count: {d}
+        \\block.draft_pos4_count: {d}
+        \\block.accept_pos1_count: {d}
+        \\block.accept_pos2_count: {d}
+        \\block.accept_pos3_count: {d}
+        \\block.accept_pos4_count: {d}
         \\block.mismatch_pos0_count: {d}
         \\block.mismatch_pos1_count: {d}
         \\block.mismatch_pos2_count: {d}
@@ -250,6 +266,14 @@ pub fn runCommand(
             report.block_quality_gate_trigger_count,
             report.block_precheck_count,
             report.block_precheck_fail_count,
+            report.block_draft_pos1_count,
+            report.block_draft_pos2_count,
+            report.block_draft_pos3_count,
+            report.block_draft_pos4_count,
+            report.block_accept_pos1_count,
+            report.block_accept_pos2_count,
+            report.block_accept_pos3_count,
+            report.block_accept_pos4_count,
             report.block_mismatch_pos0_count,
             report.block_mismatch_pos1_count,
             report.block_mismatch_pos2_count,
@@ -339,6 +363,14 @@ pub fn benchCommand(
             \\cold.block.quality_gate_trigger_count={d}
             \\cold.block.precheck_count={d}
             \\cold.block.precheck_fail_count={d}
+            \\cold.block.draft_pos1_count={d}
+            \\cold.block.draft_pos2_count={d}
+            \\cold.block.draft_pos3_count={d}
+            \\cold.block.draft_pos4_count={d}
+            \\cold.block.accept_pos1_count={d}
+            \\cold.block.accept_pos2_count={d}
+            \\cold.block.accept_pos3_count={d}
+            \\cold.block.accept_pos4_count={d}
             \\cold.block.mismatch_pos0_count={d}
             \\cold.block.mismatch_pos1_count={d}
             \\cold.block.mismatch_pos2_count={d}
@@ -364,6 +396,14 @@ pub fn benchCommand(
                 summary.cold.block_quality_gate_trigger_count,
                 summary.cold.block_precheck_count,
                 summary.cold.block_precheck_fail_count,
+                summary.cold.block_draft_pos1_count,
+                summary.cold.block_draft_pos2_count,
+                summary.cold.block_draft_pos3_count,
+                summary.cold.block_draft_pos4_count,
+                summary.cold.block_accept_pos1_count,
+                summary.cold.block_accept_pos2_count,
+                summary.cold.block_accept_pos3_count,
+                summary.cold.block_accept_pos4_count,
                 summary.cold.block_mismatch_pos0_count,
                 summary.cold.block_mismatch_pos1_count,
                 summary.cold.block_mismatch_pos2_count,
@@ -425,6 +465,14 @@ pub fn benchCommand(
             \\warm.block.quality_gate_trigger_count_avg={d}
             \\warm.block.precheck_count_avg={d}
             \\warm.block.precheck_fail_count_avg={d}
+            \\warm.block.draft_pos1_count_avg={d}
+            \\warm.block.draft_pos2_count_avg={d}
+            \\warm.block.draft_pos3_count_avg={d}
+            \\warm.block.draft_pos4_count_avg={d}
+            \\warm.block.accept_pos1_count_avg={d}
+            \\warm.block.accept_pos2_count_avg={d}
+            \\warm.block.accept_pos3_count_avg={d}
+            \\warm.block.accept_pos4_count_avg={d}
             \\warm.block.mismatch_pos0_count_avg={d}
             \\warm.block.mismatch_pos1_count_avg={d}
             \\warm.block.mismatch_pos2_count_avg={d}
@@ -447,6 +495,14 @@ pub fn benchCommand(
                 summary.warm_block_quality_gate_trigger_count_avg,
                 summary.warm_block_precheck_count_avg,
                 summary.warm_block_precheck_fail_count_avg,
+                summary.warm_block_draft_pos1_count_avg,
+                summary.warm_block_draft_pos2_count_avg,
+                summary.warm_block_draft_pos3_count_avg,
+                summary.warm_block_draft_pos4_count_avg,
+                summary.warm_block_accept_pos1_count_avg,
+                summary.warm_block_accept_pos2_count_avg,
+                summary.warm_block_accept_pos3_count_avg,
+                summary.warm_block_accept_pos4_count_avg,
                 summary.warm_block_mismatch_pos0_count_avg,
                 summary.warm_block_mismatch_pos1_count_avg,
                 summary.warm_block_mismatch_pos2_count_avg,
@@ -534,6 +590,14 @@ pub fn benchCommand(
         \\block.quality_gate_trigger_count={d}
         \\block.precheck_count={d}
         \\block.precheck_fail_count={d}
+        \\block.draft_pos1_count={d}
+        \\block.draft_pos2_count={d}
+        \\block.draft_pos3_count={d}
+        \\block.draft_pos4_count={d}
+        \\block.accept_pos1_count={d}
+        \\block.accept_pos2_count={d}
+        \\block.accept_pos3_count={d}
+        \\block.accept_pos4_count={d}
         \\block.mismatch_pos0_count={d}
         \\block.mismatch_pos1_count={d}
         \\block.mismatch_pos2_count={d}
@@ -559,6 +623,14 @@ pub fn benchCommand(
             report.block_quality_gate_trigger_count,
             report.block_precheck_count,
             report.block_precheck_fail_count,
+            report.block_draft_pos1_count,
+            report.block_draft_pos2_count,
+            report.block_draft_pos3_count,
+            report.block_draft_pos4_count,
+            report.block_accept_pos1_count,
+            report.block_accept_pos2_count,
+            report.block_accept_pos3_count,
+            report.block_accept_pos4_count,
             report.block_mismatch_pos0_count,
             report.block_mismatch_pos1_count,
             report.block_mismatch_pos2_count,

@@ -25,6 +25,24 @@ pub const ProposeResult = struct {
     top1_token: u32 = 0,
 };
 
+pub const TailProposalSource = enum {
+    exact_suffix,
+    suffix_backoff,
+};
+
+pub const TailProposalTrace = struct {
+    source: TailProposalSource = .exact_suffix,
+    matched_context_tokens: usize = 0,
+    match_count: u16 = 0,
+
+    pub fn label(self: TailProposalTrace) []const u8 {
+        return switch (self.source) {
+            .exact_suffix => "exact_suffix",
+            .suffix_backoff => "suffix_backoff",
+        };
+    }
+};
+
 const ScoredToken = struct {
     token_id: u32,
     raw_logit: f32,
@@ -147,6 +165,32 @@ pub fn proposeDraftTokensFromHistoryChain(
         out[produced] = next;
     }
 
+    return produced;
+}
+
+pub fn proposeTailTokensFromAcceptedContext(
+    history: []const u32,
+    max_draft: usize,
+    out: []u32,
+    trace_out: ?[]TailProposalTrace,
+) usize {
+    if (max_draft == 0 or out.len == 0 or history.len == 0) return 0;
+
+    const draft_cap = @min(max_draft, out.len);
+    var produced: usize = 0;
+    while (produced < draft_cap) : (produced += 1) {
+        const continuation = bestContextContinuation(history, out[0..produced]) orelse break;
+        out[produced] = continuation.token_id;
+        if (trace_out) |trace| {
+            if (produced < trace.len) {
+                trace[produced] = .{
+                    .source = continuation.trace.source,
+                    .matched_context_tokens = continuation.trace.matched_context_tokens,
+                    .match_count = continuation.trace.match_count,
+                };
+            }
+        }
+    }
     return produced;
 }
 
@@ -636,6 +680,93 @@ fn shortlistLogitOf(token_id: u32, shortlist: []const gpu.ShortlistEntry) f32 {
     return -std.math.inf(f32);
 }
 
+const ContextContinuation = struct {
+    token_id: u32,
+    trace: TailProposalTrace,
+};
+
+fn bestContextContinuation(history: []const u32, drafted_prefix: []const u32) ?ContextContinuation {
+    if (history.len == 0) return null;
+
+    const total_context_len = history.len + drafted_prefix.len;
+    const max_context_len = @min(total_context_len, @as(usize, 8));
+    if (max_context_len == 0) return null;
+
+    var context_len = max_context_len;
+    while (context_len >= 1) : (context_len -= 1) {
+        var candidate_ids: [max_candidates]u32 = undefined;
+        var candidate_counts: [max_candidates]u16 = undefined;
+        var candidate_len: usize = 0;
+
+        var i: usize = 0;
+        while (i + context_len < history.len) : (i += 1) {
+            if (!historyContextMatches(history, drafted_prefix, i, context_len)) continue;
+            const next = history[i + context_len];
+            var slot: usize = 0;
+            while (slot < candidate_len and candidate_ids[slot] != next) : (slot += 1) {}
+            if (slot < candidate_len) {
+                candidate_counts[slot] +|= 1;
+                continue;
+            }
+            if (candidate_len >= max_candidates) continue;
+            candidate_ids[candidate_len] = next;
+            candidate_counts[candidate_len] = 1;
+            candidate_len += 1;
+        }
+
+        if (candidate_len == 0) {
+            if (context_len == 1) break;
+            continue;
+        }
+
+        var best_idx: usize = 0;
+        var k: usize = 1;
+        while (k < candidate_len) : (k += 1) {
+            if (candidate_counts[k] > candidate_counts[best_idx] or
+                (candidate_counts[k] == candidate_counts[best_idx] and candidate_ids[k] < candidate_ids[best_idx]))
+            {
+                best_idx = k;
+            }
+        }
+
+        const best_count = candidate_counts[best_idx];
+        if ((context_len == 1 and best_count < 2) or (context_len == 2 and best_count < 1)) {
+            if (context_len == 1) break;
+            continue;
+        }
+
+        return .{
+            .token_id = candidate_ids[best_idx],
+            .trace = .{
+                .source = if (context_len == max_context_len) .exact_suffix else .suffix_backoff,
+                .matched_context_tokens = context_len,
+                .match_count = best_count,
+            },
+        };
+    }
+
+    return null;
+}
+
+fn historyContextMatches(history: []const u32, drafted_prefix: []const u32, history_start: usize, context_len: usize) bool {
+    const total_context_len = history.len + drafted_prefix.len;
+    if (context_len > total_context_len) return false;
+    const context_start = total_context_len - context_len;
+
+    var offset: usize = 0;
+    while (offset < context_len) : (offset += 1) {
+        if (history[history_start + offset] != contextTokenAt(history, drafted_prefix, context_start + offset)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn contextTokenAt(history: []const u32, drafted_prefix: []const u32, idx: usize) u32 {
+    if (idx < history.len) return history[idx];
+    return drafted_prefix[idx - history.len];
+}
+
 fn mostFrequentHistoryContinuation(current_token: u32, drafted_prefix: []const u32, history: []const u32) ?u32 {
     var candidate_ids: [max_candidates]u32 = undefined;
     var candidate_counts: [max_candidates]u16 = undefined;
@@ -788,4 +919,16 @@ test "history chain proposer follows repeated continuation" {
     try std.testing.expectEqual(@as(u32, 20), out[0]);
     try std.testing.expectEqual(@as(u32, 30), out[1]);
     try std.testing.expectEqual(@as(u32, 40), out[2]);
+}
+
+test "accepted-context tail proposer uses longest suffix and backoff" {
+    const history = [_]u32{ 7, 8, 9, 10, 11, 13, 7, 8, 9, 10, 11, 14, 7, 8, 9, 10 };
+    var out: [2]u32 = undefined;
+    var trace: [2]TailProposalTrace = undefined;
+    const drafted = proposeTailTokensFromAcceptedContext(&history, 2, &out, &trace);
+    try std.testing.expectEqual(@as(usize, 2), drafted);
+    try std.testing.expectEqual(@as(u32, 11), out[0]);
+    try std.testing.expectEqual(@as(u32, 13), out[1]);
+    try std.testing.expectEqual(@as(usize, 4), trace[0].matched_context_tokens);
+    try std.testing.expectEqualStrings("suffix_backoff", trace[0].label());
 }

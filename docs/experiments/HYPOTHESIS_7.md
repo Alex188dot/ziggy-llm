@@ -912,3 +912,36 @@ If continuing immediately, the next implementation should be:
 2. make the tail proposer explicitly consume the accepted in-block prefix when proposing token 2+
 3. keep "stop drafting" as the default when tail evidence is weak
 4. benchmark again before touching larger `k`
+
+### 20.5) Implementation Status (2026-04-18)
+
+- [x] Added per-position draft/accept metrics for positions `1..4`:
+  - `block.draft_pos1_count` ... `block.draft_pos4_count`
+  - `block.accept_pos1_count` ... `block.accept_pos4_count`
+  - warm bench averages emitted for the same metrics
+- [x] Replaced the weak tail fallback with a context-suffix proposer:
+  - token 2+ is now proposed from the actual accepted context suffix plus in-block drafted prefix
+  - the proposer backs off from longer suffixes to shorter suffixes and stops when evidence is weak
+- [x] Added tail-proposer trace output:
+  - `BLOCK_TAIL_PROPOSAL pos=... token=... piece="..." source=... matched_context=... matches=...`
+- [x] Benchmarked the canonical prompt after implementation
+
+### 20.6) Latest Measured Result
+
+- Canonical forced bench (`k=4`, `confidence_margin=0`, warm avg):
+  - `warm.tps_avg=38.467`
+  - `warm.block.accepted_prefix_len_avg=1.000`
+  - `warm.block.rollback_count_avg=4`
+  - `warm.block.draft_pos2_count_avg=4`
+  - `warm.block.accept_pos2_count_avg=0`
+
+Interpretation:
+
+- The new tail proposer is conservative enough to avoid most of the earlier bad tail behavior.
+- Throughput recovered to roughly baseline territory on the canonical forced run.
+- But the core remaining problem is still visible in the new metrics:
+  - token 2 is occasionally proposed
+  - token 2 is still not being accepted on the canonical prompt
+- So section 20 is only partially complete in outcome terms:
+  - the right architecture and instrumentation are now in place
+  - the next improvement must come from a stronger token-2 selection policy, not from drafting deeper with the current proposer
