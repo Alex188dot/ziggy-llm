@@ -1005,3 +1005,80 @@ Interpretation:
 - token 2 is still not being accepted on the canonical prompt
 - this means weighted suffix ranking alone is not sufficient
 - the next real implementation step must use a different signal class for token 2, not just a better count-based ranking of historical suffix matches
+
+### 20.10) Logits-Aligned Chained Drafting Experiment
+
+Implemented a stronger proposer that uses the verifier model's own live post-token logits to draft token 2+.
+
+What changed:
+
+- token 2+ is no longer proposed from suffix/history counts in the active experiment path
+- after exact token 1 is emitted, the proposer temporarily advances the live GPU session with exact `stepGreedy` calls
+- each chained step reads the real post-token shortlist/logits from that drafted state
+- the temporary proposal path is rolled back to the verifier start state via explicit GPU KV-slot backup/restore
+- the existing verifier path is then reused unchanged to verify the drafted suffix
+- trace output labels these tail drafts as `source=logits_chain`
+
+Why this was important:
+
+- this removes the signal mismatch between proposer and verifier for token 2+
+- it tests the core hypothesis directly: if token 2+ comes from true model-state signal instead of history heuristics, acceptance should rise sharply
+
+Implementation notes:
+
+- added GPU KV backup/restore helpers so proposal-time exact steps can be reverted safely
+- replaced the old history/suffix tail path in block decode with temporary exact chained greedy drafting
+- kept the verifier and acceptance accounting unchanged so the experiment isolates proposer quality
+
+Validation:
+
+- `zig fmt` passed
+- `zig build` passed
+- canonical traced `run` passed
+- canonical `bench` passed
+
+Canonical traced run result:
+
+- `tps: 14.207`
+- `block.accepted_prefix_len: 1.870`
+- `block.rollback_count: 0`
+- `block.draft_pos2_count: 12`
+- `block.accept_pos2_count: 12`
+- `block.draft_pos3_count: 4`
+- `block.accept_pos3_count: 4`
+- `block.draft_pos4_count: 4`
+- `block.accept_pos4_count: 4`
+
+Canonical forced bench result (`k=4`, `confidence_margin=0`, warm avg):
+
+- `warm.tps_avg=21.848`
+- `warm.block.accepted_prefix_len_avg=2.639`
+- `warm.block.rollback_count_avg=0`
+- `warm.block.draft_pos2_count_avg=25`
+- `warm.block.accept_pos2_count_avg=25`
+- `warm.block.draft_pos3_count_avg=17`
+- `warm.block.accept_pos3_count_avg=17`
+- `warm.block.draft_pos4_count_avg=17`
+- `warm.block.accept_pos4_count_avg=17`
+
+Interpretation:
+
+- this experiment proves that the earlier bottleneck diagnosis was correct
+- when token 2+ is proposed from the model's actual current state, acceptance becomes very strong
+- rollbacks collapse to zero on the canonical benchmark
+- accepted prefix length rises well above `1.0`
+
+But it is still not a speed win:
+
+- throughput collapses because proposal is now paying real sequential forward-pass cost
+- verifier work then repeats that work again during verification
+- so this is a correctness / signal-quality success, but a performance failure
+
+Conclusion:
+
+- stronger token-2+ signal is necessary
+- but stronger signal alone is not sufficient if proposal and verification duplicate the same exact compute
+- the next real performance step must introduce reuse or batching across proposal and verification, for example:
+  - GPU-side proposal/verifier reuse
+  - verifier-side batching that avoids recomputing proposal work
+  - or a separate cheaper draft model
