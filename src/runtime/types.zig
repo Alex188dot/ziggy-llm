@@ -162,6 +162,7 @@ pub const GenerationOptions = struct {
     exp_block_decode: bool = false,
     exp_block_k: usize = 2,
     exp_block_confidence_margin: f32 = 0.75,
+    exp_block_cooldown_tokens: usize = 8,
 };
 
 pub const StartupBreakdown = struct {
@@ -193,9 +194,11 @@ pub const GenerationReport = struct {
     exp_block_decode: bool = false,
     exp_block_k: usize = 0,
     exp_block_confidence_margin: f32 = 0.75,
+    exp_block_cooldown_tokens: usize = 8,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_confidence_gated_count: usize = 0,
+    block_cooldown_active_count: usize = 0,
     block_verify_ns: u64 = 0,
     block_gpu_backup_ns: u64 = 0,
     block_gpu_restore_ns: u64 = 0,

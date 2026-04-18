@@ -15,6 +15,7 @@ pub const BenchSummary = struct {
     warm_block_accepted_prefix_len_avg: f64 = 0,
     warm_block_rollback_count_avg: usize = 0,
     warm_block_confidence_gated_count_avg: usize = 0,
+    warm_block_cooldown_active_count_avg: usize = 0,
     warm_block_verify_ns_avg: u64 = 0,
     warm_block_gpu_backup_ns_avg: u64 = 0,
     warm_block_gpu_restore_ns_avg: u64 = 0,
@@ -65,6 +66,7 @@ pub fn runWarmBench(
     var warm_block_accepted_prefix_len_total: f64 = 0;
     var warm_block_rollback_count_total: u128 = 0;
     var warm_block_confidence_gated_count_total: u128 = 0;
+    var warm_block_cooldown_active_count_total: u128 = 0;
     var warm_block_verify_ns_total: u128 = 0;
     var warm_block_gpu_backup_ns_total: u128 = 0;
     var warm_block_gpu_restore_ns_total: u128 = 0;
@@ -84,6 +86,7 @@ pub fn runWarmBench(
         warm_block_accepted_prefix_len_total += warm.block_accepted_prefix_len;
         warm_block_rollback_count_total += warm.block_rollback_count;
         warm_block_confidence_gated_count_total += warm.block_confidence_gated_count;
+        warm_block_cooldown_active_count_total += warm.block_cooldown_active_count;
         warm_block_verify_ns_total += warm.block_verify_ns;
         warm_block_gpu_backup_ns_total += warm.block_gpu_backup_ns;
         warm_block_gpu_restore_ns_total += warm.block_gpu_restore_ns;
@@ -115,6 +118,7 @@ pub fn runWarmBench(
         .warm_block_accepted_prefix_len_avg = warm_block_accepted_prefix_len_total / @as(f64, @floatFromInt(warm_runs)),
         .warm_block_rollback_count_avg = @intCast(warm_block_rollback_count_total / warm_runs),
         .warm_block_confidence_gated_count_avg = @intCast(warm_block_confidence_gated_count_total / warm_runs),
+        .warm_block_cooldown_active_count_avg = @intCast(warm_block_cooldown_active_count_total / warm_runs),
         .warm_block_verify_ns_avg = @intCast(warm_block_verify_ns_total / warm_runs),
         .warm_block_gpu_backup_ns_avg = @intCast(warm_block_gpu_backup_ns_total / warm_runs),
         .warm_block_gpu_restore_ns_avg = @intCast(warm_block_gpu_restore_ns_total / warm_runs),

@@ -82,6 +82,7 @@ pub fn generate(
             .exp_block_decode = options.exp_block_decode,
             .exp_block_k = options.exp_block_k,
             .exp_block_confidence_margin = options.exp_block_confidence_margin,
+            .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
         };
 
         const family_report = try runtime.generate(allocator, model_path, prompt, family_options);
@@ -106,9 +107,11 @@ pub fn generate(
             .exp_block_decode = family_report.exp_block_decode,
             .exp_block_k = family_report.exp_block_k,
             .exp_block_confidence_margin = family_report.exp_block_confidence_margin,
+            .exp_block_cooldown_tokens = family_report.exp_block_cooldown_tokens,
             .block_accepted_prefix_len = family_report.block_accepted_prefix_len,
             .block_rollback_count = family_report.block_rollback_count,
             .block_confidence_gated_count = family_report.block_confidence_gated_count,
+            .block_cooldown_active_count = family_report.block_cooldown_active_count,
             .block_verify_ns = family_report.block_verify_ns,
             .block_gpu_backup_ns = family_report.block_gpu_backup_ns,
             .block_gpu_restore_ns = family_report.block_gpu_restore_ns,
@@ -189,9 +192,11 @@ pub fn runCommand(
         \\block.exp_enabled: {}
         \\block.k: {d}
         \\block.confidence_margin: {d:.3}
+        \\block.cooldown_tokens: {d}
         \\block.accepted_prefix_len: {d:.3}
         \\block.rollback_count: {d}
         \\block.confidence_gated_count: {d}
+        \\block.cooldown_active_count: {d}
         \\block.verify_ms: {d:.3}
         \\block.gpu_backup_ms: {d:.3}
         \\block.gpu_restore_ms: {d:.3}
@@ -204,9 +209,11 @@ pub fn runCommand(
             report.exp_block_decode,
             report.exp_block_k,
             report.exp_block_confidence_margin,
+            report.exp_block_cooldown_tokens,
             report.block_accepted_prefix_len,
             report.block_rollback_count,
             report.block_confidence_gated_count,
+            report.block_cooldown_active_count,
             nsToMs(report.block_verify_ns),
             nsToMs(report.block_gpu_backup_ns),
             nsToMs(report.block_gpu_restore_ns),
@@ -281,9 +288,11 @@ pub fn benchCommand(
         );
         try writer.print(
             \\cold.block.confidence_margin={d:.3}
+            \\cold.block.cooldown_tokens={d}
             \\cold.block.accepted_prefix_len={d:.3}
             \\cold.block.rollback_count={d}
             \\cold.block.confidence_gated_count={d}
+            \\cold.block.cooldown_active_count={d}
             \\cold.block.verify_ms={d:.3}
             \\cold.block.gpu_backup_ms={d:.3}
             \\cold.block.gpu_restore_ms={d:.3}
@@ -294,9 +303,11 @@ pub fn benchCommand(
         ,
             .{
                 summary.cold.exp_block_confidence_margin,
+                summary.cold.exp_block_cooldown_tokens,
                 summary.cold.block_accepted_prefix_len,
                 summary.cold.block_rollback_count,
                 summary.cold.block_confidence_gated_count,
+                summary.cold.block_cooldown_active_count,
                 nsToMs(summary.cold.block_verify_ns),
                 nsToMs(summary.cold.block_gpu_backup_ns),
                 nsToMs(summary.cold.block_gpu_restore_ns),
@@ -348,6 +359,7 @@ pub fn benchCommand(
             \\warm.block.accepted_prefix_len_avg={d:.3}
             \\warm.block.rollback_count_avg={d}
             \\warm.block.confidence_gated_count_avg={d}
+            \\warm.block.cooldown_active_count_avg={d}
             \\warm.block.verify_ms_avg={d:.3}
             \\warm.block.gpu_backup_ms_avg={d:.3}
             \\warm.block.gpu_restore_ms_avg={d:.3}
@@ -360,6 +372,7 @@ pub fn benchCommand(
                 summary.warm_block_accepted_prefix_len_avg,
                 summary.warm_block_rollback_count_avg,
                 summary.warm_block_confidence_gated_count_avg,
+                summary.warm_block_cooldown_active_count_avg,
                 nsToMs(summary.warm_block_verify_ns_avg),
                 nsToMs(summary.warm_block_gpu_backup_ns_avg),
                 nsToMs(summary.warm_block_gpu_restore_ns_avg),
@@ -432,9 +445,11 @@ pub fn benchCommand(
     );
     try writer.print(
         \\block.confidence_margin={d:.3}
+        \\block.cooldown_tokens={d}
         \\block.accepted_prefix_len={d:.3}
         \\block.rollback_count={d}
         \\block.confidence_gated_count={d}
+        \\block.cooldown_active_count={d}
         \\block.verify_ms={d:.3}
         \\block.gpu_backup_ms={d:.3}
         \\block.gpu_restore_ms={d:.3}
@@ -445,9 +460,11 @@ pub fn benchCommand(
     ,
         .{
             report.exp_block_confidence_margin,
+            report.exp_block_cooldown_tokens,
             report.block_accepted_prefix_len,
             report.block_rollback_count,
             report.block_confidence_gated_count,
+            report.block_cooldown_active_count,
             nsToMs(report.block_verify_ns),
             nsToMs(report.block_gpu_backup_ns),
             nsToMs(report.block_gpu_restore_ns),

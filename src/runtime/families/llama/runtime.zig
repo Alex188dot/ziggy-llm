@@ -29,6 +29,7 @@ fn llamaGenerate(
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
+        .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
     };
     const report = try llama_runtime.generate(allocator, model_path, prompt, gen_opts);
     return families_mod.FamilyReport{
@@ -51,9 +52,11 @@ fn llamaGenerate(
         .exp_block_decode = report.exp_block_decode,
         .exp_block_k = report.exp_block_k,
         .exp_block_confidence_margin = report.exp_block_confidence_margin,
+        .exp_block_cooldown_tokens = report.exp_block_cooldown_tokens,
         .block_accepted_prefix_len = report.block_accepted_prefix_len,
         .block_rollback_count = report.block_rollback_count,
         .block_confidence_gated_count = report.block_confidence_gated_count,
+        .block_cooldown_active_count = report.block_cooldown_active_count,
         .block_verify_ns = report.block_verify_ns,
         .block_gpu_backup_ns = report.block_gpu_backup_ns,
         .block_gpu_restore_ns = report.block_gpu_restore_ns,

@@ -46,9 +46,11 @@ pub const GenerateReport = struct {
     exp_block_decode: bool = false,
     exp_block_k: usize = 0,
     exp_block_confidence_margin: f32 = block_policy.default_confidence_margin_threshold,
+    exp_block_cooldown_tokens: usize = 8,
     block_accepted_prefix_len: f64 = 0,
     block_rollback_count: usize = 0,
     block_confidence_gated_count: usize = 0,
+    block_cooldown_active_count: usize = 0,
     block_verify_ns: u64 = 0,
     block_gpu_backup_ns: u64 = 0,
     block_gpu_restore_ns: u64 = 0,
@@ -1699,6 +1701,8 @@ pub fn generateLoadedStreaming(
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
+    var block_decode_cooldown_active: usize = 0;
+    var block_decode_cooldown_remaining: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
@@ -1776,6 +1780,10 @@ pub fn generateLoadedStreaming(
                 } else {
                     if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
+                if (block_decode_cooldown_remaining > 0) {
+                    block_decode_cooldown_active += 1;
+                    draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
+                }
             }
             const draft_tokens = session.findDraftTokens(next_token, draft_limit);
             if (draft_tokens.len > 0) {
@@ -1798,7 +1806,10 @@ pub fn generateLoadedStreaming(
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     block_decode_total_accepted += accepted_prefix_len;
                     block_decode_step_count += 1;
-                    if (accepted_prefix_len < draft_tokens.len) block_decode_rollbacks += 1;
+                    if (accepted_prefix_len < draft_tokens.len) {
+                        block_decode_rollbacks += 1;
+                        block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
+                    }
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
@@ -1868,9 +1879,11 @@ pub fn generateLoadedStreaming(
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
+        .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,
+        .block_cooldown_active_count = block_decode_cooldown_active,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,
@@ -1969,6 +1982,8 @@ pub fn generateLoadedStreamingCached(
     var block_decode_total_accepted: usize = 0;
     var block_decode_rollbacks: usize = 0;
     var block_decode_confidence_gated: usize = 0;
+    var block_decode_cooldown_active: usize = 0;
+    var block_decode_cooldown_remaining: usize = 0;
     var block_decode_step_count: usize = 0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
@@ -2046,6 +2061,10 @@ pub fn generateLoadedStreamingCached(
                 } else {
                     if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
+                if (block_decode_cooldown_remaining > 0) {
+                    block_decode_cooldown_active += 1;
+                    draft_limit = block_policy.applyCooldownDraftLimit(draft_limit, &block_decode_cooldown_remaining);
+                }
             }
             const draft_tokens = session.findDraftTokens(next_token, draft_limit);
             if (draft_tokens.len > 0) {
@@ -2068,7 +2087,10 @@ pub fn generateLoadedStreamingCached(
                     block_gpu_sequence_commits_total += batch_stats.sequence_commits;
                     block_decode_total_accepted += accepted_prefix_len;
                     block_decode_step_count += 1;
-                    if (accepted_prefix_len < draft_tokens.len) block_decode_rollbacks += 1;
+                    if (accepted_prefix_len < draft_tokens.len) {
+                        block_decode_rollbacks += 1;
+                        block_decode_cooldown_remaining = options.exp_block_cooldown_tokens;
+                    }
                     if (batch_stats.sequence_commits == 0) block_gpu_fallback_count_total += 1;
                 }
 
@@ -2138,9 +2160,11 @@ pub fn generateLoadedStreamingCached(
         .exp_block_decode = options.exp_block_decode,
         .exp_block_k = options.exp_block_k,
         .exp_block_confidence_margin = options.exp_block_confidence_margin,
+        .exp_block_cooldown_tokens = options.exp_block_cooldown_tokens,
         .block_accepted_prefix_len = if (block_decode_step_count > 0) @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count)) else 0,
         .block_rollback_count = block_decode_rollbacks,
         .block_confidence_gated_count = block_decode_confidence_gated,
+        .block_cooldown_active_count = block_decode_cooldown_active,
         .block_verify_ns = block_verify_ns_total,
         .block_gpu_backup_ns = block_gpu_backup_ns_total,
         .block_gpu_restore_ns = block_gpu_restore_ns_total,
