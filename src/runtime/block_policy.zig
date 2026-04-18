@@ -3,6 +3,10 @@ const std = @import("std");
 // Conservative default: only speculate when the top-1 token is clearly separated.
 pub const default_confidence_margin_threshold: f32 = 0.75;
 pub const cooldown_draft_cap: usize = 1;
+const rollback_ema_unstable: f64 = 0.45;
+const accepted_ema_high: f64 = 1.8;
+const high_confidence_multiplier: f32 = 2.0;
+const medium_confidence_multiplier: f32 = 1.25;
 
 pub fn top1Top2Margin(logits: []const f32) f32 {
     std.debug.assert(logits.len > 0);
@@ -34,6 +38,34 @@ pub fn applyCooldownDraftLimit(draft_limit: usize, cooldown_remaining: *usize) u
     return @min(draft_limit, cooldown_draft_cap);
 }
 
+pub fn selectAdaptiveDraftLimit(
+    exp_block_cap: usize,
+    confidence_margin: f32,
+    confidence_threshold: f32,
+    recent_accepted_ema: f64,
+    recent_rollback_ema: f64,
+) usize {
+    if (exp_block_cap == 0) return 0;
+    if (confidence_margin < confidence_threshold) return 0;
+    if (exp_block_cap == 1) return 1;
+
+    if (recent_rollback_ema >= rollback_ema_unstable) {
+        return @min(exp_block_cap, @as(usize, 1));
+    }
+
+    const high_confidence_threshold = confidence_threshold * high_confidence_multiplier;
+    if (exp_block_cap >= 4 and confidence_margin >= high_confidence_threshold and recent_accepted_ema >= accepted_ema_high) {
+        return @min(exp_block_cap, @as(usize, 4));
+    }
+
+    const medium_confidence_threshold = confidence_threshold * medium_confidence_multiplier;
+    if (confidence_margin >= medium_confidence_threshold) {
+        return @min(exp_block_cap, @as(usize, 2));
+    }
+
+    return 1;
+}
+
 test "top1Top2Margin returns best-second gap" {
     const logits = [_]f32{ -2.0, 0.5, 1.75, 1.0 };
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), top1Top2Margin(&logits), 1e-6);
@@ -54,4 +86,11 @@ test "applyCooldownDraftLimit clamps while countdown is active" {
     try std.testing.expectEqual(@as(usize, 1), applyCooldownDraftLimit(8, &remaining));
     try std.testing.expectEqual(@as(usize, 0), remaining);
     try std.testing.expectEqual(@as(usize, 5), applyCooldownDraftLimit(5, &remaining));
+}
+
+test "selectAdaptiveDraftLimit gates low confidence and scales on stable high confidence" {
+    try std.testing.expectEqual(@as(usize, 0), selectAdaptiveDraftLimit(4, 0.6, 0.75, 2.0, 0.1));
+    try std.testing.expectEqual(@as(usize, 2), selectAdaptiveDraftLimit(4, 1.0, 0.75, 1.6, 0.1));
+    try std.testing.expectEqual(@as(usize, 4), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.1));
+    try std.testing.expectEqual(@as(usize, 1), selectAdaptiveDraftLimit(4, 1.8, 0.75, 2.2, 0.5));
 }

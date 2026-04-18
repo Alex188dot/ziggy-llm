@@ -1706,6 +1706,8 @@ pub fn generateLoadedStreaming(
     var block_decode_cooldown_active: usize = 0;
     var block_decode_cooldown_remaining: usize = 0;
     var block_decode_step_count: usize = 0;
+    var block_recent_accepted_ema: f64 = 0.0;
+    var block_recent_rollback_ema: f64 = 1.0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
     var block_gpu_restore_ns_total: u64 = 0;
@@ -1764,23 +1766,16 @@ pub fn generateLoadedStreaming(
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = default_draft_len;
             if (exp_block_enabled) {
-                if (!block_policy.shouldSpeculateFromLogits(session.logits, options.exp_block_confidence_margin)) {
+                const confidence_margin = block_policy.top1Top2Margin(session.logits);
+                draft_limit = block_policy.selectAdaptiveDraftLimit(
+                    exp_block_cap,
+                    confidence_margin,
+                    options.exp_block_confidence_margin,
+                    block_recent_accepted_ema,
+                    block_recent_rollback_ema,
+                );
+                if (draft_limit == 0 and confidence_margin < options.exp_block_confidence_margin) {
                     block_decode_confidence_gated += 1;
-                    draft_limit = 0;
-                }
-                if (exp_block_cap >= @as(usize, 4)) {
-                    const mean_accepted = if (block_decode_step_count > 0)
-                        @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count))
-                    else
-                        0.0;
-                    const rollback_ratio = if (block_decode_step_count > 0)
-                        @as(f64, @floatFromInt(block_decode_rollbacks)) / @as(f64, @floatFromInt(block_decode_step_count))
-                    else
-                        1.0;
-                    const adaptive_k: usize = if (block_decode_step_count >= 8 and mean_accepted >= 2.5 and rollback_ratio <= 0.25) @as(usize, 4) else @as(usize, 2);
-                    if (draft_limit > 0) draft_limit = @min(exp_block_cap, adaptive_k);
-                } else {
-                    if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
                 if (block_decode_cooldown_remaining > 0) {
                     block_decode_cooldown_active += 1;
@@ -1809,6 +1804,10 @@ pub fn generateLoadedStreaming(
                 if (use_gpu_block) {
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
                     const accepted_prefix_len = accepted_count - 1;
+                    const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
+                    const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
+                    block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
+                    block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
                     block_verify_ns_total += verify_elapsed;
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
@@ -1995,6 +1994,8 @@ pub fn generateLoadedStreamingCached(
     var block_decode_cooldown_active: usize = 0;
     var block_decode_cooldown_remaining: usize = 0;
     var block_decode_step_count: usize = 0;
+    var block_recent_accepted_ema: f64 = 0.0;
+    var block_recent_rollback_ema: f64 = 1.0;
     var block_verify_ns_total: u64 = 0;
     var block_gpu_backup_ns_total: u64 = 0;
     var block_gpu_restore_ns_total: u64 = 0;
@@ -2053,23 +2054,16 @@ pub fn generateLoadedStreamingCached(
             const exp_block_cap: usize = if (exp_block_enabled) @min(gpu.max_draft_len, options.exp_block_k) else @as(usize, 0);
             var draft_limit: usize = default_draft_len;
             if (exp_block_enabled) {
-                if (!block_policy.shouldSpeculateFromLogits(session.logits, options.exp_block_confidence_margin)) {
+                const confidence_margin = block_policy.top1Top2Margin(session.logits);
+                draft_limit = block_policy.selectAdaptiveDraftLimit(
+                    exp_block_cap,
+                    confidence_margin,
+                    options.exp_block_confidence_margin,
+                    block_recent_accepted_ema,
+                    block_recent_rollback_ema,
+                );
+                if (draft_limit == 0 and confidence_margin < options.exp_block_confidence_margin) {
                     block_decode_confidence_gated += 1;
-                    draft_limit = 0;
-                }
-                if (exp_block_cap >= @as(usize, 4)) {
-                    const mean_accepted = if (block_decode_step_count > 0)
-                        @as(f64, @floatFromInt(block_decode_total_accepted)) / @as(f64, @floatFromInt(block_decode_step_count))
-                    else
-                        0.0;
-                    const rollback_ratio = if (block_decode_step_count > 0)
-                        @as(f64, @floatFromInt(block_decode_rollbacks)) / @as(f64, @floatFromInt(block_decode_step_count))
-                    else
-                        1.0;
-                    const adaptive_k: usize = if (block_decode_step_count >= 8 and mean_accepted >= 2.5 and rollback_ratio <= 0.25) @as(usize, 4) else @as(usize, 2);
-                    if (draft_limit > 0) draft_limit = @min(exp_block_cap, adaptive_k);
-                } else {
-                    if (draft_limit > 0) draft_limit = exp_block_cap;
                 }
                 if (block_decode_cooldown_remaining > 0) {
                     block_decode_cooldown_active += 1;
@@ -2098,6 +2092,10 @@ pub fn generateLoadedStreamingCached(
                 if (use_gpu_block) {
                     const verify_elapsed = deltaNs(verify_begin, std.time.nanoTimestamp());
                     const accepted_prefix_len = accepted_count - 1;
+                    const accepted_prefix_f = @as(f64, @floatFromInt(accepted_prefix_len));
+                    const rollback_observed: f64 = if (accepted_prefix_len < draft_tokens.len) 1.0 else 0.0;
+                    block_recent_accepted_ema = block_recent_accepted_ema * 0.8 + accepted_prefix_f * 0.2;
+                    block_recent_rollback_ema = block_recent_rollback_ema * 0.8 + rollback_observed * 0.2;
                     block_verify_ns_total += verify_elapsed;
                     block_gpu_backup_ns_total += batch_stats.backup_ns;
                     block_gpu_restore_ns_total += batch_stats.restore_ns;
