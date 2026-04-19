@@ -73,6 +73,7 @@ pub const ModelDesc = struct {
     kv_projection_size: usize,
     kv_dimension: usize,
     rope_freq_base: f32,
+    rope_scaling_factor: f32 = 0.0,
     sliding_window: usize = 0,
     attn_logit_softcapping: ?f32 = null,
     final_logit_softcapping: ?f32 = null,

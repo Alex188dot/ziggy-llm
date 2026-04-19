@@ -265,6 +265,8 @@ const Metadata = struct {
     attention_value_length: ?u32 = null,
     rms_norm_eps: ?f32 = null,
     rope_freq_base: ?f32 = null,
+    rope_scaling_type: ?[]u8 = null,
+    rope_scaling_factor: ?f32 = null,
     sliding_window: ?u32 = null,
     attn_logit_softcapping: ?f32 = null,
     final_logit_softcapping: ?f32 = null,
@@ -702,6 +704,7 @@ pub const Model = struct {
     kv_dimension: usize,
     rms_norm_eps: f32,
     rope_freq_base: f32,
+    rope_scaling_factor: f32 = 0.0,
     sliding_window: usize = 0,
     attn_logit_softcapping: ?f32 = null,
     final_logit_softcapping: ?f32 = null,
@@ -1553,6 +1556,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .kv_projection_size = model.kv_projection_size,
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
+        .rope_scaling_factor = model.rope_scaling_factor,
         .sliding_window = model.sliding_window,
         .attn_logit_softcapping = model.attn_logit_softcapping,
         .final_logit_softcapping = model.final_logit_softcapping,
@@ -2248,6 +2252,11 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const rope_dimension_count = metadata.rope_dimension_count orelse key_head_dimension;
     const rms_norm_eps = metadata.rms_norm_eps orelse 1e-6;
     const rope_freq_base = metadata.rope_freq_base orelse 10000;
+    const rope_scaling_factor = metadata.rope_scaling_factor orelse 0.0;
+    const effective_freq_base = if (rope_scaling_factor > 0 and rope_freq_base > 0)
+        rope_freq_base / rope_scaling_factor
+    else
+        rope_freq_base;
     if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
     if (key_head_dimension == 0 or value_head_dimension == 0 or rope_dimension_count > key_head_dimension) return error.InvalidMetadataValue;
 
@@ -2275,7 +2284,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const use_gelu_ffn = std.mem.eql(u8, architecture, "gemma") or
         std.mem.eql(u8, architecture, "gemma2") or
         std.mem.eql(u8, architecture, "gemma3");
-    const embedding_scale: f32 = if (std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2"))
+    const embedding_scale: f32 = if (std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3"))
         @sqrt(@as(f32, @floatFromInt(embedding_length)))
     else
         1.0;
@@ -2338,7 +2347,8 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .kv_projection_size = kv_projection_size,
         .kv_dimension = kv_dimension,
         .rms_norm_eps = rms_norm_eps,
-        .rope_freq_base = rope_freq_base,
+        .rope_freq_base = effective_freq_base,
+        .rope_scaling_factor = rope_scaling_factor,
         .sliding_window = sliding_window,
         .attn_logit_softcapping = metadata.attn_logit_softcapping,
         .final_logit_softcapping = metadata.final_logit_softcapping,
@@ -2660,6 +2670,14 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.endsWith(u8, key, ".rope.freq_base")) {
         metadata.rope_freq_base = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".rope.scaling.type")) {
+        metadata.rope_scaling_type = try readExpectedString(allocator, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".rope.scaling.factor")) {
+        metadata.rope_scaling_factor = try readExpectedFloat(parser, value_type);
         return;
     }
     if (std.mem.endsWith(u8, key, ".attention.sliding_window")) {

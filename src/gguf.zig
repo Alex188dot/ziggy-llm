@@ -30,7 +30,7 @@ const Parser = struct {
     }
 };
 
-const ValueType = enum(u32) {
+pub const ValueType = enum(u32) {
     uint8 = 0,
     int8 = 1,
     uint16 = 2,

@@ -134,3 +134,73 @@ model.layers[i].post_attention_layernorm.weight  // Post-norm
 
 - [Gemma 2 Report](https://storage.googleapis.com/deepmind-media/gemma/gemma-2-report.pdf)
 - [HF Transformers Gemma2](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma2/modeling_gemma2.py)
+
+## 2026-04-19 Fix Plan (Gibberish Output Investigation)
+
+### Problem Statement
+
+Gemma 2 and Gemma 3 produce gibberish/unintelligible output. Investigation shows likely issues:
+
+1. **Critical Bug - `embedding_scale` not applied to Gemma 3**
+   - Location: `src/model/loader.zig:2278-2281`
+   - Issue: Gemma 3 uses `embedding_scale = sqrt(embedding_length)` but this is only applied to Gemma 1 and 2
+   - Fix: Add `"gemma3"` to the condition
+
+2. **Sliding Window Attention Implementation**
+   - Gemma 2 uses hybrid local/global attention (alternating layers)
+   - Global attention layers: full context
+   - Local attention layers: 4096 token window
+   - Need to verify `global_attention_interval = 2` is correct
+
+3. **Post-Norm Application**
+   - Gemma 2 has `post_attention_norm` and `post_ffw_norm`
+   - Must verify these are being applied in the attention and FFN blocks
+
+### Implementation Steps
+
+1. **Step 1: Add Diagnostic Tool**
+   - Enhance existing `inspect` command to dump all GGUF metadata
+   - Add tensor listing capability
+   - Focus on Gemma-specific metadata fields
+
+2. **Step 2: Run Diagnostics**
+   - Inspect `gemma-2-2b-it-Q4_K_M.gguf` (bartowski)
+   - Capture all metadata fields
+   - Verify tensor shapes and names
+
+3. **Step 3: Fix Critical Bug (Gemma 3 embedding_scale)**
+   - File: `src/model/loader.zig`
+   - Line ~2278: Add `gemma3` to embedding_scale condition
+
+4. **Step 4: Validate Prompt Format**
+   - Gemma 2 chat format:
+     ```
+     <bos><start_of_turn>user
+     {prompt}<end_of_turn>
+     <start_of_turn>model
+     <end_of_turn>
+     <start_of_turn>model
+     ```
+   - Verify `chat_prompt.zig` handles this correctly
+
+5. **Step 5: Compare with llama.cpp Reference**
+   - Generate same text with same seed/temperature
+   - Compare output token-by-token
+   - Narrow down which computation step is wrong
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/model/loader.zig` | Fix embedding_scale for Gemma 3; verify RoPE params |
+| `src/commands.zig` | Ensure inspect command dumps all metadata |
+| `src/runtime/families/gemma2/runtime.zig` | Add validation/debug capabilities |
+| `src/chat_prompt.zig` | Verify Gemma 2 prompt format handling |
+
+### Validation Plan
+
+1. Run inspect on Gemma 2 GGUF and document all metadata
+2. Fix embedding_scale bug
+3. Test with simple prompt "Hello" using both zig_ and llama.cpp
+4. Compare outputs with identical seed/temperature settings
+5. If mismatch persists, add intermediate debug outputs (layer-wise activations)

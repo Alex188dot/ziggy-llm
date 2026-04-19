@@ -32,6 +32,7 @@ pub const Config = struct {
     moon_quant: runtime.MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: runtime.SamplingStrategy = .auto,
+    dump_tensors: bool = false,
 };
 
 pub const ParseError = error{
@@ -162,6 +163,10 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
         }
         if (std.mem.eql(u8, arg, "--metal-profile")) {
             config.metal_profile = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dump-tensors")) {
+            config.dump_tensors = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--sampling-path")) {
