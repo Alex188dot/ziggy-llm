@@ -36,6 +36,7 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> storeKvHalfPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> attentionFusedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> geluMulPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> addInPlacePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> rmsNormPerHeadPipeline;
@@ -629,6 +630,11 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal silu pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> gelu_mul_pipeline = ziggy_pipeline(device, library, @"gelu_mul_f32", &pipeline_error);
+        if (gelu_mul_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal gelu pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         id<MTLComputePipelineState> add_in_place_pipeline = ziggy_pipeline(device, library, @"add_in_place_f32", &pipeline_error);
         if (add_in_place_pipeline == nil) {
@@ -743,6 +749,7 @@ int ziggy_metal_create_context(
         state.storeKvHalfPipeline = store_kv_half_pipeline;
         state.attentionFusedPipeline = attention_fused_pipeline;
         state.siluMulPipeline = silu_mul_pipeline;
+        state.geluMulPipeline = gelu_mul_pipeline;
         state.addInPlacePipeline = add_in_place_pipeline;
         state.rmsNormPipeline = rms_norm_pipeline;
         state.rmsNormPerHeadPipeline = rms_norm_per_head_pipeline;
@@ -1844,7 +1851,9 @@ int ziggy_metal_attention_fused_f32(
     uint32_t context_length,
     uint32_t position,
     uint32_t layer_base,
+    uint32_t window_start,
     float scale,
+    float softcap,
     char *error_message,
     size_t error_message_len
 ) {
@@ -1883,12 +1892,14 @@ int ziggy_metal_attention_fused_f32(
         [encoder setBytes:&context_length length:sizeof(context_length) atIndex:8];
         [encoder setBytes:&position length:sizeof(position) atIndex:9];
         [encoder setBytes:&layer_base length:sizeof(layer_base) atIndex:10];
-        [encoder setBytes:&scale length:sizeof(scale) atIndex:11];
+        [encoder setBytes:&window_start length:sizeof(window_start) atIndex:11];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:12];
+        [encoder setBytes:&softcap length:sizeof(softcap) atIndex:13];
 
         NSUInteger thread_width = state.attentionFusedPipeline.threadExecutionWidth;
         if (thread_width == 0) thread_width = 1;
         NSUInteger max_total_threads = state.attentionFusedPipeline.maxTotalThreadsPerThreadgroup;
-        NSUInteger work_items = position + 1;
+        NSUInteger work_items = position - window_start + 1;
         if (head_dim > work_items) work_items = head_dim;
         NSUInteger threads_per_group = thread_width;
         while (threads_per_group < work_items && threads_per_group + thread_width <= max_total_threads && threads_per_group < 256) {
@@ -1933,6 +1944,38 @@ int ziggy_metal_silu_mul_f32(
         return ziggy_run_compute(
             state,
             state.siluMulPipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:up_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_gelu_mul_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || gate == NULL || up == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal gelu request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *gate_buffer = ziggy_buffer(gate);
+        const ZiggyMetalBufferState *up_buffer = ziggy_const_buffer(up);
+        return ziggy_run_compute(
+            state,
+            state.geluMulPipeline,
             count,
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:0];
@@ -2082,6 +2125,7 @@ int ziggy_metal_rms_norm_f32(
     ZiggyMetalBuffer *output,
     uint32_t count,
     float eps,
+    float weight_offset,
     char *error_message,
     size_t error_message_len
 ) {
@@ -2116,6 +2160,7 @@ int ziggy_metal_rms_norm_f32(
                 [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
                 [encoder setBytes:&count length:sizeof(count) atIndex:3];
                 [encoder setBytes:&eps length:sizeof(eps) atIndex:4];
+                [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:5];
             },
             error_message,
             error_message_len
@@ -2131,6 +2176,7 @@ int ziggy_metal_rms_norm_per_head_f32(
     uint32_t head_count,
     uint32_t head_dim,
     float eps,
+    float weight_offset,
     char *error_message,
     size_t error_message_len
 ) {
@@ -2176,6 +2222,7 @@ int ziggy_metal_rms_norm_per_head_f32(
         [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
         [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
         [encoder setBytes:&eps length:sizeof(eps) atIndex:5];
+        [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:6];
         
         ziggy_dispatch_rowwise(encoder, state.rmsNormPerHeadPipeline, head_count);
         [encoder endEncoding];
@@ -2626,6 +2673,7 @@ int ziggy_metal_batch_rms_norm_f32(
     ZiggyMetalBuffer *output,
     uint32_t count,
     float eps,
+    float weight_offset,
     uint32_t batch_idx,
     char *error_message,
     size_t error_message_len
@@ -2663,7 +2711,8 @@ int ziggy_metal_batch_rms_norm_f32(
                 [encoder setBuffer:output_buffer.buffer offset:0 atIndex:2];
                 [encoder setBytes:&count length:sizeof(count) atIndex:3];
                 [encoder setBytes:&eps length:sizeof(eps) atIndex:4];
-                [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:5];
+                [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:5];
+                [encoder setBytes:&batch_idx length:sizeof(batch_idx) atIndex:6];
             },
             error_message,
             error_message_len

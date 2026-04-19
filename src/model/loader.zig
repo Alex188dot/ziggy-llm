@@ -233,6 +233,8 @@ pub const LayerRefs = struct {
     ffn_gate: TensorRef,
     ffn_down: TensorRef,
     ffn_up: TensorRef,
+    post_attention_norm: ?TensorRef = null,
+    post_ffw_norm: ?TensorRef = null,
     linear_attn: ?LinearAttnTensors = null,
 };
 
@@ -259,8 +261,13 @@ const Metadata = struct {
     rope_dimension_count: ?u32 = null,
     head_count: ?u32 = null,
     head_count_kv: ?u32 = null,
+    attention_key_length: ?u32 = null,
+    attention_value_length: ?u32 = null,
     rms_norm_eps: ?f32 = null,
     rope_freq_base: ?f32 = null,
+    sliding_window: ?u32 = null,
+    attn_logit_softcapping: ?f32 = null,
+    final_logit_softcapping: ?f32 = null,
     partial_rotary_factor: ?f32 = null,
     linear_num_key_heads: ?u32 = null,
     linear_num_value_heads: ?u32 = null,
@@ -280,6 +287,7 @@ const Metadata = struct {
     pad_token_id: ?u32 = null,
     add_bos_token: ?bool = null,
     add_eos_token: ?bool = null,
+    add_space_prefix: ?bool = null,
 
     fn deinit(self: *Metadata, allocator: std.mem.Allocator) void {
         if (self.architecture) |value| allocator.free(value);
@@ -311,6 +319,7 @@ const Tokenizer = struct {
     pad_token_id: ?u32,
     add_bos_token: bool,
     add_eos_token: bool,
+    add_space_prefix: bool,
 
     const Mode = enum {
         score_dp,
@@ -365,10 +374,75 @@ const Tokenizer = struct {
     }
 
     fn encodeScoreDp(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
+        var pieces = std.ArrayList(u32).empty;
+        defer pieces.deinit(allocator);
+        try pieces.ensureTotalCapacity(allocator, prompt.len);
+
+        var pos: usize = 0;
+        var is_first_chunk = true;
+        while (pos < prompt.len) {
+            var best_match: ?u32 = null;
+            var best_match_pos: usize = prompt.len;
+            var best_match_len: usize = 0;
+
+            for (self.special_tokens) |special_id| {
+                const special_str = self.tokens[special_id];
+                if (special_str.len == 0) continue;
+                if (std.mem.indexOf(u8, prompt[pos..], special_str)) |offset| {
+                    const abs_pos = pos + offset;
+                    if (abs_pos < best_match_pos or (abs_pos == best_match_pos and special_str.len > best_match_len)) {
+                        best_match_pos = abs_pos;
+                        best_match = special_id;
+                        best_match_len = special_str.len;
+                    }
+                }
+            }
+
+            if (best_match_pos > pos) {
+                try self.encodeScoreDpChunk(allocator, prompt[pos..best_match_pos], &pieces, is_first_chunk);
+                is_first_chunk = false;
+            }
+            if (best_match) |token_id| {
+                pieces.appendAssumeCapacity(token_id);
+                pos = best_match_pos + best_match_len;
+                is_first_chunk = false;
+            } else {
+                pos = prompt.len;
+            }
+        }
+
+        var count: usize = 0;
+        if (self.add_bos_token) {
+            const bos = self.bos_token_id orelse return error.MissingRequiredMetadata;
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = bos;
+            count += 1;
+        }
+
+        for (pieces.items) |token_id| {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = token_id;
+            count += 1;
+        }
+
+        if (self.add_eos_token and self.eos_token_id != null) {
+            if (count >= out.len) return error.ContextOverflow;
+            out[count] = self.eos_token_id.?;
+            count += 1;
+        }
+
+        return count;
+    }
+
+    fn encodeScoreDpChunk(self: Tokenizer, allocator: std.mem.Allocator, chunk: []const u8, pieces: *std.ArrayList(u32), add_initial_space_prefix: bool) !void {
+        if (chunk.len == 0) return;
+
         var normalized = std.ArrayList(u8).empty;
         defer normalized.deinit(allocator);
-        try normalized.appendSlice(allocator, rope_metaspace);
-        for (prompt) |byte| {
+        if (self.add_space_prefix and add_initial_space_prefix) {
+            try normalized.appendSlice(allocator, rope_metaspace);
+        }
+        for (chunk) |byte| {
             if (byte == ' ') {
                 try normalized.appendSlice(allocator, rope_metaspace);
             } else {
@@ -427,30 +501,12 @@ const Tokenizer = struct {
             best_next[pos] = best_end;
         }
 
-        var count: usize = 0;
-        if (self.add_bos_token) {
-            const bos = self.bos_token_id orelse return error.MissingRequiredMetadata;
-            if (count >= out.len) return error.ContextOverflow;
-            out[count] = bos;
-            count += 1;
-        }
-
         pos = 0;
         while (pos < n) {
             const token_id = best_tokens[pos] orelse return error.UnknownToken;
-            if (count >= out.len) return error.ContextOverflow;
-            out[count] = token_id;
-            count += 1;
+            try pieces.append(allocator, token_id);
             pos = best_next[pos];
         }
-
-        if (self.add_eos_token and self.eos_token_id != null) {
-            if (count >= out.len) return error.ContextOverflow;
-            out[count] = self.eos_token_id.?;
-            count += 1;
-        }
-
-        return count;
     }
 
     fn encodeGpt2Bpe(self: Tokenizer, allocator: std.mem.Allocator, prompt: []const u8, out: []u32) !usize {
@@ -604,11 +660,20 @@ pub const Model = struct {
     head_count: usize,
     head_count_kv: usize,
     head_dimension: usize,
+    key_head_dimension: usize,
+    value_head_dimension: usize,
     q_projection_size: usize,
     kv_projection_size: usize,
     kv_dimension: usize,
     rms_norm_eps: f32,
     rope_freq_base: f32,
+    sliding_window: usize = 0,
+    attn_logit_softcapping: ?f32 = null,
+    final_logit_softcapping: ?f32 = null,
+    global_attention_interval: usize = 0,
+    use_gelu_ffn: bool = false,
+    embedding_scale: f32 = 1.0,
+    rms_norm_weight_offset: f32 = 0.0,
     rope_style: RopeStyle,
     data_offset: usize,
     token_embd: TensorRef,
@@ -641,6 +706,8 @@ pub const Model = struct {
             allocator.free(layer.ffn_gate.name);
             allocator.free(layer.ffn_down.name);
             allocator.free(layer.ffn_up.name);
+            if (layer.post_attention_norm) |n| allocator.free(n.name);
+            if (layer.post_ffw_norm) |n| allocator.free(n.name);
             if (layer.linear_attn) |la| {
                 allocator.free(la.in_proj_qkv.name);
                 allocator.free(la.in_proj_z.name);
@@ -799,7 +866,6 @@ const Session = struct {
                 session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
             }
         }
-
         return session;
     }
 
@@ -1011,6 +1077,7 @@ const Session = struct {
             try self.recordCalibration(self.model.output, .output, self.normed);
             try self.matVec(self.logits, self.model.output, self.normed);
         }
+        if (self.model.final_logit_softcapping) |cap| applySoftcapInPlace(self.logits, cap);
 
         self.finishToken(token_id);
         return self.logits;
@@ -1019,6 +1086,7 @@ const Session = struct {
     fn runTokenCore(self: *Session, token_id: u32) !void {
         if (self.position >= self.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
+        scaleInPlace(self.hidden, self.model.embedding_scale);
 
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
@@ -1037,14 +1105,14 @@ const Session = struct {
                     try self.matVec(self.q, q, self.normed);
                 }
                 if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
-                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.rope_dimension_count);
+                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.key_head_dimension);
 
                 if (layer.attn_k) |k| {
                     try self.recordCalibration(k, .attn_k, self.normed);
                     try self.matVec(self.k, k, self.normed);
                 }
                 if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
-                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.rope_dimension_count);
+                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.key_head_dimension);
 
                 if (layer.attn_v) |v| {
                     try self.recordCalibration(v, .attn_v, self.normed);
@@ -1053,14 +1121,15 @@ const Session = struct {
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
                 const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
-                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
-                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.rope_dimension_count, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 if (layer.attn_output) |o| {
                     try self.recordCalibration(o, .attn_output, self.attn_out);
                     try self.matVec(self.attn_tmp, o, self.attn_out);
                 }
+                if (layer.post_attention_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
             }
 
             if (self.gpu_session) |*gpu_session| {
@@ -1071,12 +1140,17 @@ const Session = struct {
                 try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
                 try self.matVec(self.gate, layer.ffn_gate, self.normed);
                 try self.matVec(self.up, layer.ffn_up, self.normed);
-                siluInPlace(self.gate);
+                if (self.model.use_gelu_ffn) {
+                    geluInPlace(self.gate);
+                } else {
+                    siluInPlace(self.gate);
+                }
                 for (self.gate, self.up) |*gate, up| {
                     gate.* *= up;
                 }
                 try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
                 try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
+                if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
             }
             addInPlace(self.hidden, self.attn_tmp);
         }
@@ -1118,27 +1192,29 @@ const Session = struct {
 
     fn computeAttention(self: *Session, layer_index: usize) void {
         @memset(self.attn_out, 0);
-        const head_dim = self.model.rope_dimension_count;
+        const head_dim = self.model.key_head_dimension;
         const kv_group_size = self.model.head_count / self.model.head_count_kv;
         const layer_base = layer_index * self.context_length * self.model.kv_dimension;
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(head_dim)));
-        const pos_plus_1 = self.position + 1;
+        const window_start = self.attentionWindowStart(layer_index);
+        const token_count = self.position - window_start + 1;
 
         for (0..self.model.head_count) |head_index| {
             const q_head = self.q[head_index * head_dim ..][0..head_dim];
             const kv_head = head_index / kv_group_size;
             const kv_offset = kv_head * head_dim;
 
-            for (0..pos_plus_1) |token_index| {
+            for (window_start..self.position + 1) |token_index| {
                 const k_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
                 const k_head = self.k_cache[k_base..][0..head_dim];
-                self.scores[token_index] = dot(q_head, k_head) * scale;
+                self.scores[token_index - window_start] = dot(q_head, k_head) * scale;
             }
-            softmaxInPlace(self.scores[0..pos_plus_1]);
+            if (self.model.attn_logit_softcapping) |cap| applySoftcapInPlace(self.scores[0..token_count], cap);
+            softmaxInPlace(self.scores[0..token_count]);
 
             const out_head = self.attn_out[head_index * head_dim ..][0..head_dim];
-            for (0..pos_plus_1) |token_index| {
-                const weight = self.scores[token_index];
+            for (window_start..self.position + 1) |token_index| {
+                const weight = self.scores[token_index - window_start];
                 const v_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
                 const v_head = self.v_cache[v_base..][0..head_dim];
 
@@ -1155,6 +1231,18 @@ const Session = struct {
                 }
             }
         }
+    }
+
+    fn attentionWindowStart(self: *const Session, layer_index: usize) usize {
+        if (!self.layerUsesSlidingWindow(layer_index)) return 0;
+        const window = self.model.sliding_window;
+        return (self.position + 1) - @min(self.position + 1, window);
+    }
+
+    fn layerUsesSlidingWindow(self: *const Session, layer_index: usize) bool {
+        if (self.model.sliding_window == 0) return false;
+        if (self.model.global_attention_interval == 0) return true;
+        return ((layer_index + 1) % self.model.global_attention_interval) != 0;
     }
 
     fn computeLinearAttention(self: *Session, layer_index: usize, linear_attn: LinearAttnTensors) !void {
@@ -1348,11 +1436,12 @@ const Session = struct {
                 const input_vec = loadInputVec(h_in, i);
                 const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
                 const scale_vec: F32x = @splat(scale);
-                const result = scale_vec * input_vec * weight_vec;
+                const weight_offset_vec: F32x = @splat(self.model.rms_norm_weight_offset);
+                const result = scale_vec * input_vec * (weight_vec + weight_offset_vec);
                 @as(*[simd_lane_count]f32, @ptrCast(h_out[i..])).* = result;
             }
             while (i < head_dim) : (i += 1) {
-                const weight = readF32(weights[i * 4 ..][0..4]);
+                const weight = readF32(weights[i * 4 ..][0..4]) + self.model.rms_norm_weight_offset;
                 h_out[i] = h_in[i] * scale * weight;
             }
         }
@@ -1407,6 +1496,8 @@ fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
         .ffn_gate = adaptTensorDesc(layer.ffn_gate),
         .ffn_down = adaptTensorDesc(layer.ffn_down),
         .ffn_up = adaptTensorDesc(layer.ffn_up),
+        .post_attention_norm = if (layer.post_attention_norm) |n| adaptTensorDesc(n) else null,
+        .post_ffw_norm = if (layer.post_ffw_norm) |n| adaptTensorDesc(n) else null,
         .linear_attn = if (layer.linear_attn) |la| adaptLinearAttnDesc(la) else null,
     };
 }
@@ -1421,10 +1512,19 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .head_count = model.head_count,
         .head_count_kv = model.head_count_kv,
         .head_dimension = model.head_dimension,
+        .key_head_dimension = model.key_head_dimension,
+        .value_head_dimension = model.value_head_dimension,
         .q_projection_size = model.q_projection_size,
         .kv_projection_size = model.kv_projection_size,
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
+        .sliding_window = model.sliding_window,
+        .attn_logit_softcapping = model.attn_logit_softcapping,
+        .final_logit_softcapping = model.final_logit_softcapping,
+        .global_attention_interval = model.global_attention_interval,
+        .use_gelu_ffn = model.use_gelu_ffn,
+        .embedding_scale = model.embedding_scale,
+        .rms_norm_weight_offset = model.rms_norm_weight_offset,
         .vocab_size = model.tokenizer.tokens.len,
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
@@ -2107,10 +2207,14 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
     const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
 
-    const rope_dimension_count = metadata.rope_dimension_count orelse (embedding_length / head_count);
+    const head_dimension = embedding_length / head_count;
+    const key_head_dimension = metadata.attention_key_length orelse head_dimension;
+    const value_head_dimension = metadata.attention_value_length orelse key_head_dimension;
+    const rope_dimension_count = metadata.rope_dimension_count orelse key_head_dimension;
     const rms_norm_eps = metadata.rms_norm_eps orelse 1e-6;
     const rope_freq_base = metadata.rope_freq_base orelse 10000;
     if (head_count == 0 or head_count_kv == 0 or embedding_length % head_count != 0) return error.InvalidMetadataValue;
+    if (key_head_dimension == 0 or value_head_dimension == 0 or rope_dimension_count > key_head_dimension) return error.InvalidMetadataValue;
 
     const token_embd = try takeTensor(allocator, &tensors, "token_embd.weight");
     const output = takeTensor(allocator, &tensors, "output.weight") catch |err| switch (err) {
@@ -2126,6 +2230,21 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const linear_key_head_dim = metadata.linear_key_head_dim orelse 128;
     const linear_value_head_dim = metadata.linear_value_head_dim orelse 128;
     const linear_conv_kernel_dim = metadata.linear_conv_kernel_dim orelse 4;
+    const sliding_window = metadata.sliding_window orelse 0;
+    const global_attention_interval: usize = if (std.mem.eql(u8, architecture, "gemma2"))
+        2
+    else if (std.mem.eql(u8, architecture, "gemma3"))
+        6
+    else
+        0;
+    const use_gelu_ffn = std.mem.eql(u8, architecture, "gemma") or
+        std.mem.eql(u8, architecture, "gemma2") or
+        std.mem.eql(u8, architecture, "gemma3");
+    const embedding_scale: f32 = if (use_gelu_ffn)
+        @sqrt(@as(f32, @floatFromInt(embedding_length)))
+    else
+        1.0;
+    const rms_norm_weight_offset: f32 = 0.0;
 
     var layer_types: []LayerType = &.{};
     defer if (layer_types.len > 0) allocator.free(layer_types);
@@ -2155,15 +2274,15 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
             .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
             .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
             .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+            .post_attention_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
+            .post_ffw_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_ffw_norm.weight"),
             .linear_attn = null,
         };
     }
 
     const tokenizer = try buildTokenizer(allocator, &metadata);
-    const head_dimension = embedding_length / head_count;
-    const effective_rope_dim = @max(rope_dimension_count, head_dimension);
-    const q_projection_size = head_count * effective_rope_dim;
-    const kv_projection_size = head_count_kv * effective_rope_dim;
+    const q_projection_size = head_count * key_head_dimension;
+    const kv_projection_size = head_count_kv * value_head_dimension;
     const kv_dimension = kv_projection_size;
 
     return .{
@@ -2178,11 +2297,20 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .head_count = head_count,
         .head_count_kv = head_count_kv,
         .head_dimension = head_dimension,
+        .key_head_dimension = key_head_dimension,
+        .value_head_dimension = value_head_dimension,
         .q_projection_size = q_projection_size,
         .kv_projection_size = kv_projection_size,
         .kv_dimension = kv_dimension,
         .rms_norm_eps = rms_norm_eps,
         .rope_freq_base = rope_freq_base,
+        .sliding_window = sliding_window,
+        .attn_logit_softcapping = metadata.attn_logit_softcapping,
+        .final_logit_softcapping = metadata.final_logit_softcapping,
+        .global_attention_interval = global_attention_interval,
+        .use_gelu_ffn = use_gelu_ffn,
+        .embedding_scale = embedding_scale,
+        .rms_norm_weight_offset = rms_norm_weight_offset,
         .rope_style = rope_style,
         .data_offset = data_offset,
         .token_embd = token_embd,
@@ -2268,6 +2396,7 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
             .pad_token_id = metadata.pad_token_id,
             .add_bos_token = metadata.add_bos_token orelse true,
             .add_eos_token = metadata.add_eos_token orelse false,
+            .add_space_prefix = metadata.add_space_prefix orelse true,
         };
     }
 
@@ -2331,6 +2460,7 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
         .pad_token_id = metadata.pad_token_id,
         .add_bos_token = metadata.add_bos_token orelse true,
         .add_eos_token = metadata.add_eos_token orelse false,
+        .add_space_prefix = metadata.add_space_prefix orelse true,
     };
 }
 
@@ -2421,6 +2551,7 @@ fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_c
         .pad_token_id = metadata.pad_token_id,
         .add_bos_token = metadata.add_bos_token orelse false,
         .add_eos_token = metadata.add_eos_token orelse false,
+        .add_space_prefix = metadata.add_space_prefix orelse true,
     };
 }
 
@@ -2477,12 +2608,32 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.head_count_kv = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".attention.key_length")) {
+        metadata.attention_key_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".attention.value_length")) {
+        metadata.attention_value_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
     if (std.mem.endsWith(u8, key, ".attention.layer_norm_rms_epsilon") or std.mem.endsWith(u8, key, ".attention.layer_norm_epsilon")) {
         metadata.rms_norm_eps = try readExpectedFloat(parser, value_type);
         return;
     }
     if (std.mem.endsWith(u8, key, ".rope.freq_base")) {
         metadata.rope_freq_base = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".attention.sliding_window")) {
+        metadata.sliding_window = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".attn_logit_softcapping")) {
+        metadata.attn_logit_softcapping = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".final_logit_softcapping")) {
+        metadata.final_logit_softcapping = try readExpectedFloat(parser, value_type);
         return;
     }
     if (std.mem.eql(u8, key, "partial_rotary_factor")) {
@@ -2564,6 +2715,10 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.add_eos_token")) {
         metadata.add_eos_token = try readExpectedBool(parser, value_type);
+        return;
+    }
+    if (std.mem.eql(u8, key, "tokenizer.ggml.add_space_prefix")) {
+        metadata.add_space_prefix = try readExpectedBool(parser, value_type);
         return;
     }
 
@@ -2726,11 +2881,12 @@ fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRe
         const input_vec = loadInputVec(input, i);
         const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
         const scale_vec: F32x = @splat(scale);
-        const result = scale_vec * input_vec * weight_vec;
+        const weight_offset_vec: F32x = @splat(model.rms_norm_weight_offset);
+        const result = scale_vec * input_vec * (weight_vec + weight_offset_vec);
         @as(*[simd_lane_count]f32, @ptrCast(out[i..])).* = result;
     }
     while (i < input.len) : (i += 1) {
-        const weight = readF32(weights[i * 4 ..][0..4]);
+        const weight = readF32(weights[i * 4 ..][0..4]) + model.rms_norm_weight_offset;
         out[i] = input[i] * scale * weight;
     }
 }
@@ -3107,6 +3263,18 @@ fn addInPlace(dst: []f32, src: []const f32) void {
     }
 }
 
+fn scaleInPlace(values: []f32, scale: f32) void {
+    if (scale == 1.0) return;
+
+    var i: usize = 0;
+    const scale_vec: F32x = @splat(scale);
+    while (i + simd_lane_count <= values.len) : (i += simd_lane_count) {
+        const value_vec = loadInputVec(values, i);
+        @as(*[simd_lane_count]f32, @ptrCast(values[i..])).* = value_vec * scale_vec;
+    }
+    while (i < values.len) : (i += 1) values[i] *= scale;
+}
+
 fn siluInPlace(values: []f32) void {
     var i: usize = 0;
     while (i + simd_lane_count <= values.len) : (i += simd_lane_count) {
@@ -3121,8 +3289,13 @@ fn siluInPlace(values: []f32) void {
     }
 }
 
-fn silu(value: f32) f32 {
-    return value / (1 + @exp(-value));
+fn geluInPlace(values: []f32) void {
+    for (values) |*value| value.* = geluTanh(value.*);
+}
+
+fn geluTanh(value: f32) f32 {
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    return 0.5 * value * (1.0 + std.math.tanh(sqrt_2_over_pi * (value + 0.044715 * value * value * value)));
 }
 
 const F32x = @Vector(simd_lane_count, f32);
@@ -3235,6 +3408,13 @@ fn softmaxInPlace(values: []f32) void {
         sum += value.*;
     }
     for (values) |*value| value.* /= sum;
+}
+
+fn applySoftcapInPlace(values: []f32, cap: f32) void {
+    if (!(cap > 0)) return;
+    for (values) |*value| {
+        value.* = std.math.tanh(value.* / cap) * cap;
+    }
 }
 
 fn gpt2ByteToCodepoint(byte: u8) u21 {

@@ -910,7 +910,9 @@ pub fn attentionFused(
     context_length: usize,
     position: usize,
     layer_base: usize,
+    window_start: usize,
     scale: f32,
+    softcap: ?f32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -928,7 +930,9 @@ pub fn attentionFused(
         @intCast(context_length),
         @intCast(position),
         @intCast(layer_base),
+        @intCast(window_start),
         scale,
+        softcap orelse 0,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -944,6 +948,25 @@ pub fn siluMul(
     const state = stateFromCtx(backend.ctx);
     var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
     try mapStatus(c.ziggy_metal_silu_mul_f32(
+        state.context,
+        gate.raw,
+        up.raw,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn geluMul(
+    backend: backend_api.MatVecBackend,
+    gate: BufferHandle,
+    up: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_gelu_mul_f32(
         state.context,
         gate.raw,
         up.raw,
@@ -998,6 +1021,7 @@ pub fn rmsNorm(
     output: BufferHandle,
     count: usize,
     eps: f32,
+    weight_offset: f32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -1010,6 +1034,7 @@ pub fn rmsNorm(
         output.raw,
         @intCast(count),
         eps,
+        weight_offset,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -1023,6 +1048,7 @@ pub fn rmsNormPerHeadF32(
     head_count: usize,
     head_dim: usize,
     eps: f32,
+    weight_offset: f32,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     const state = stateFromCtx(backend.ctx);
@@ -1036,6 +1062,7 @@ pub fn rmsNormPerHeadF32(
         @intCast(head_count),
         @intCast(head_dim),
         eps,
+        weight_offset,
         &error_buf,
         error_buf.len,
     ), &error_buf);
@@ -1242,6 +1269,7 @@ pub fn batchRmsNorm(
     output: BufferHandle,
     count: usize,
     eps: f32,
+    weight_offset: f32,
     batch_idx: usize,
 ) !void {
     if (!build_enabled_value) return error.MetalDisabled;
@@ -1256,6 +1284,7 @@ pub fn batchRmsNorm(
         output.raw,
         @intCast(count),
         eps,
+        weight_offset,
         @intCast(batch_idx),
         &error_buf,
         error_buf.len,

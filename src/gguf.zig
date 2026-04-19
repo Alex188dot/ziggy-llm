@@ -86,6 +86,7 @@ pub const ChatTemplateStyle = enum {
     generic,
     chatml,
     qwen,
+    gemma,
 };
 
 const TypeLayout = struct {
@@ -654,6 +655,11 @@ fn optionalString(value: ?[]const u8) []const u8 {
 
 pub fn detectChatTemplateStyle(chat_template: ?[]const u8) ChatTemplateStyle {
     const template = chat_template orelse return .generic;
+    if (std.mem.indexOf(u8, template, "<start_of_turn>") != null and
+        std.mem.indexOf(u8, template, "<end_of_turn>") != null)
+    {
+        return .gemma;
+    }
     if (std.mem.indexOf(u8, template, "<|im_start|>") != null) {
         return .qwen;
     }

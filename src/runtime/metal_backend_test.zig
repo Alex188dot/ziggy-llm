@@ -754,7 +754,9 @@ test "metal fused attention matches cpu reference" {
         context_length,
         position,
         layer_base,
+        0,
         scale,
+        null,
     );
     try metal_backend.readBufferF32(output_buffer, &actual);
 

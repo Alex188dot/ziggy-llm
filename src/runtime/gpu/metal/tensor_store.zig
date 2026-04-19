@@ -58,6 +58,8 @@ pub const DenseTensorStore = struct {
             try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_down, moon_quant_mode, profiler);
             try self.addTensor(model, layer.ffn_up, moon_quant_mode, profiler);
+            if (layer.post_attention_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
+            if (layer.post_ffw_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
             if (layer.linear_attn) |la| {
                 try self.addTensor(model, la.in_proj_qkv, moon_quant_mode, profiler);
                 try self.addTensor(model, la.in_proj_z, moon_quant_mode, profiler);
@@ -151,9 +153,11 @@ pub const DenseTensorStore = struct {
         profiler: ?*StartupProfiler,
     ) !void {
         if (self.tensors.contains(tensor.offset) or self.raw_tensors.contains(tensor.offset) or self.moon_quant_tensors.contains(tensor.offset)) return;
+        const rows = try tensor.rowCount();
+        const cols = try tensor.rowLen();
         try self.tensor_meta.put(tensor.offset, .{
-            .rows = try tensor.rowCount(),
-            .cols = try tensor.rowLen(),
+            .rows = rows,
+            .cols = cols,
             .tensor_type = tensor.tensor_type,
         });
 
@@ -181,8 +185,6 @@ pub const DenseTensorStore = struct {
         }
 
         const dense_prepare_start = std.time.nanoTimestamp();
-        const rows = try tensor.rowCount();
-        const cols = try tensor.rowLen();
         const row_size = try llama.tensorRowByteSize(tensor.tensor_type, cols);
         const bytes = try llama.tensorBytes(model, tensor);
         const dense = try self.allocator.alloc(f32, rows * cols);

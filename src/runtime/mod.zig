@@ -61,15 +61,10 @@ pub fn generate(
     defer arena.deinit();
 
     const gguf_report = try gguf.inspectFile(arena.allocator(), model_path);
-    std.debug.print("DEBUG: gguf architecture='{s}'\n", .{gguf_report.architecture});
     const family = families_mod.detectModelFamily(gguf_report.architecture);
-    std.debug.print("DEBUG: detected family='{s}'\n", .{family.label()});
     const reg = getRegistry();
-    std.debug.print("DEBUG: registry count={d}\n", .{reg.count});
 
     if (reg.getRuntime(family)) |runtime| {
-        std.debug.print("DEBUG: calling runtime.generate\n", .{});
-        std.debug.print("DEBUG: about to enter runtime.generate\n", .{});
         const family_options = families_mod.FamilyGenerateOptions{
             .max_tokens = options.max_tokens,
             .context_length = options.context_length,

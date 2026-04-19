@@ -191,7 +191,7 @@ pub const Session = struct {
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
         try self.runProjection(layer.attn_q.?, self.normed, self.q);
         if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
-        if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.rope_dimension_count);
+        if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.key_head_dimension);
 
         const q_rope_start = std.time.nanoTimestamp();
         try metal_backend.applyRoPE(
@@ -199,7 +199,7 @@ pub const Session = struct {
             self.q,
             self.model.head_count,
             self.model.rope_dimension_count,
-            self.model.rope_dimension_count,
+            self.model.key_head_dimension,
             position,
             self.model.rope_freq_base,
             self.model.rope_style,
@@ -217,13 +217,13 @@ pub const Session = struct {
         const kv_k_start = std.time.nanoTimestamp();
         try self.runProjection(layer.attn_k.?, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
-        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.rope_dimension_count);
+        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.key_head_dimension);
         try metal_backend.applyRoPE(
             self.backend,
             self.k,
             self.model.head_count_kv,
             self.model.rope_dimension_count,
-            self.model.rope_dimension_count,
+            self.model.key_head_dimension,
             position,
             self.model.rope_freq_base,
             self.model.rope_style,
@@ -274,12 +274,14 @@ pub const Session = struct {
             self.attn,
             self.model.head_count,
             self.model.head_count_kv,
-            self.model.rope_dimension_count,
+            self.model.key_head_dimension,
             self.model.kv_projection_size,
             self.model.context_length,
             position,
             layer_base,
-            @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.rope_dimension_count))),
+            self.attentionWindowStart(layer_index, position),
+            @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.key_head_dimension))),
+            self.model.attn_logit_softcapping,
         );
         self.recordCategoryWithShape(.attention, attention_start, .{
             .rows = self.model.head_count,
@@ -287,7 +289,13 @@ pub const Session = struct {
             .depth = position + 1,
             .extra = self.model.head_count_kv,
         });
-        try self.runProjectionAdd(layer.attn_output.?, self.attn, self.hidden);
+        if (layer.post_attention_norm) |n| {
+            try self.runProjection(layer.attn_output.?, self.attn, self.tmp);
+            try self.runRmsNorm(n, self.tmp, self.tmp);
+            try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+        } else {
+            try self.runProjectionAdd(layer.attn_output.?, self.attn, self.hidden);
+        }
     }
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
@@ -298,7 +306,7 @@ pub const Session = struct {
         const tensor = layer.ffn_down;
         var handled_fused = false;
 
-        if (tensor.tensor_type == 12) {
+        if (tensor.tensor_type == 12 and layer.post_ffw_norm == null and !self.model.use_gelu_ffn) {
             if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                 const start = std.time.nanoTimestamp();
                 try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
@@ -317,13 +325,23 @@ pub const Session = struct {
 
         if (!handled_fused) {
             const silu_start = std.time.nanoTimestamp();
-            try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+            if (self.model.use_gelu_ffn) {
+                try metal_backend.geluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+            } else {
+                try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+            }
             self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
                 .rows = 1,
                 .cols = self.model.feed_forward_length,
                 .depth = 2,
             });
-            try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+            if (layer.post_ffw_norm) |n| {
+                try self.runProjection(layer.ffn_down, self.gate, self.tmp);
+                try self.runRmsNorm(n, self.tmp, self.tmp);
+                try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+            } else {
+                try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
+            }
         }
     }
 
@@ -338,6 +356,7 @@ pub const Session = struct {
         const host_readback_start = std.time.nanoTimestamp();
         try metal_backend.readBufferF32(self.tmp, out);
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
+        if (self.model.final_logit_softcapping) |cap| softcapInPlace(out, cap);
     }
 
     pub fn commitToken(self: *Session) !void {
@@ -419,6 +438,23 @@ pub const Session = struct {
         return token[0];
     }
 
+    fn attentionWindowStart(self: *const Session, layer_index: usize, position: usize) usize {
+        if (!self.layerUsesSlidingWindow(layer_index)) return 0;
+        const window = self.model.sliding_window;
+        return (position + 1) - @min(position + 1, window);
+    }
+
+    fn layerUsesSlidingWindow(self: *const Session, layer_index: usize) bool {
+        if (self.model.sliding_window == 0) return false;
+        if (self.model.global_attention_interval == 0) return true;
+        return ((layer_index + 1) % self.model.global_attention_interval) != 0;
+    }
+
+    fn softcapInPlace(values: []f32, cap: f32) void {
+        if (!(cap > 0)) return;
+        for (values) |*value| value.* = std.math.tanh(value.* / cap) * cap;
+    }
+
     pub fn runOutputShortlist(
         self: *Session,
         norm: TensorDesc,
@@ -475,6 +511,7 @@ pub const Session = struct {
             output,
             self.model.embedding_length,
             self.model.rms_norm_eps,
+            self.model.rms_norm_weight_offset,
         );
         self.recordCategoryWithShape(.normalization, start, .{
             .rows = 1,
@@ -501,6 +538,7 @@ pub const Session = struct {
             head_count,
             head_dim,
             self.model.rms_norm_eps,
+            self.model.rms_norm_weight_offset,
         );
         self.recordCategoryWithShape(.normalization, start, .{
             .rows = head_count,
@@ -845,6 +883,9 @@ pub const Session = struct {
             var values: [2048]f32 = undefined;
             if (emb_rows > values.len) return error.InvalidTensorMetadata;
             @memcpy(values[0..emb_rows], src);
+            if (self.model.embedding_scale != 1.0) {
+                for (values[0..emb_rows]) |*value| value.* *= self.model.embedding_scale;
+            }
             try metal_backend.writeBufferF32(self.hidden, values[0..emb_rows]);
 
             for (layers, 0..) |layer, layer_index| {
@@ -856,7 +897,7 @@ pub const Session = struct {
                     self.q,
                     self.model.head_count,
                     self.model.rope_dimension_count,
-                    self.model.rope_dimension_count,
+                    self.model.key_head_dimension,
                     position,
                     self.model.rope_freq_base,
                     self.model.rope_style,
@@ -871,7 +912,7 @@ pub const Session = struct {
                     self.k,
                     self.model.head_count_kv,
                     self.model.rope_dimension_count,
-                    self.model.rope_dimension_count,
+                    self.model.key_head_dimension,
                     position,
                     self.model.rope_freq_base,
                     self.model.rope_style,
@@ -901,12 +942,14 @@ pub const Session = struct {
                     self.attn,
                     self.model.head_count,
                     self.model.head_count_kv,
-                    self.model.rope_dimension_count,
+                    self.model.key_head_dimension,
                     self.model.kv_projection_size,
                     self.model.context_length,
                     position,
                     layer_base,
-                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.rope_dimension_count))),
+                    self.attentionWindowStart(layer_index, position),
+                    @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(self.model.key_head_dimension))),
+                    self.model.attn_logit_softcapping,
                 );
 
                 try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
@@ -916,7 +959,11 @@ pub const Session = struct {
                 try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
                 try self.runProjection(layer.ffn_gate, self.normed, self.gate);
                 try self.runProjection(layer.ffn_up, self.normed, self.up);
-                try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+                if (self.model.use_gelu_ffn) {
+                    try metal_backend.geluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+                } else {
+                    try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+                }
                 try self.runProjectionAdd(layer.ffn_down, self.gate, self.hidden);
             }
 

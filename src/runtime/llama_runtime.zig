@@ -113,7 +113,6 @@ fn createMetalExecution(
     const tensor_prepare_begin = std.time.nanoTimestamp();
     try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
-
     const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
