@@ -320,6 +320,7 @@ const Tokenizer = struct {
     add_bos_token: bool,
     add_eos_token: bool,
     add_space_prefix: bool,
+    prefer_longest_match: bool = false,
 
     const Mode = enum {
         score_dp,
@@ -451,6 +452,11 @@ const Tokenizer = struct {
         }
 
         const text = normalized.items;
+        if (self.prefer_longest_match) {
+            try self.encodeScoreLongestChunk(text, pieces);
+            return;
+        }
+
         const n = text.len;
         var best_scores = try allocator.alloc(f32, n + 1);
         defer allocator.free(best_scores);
@@ -506,6 +512,35 @@ const Tokenizer = struct {
             const token_id = best_tokens[pos] orelse return error.UnknownToken;
             try pieces.append(allocator, token_id);
             pos = best_next[pos];
+        }
+    }
+
+    fn encodeScoreLongestChunk(self: Tokenizer, text: []const u8, pieces: *std.ArrayList(u32)) !void {
+        var pos: usize = 0;
+        while (pos < text.len) {
+            var best_token: ?u32 = null;
+            var best_len: usize = 0;
+
+            for (self.tokens, 0..) |token, token_id_usize| {
+                const token_id: u32 = @intCast(token_id_usize);
+                if (!self.canEncodeToken(token_id)) continue;
+                if (token.len == 0 or token.len > text.len - pos) continue;
+                if (!std.mem.startsWith(u8, text[pos..], token)) continue;
+                if (token.len > best_len) {
+                    best_len = token.len;
+                    best_token = token_id;
+                }
+            }
+
+            if (best_token) |token_id| {
+                pieces.appendAssumeCapacity(token_id);
+                pos += best_len;
+                continue;
+            }
+
+            const fallback = self.byte_fallback[text[pos]] orelse return error.UnknownToken;
+            pieces.appendAssumeCapacity(fallback);
+            pos += 1;
         }
     }
 
@@ -2180,7 +2215,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
     const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
     if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text and !is_gemma) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text) .neox else .interleaved;
+    const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text or is_gemma) .neox else .interleaved;
 
     if (metadata.tokenizer_model) |tm| {
         if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
@@ -2240,7 +2275,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const use_gelu_ffn = std.mem.eql(u8, architecture, "gemma") or
         std.mem.eql(u8, architecture, "gemma2") or
         std.mem.eql(u8, architecture, "gemma3");
-    const embedding_scale: f32 = if (use_gelu_ffn)
+    const embedding_scale: f32 = if (std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2"))
         @sqrt(@as(f32, @floatFromInt(embedding_length)))
     else
         1.0;
@@ -2397,6 +2432,7 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
             .add_bos_token = metadata.add_bos_token orelse true,
             .add_eos_token = metadata.add_eos_token orelse false,
             .add_space_prefix = metadata.add_space_prefix orelse true,
+            .prefer_longest_match = true,
         };
     }
 
@@ -2461,6 +2497,7 @@ fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer 
         .add_bos_token = metadata.add_bos_token orelse true,
         .add_eos_token = metadata.add_eos_token orelse false,
         .add_space_prefix = metadata.add_space_prefix orelse true,
+        .prefer_longest_match = false,
     };
 }
 
@@ -2552,6 +2589,7 @@ fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_c
         .add_bos_token = metadata.add_bos_token orelse false,
         .add_eos_token = metadata.add_eos_token orelse false,
         .add_space_prefix = metadata.add_space_prefix orelse true,
+        .prefer_longest_match = false,
     };
 }
 
@@ -2681,12 +2719,7 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.scores")) {
-        const arch = metadata.architecture orelse "";
-        if (std.mem.eql(u8, arch, "gemma") or std.mem.eql(u8, arch, "gemma2") or std.mem.eql(u8, arch, "gemma3")) {
-            try skipValue(parser, value_type);
-        } else {
-            try readFloatArray(allocator, parser, value_type, &metadata.tokenizer_scores);
-        }
+        try readFloatArray(allocator, parser, value_type, &metadata.tokenizer_scores);
         return;
     }
     if (std.mem.eql(u8, key, "tokenizer.ggml.token_type")) {
