@@ -10,6 +10,8 @@ const qwen_family = @import("families/qwen/mod.zig");
 const mistral_family = @import("families/mistral/mod.zig");
 const mistral3_family = @import("families/ministral3_2512/mod.zig");
 const gemma_family = @import("families/gemma/mod.zig");
+const gemma2_family = @import("families/gemma2/mod.zig");
+const gemma3_family = @import("families/gemma3/mod.zig");
 const qwen35_family = @import("families/qwen35/mod.zig");
 const qwen35_text_family = @import("families/qwen35_text/mod.zig");
 
@@ -41,6 +43,8 @@ fn getRegistry() *registry_mod.FamilyRegistry {
         reg.register(mistral_family.FamilyHandler) catch unreachable;
         reg.register(mistral3_family.FamilyHandler) catch unreachable;
         reg.register(gemma_family.FamilyHandler) catch unreachable;
+        reg.register(gemma2_family.FamilyHandler) catch unreachable;
+        reg.register(gemma3_family.FamilyHandler) catch unreachable;
         reg.register(qwen35_family.FamilyHandler) catch unreachable;
         reg.register(qwen35_text_family.FamilyHandler) catch unreachable;
     }
@@ -57,15 +61,10 @@ pub fn generate(
     defer arena.deinit();
 
     const gguf_report = try gguf.inspectFile(arena.allocator(), model_path);
-    std.debug.print("DEBUG: gguf architecture='{s}'\n", .{gguf_report.architecture});
     const family = families_mod.detectModelFamily(gguf_report.architecture);
-    std.debug.print("DEBUG: detected family='{s}'\n", .{family.label()});
     const reg = getRegistry();
-    std.debug.print("DEBUG: registry count={d}\n", .{reg.count});
 
     if (reg.getRuntime(family)) |runtime| {
-        std.debug.print("DEBUG: calling runtime.generate\n", .{});
-        std.debug.print("DEBUG: about to enter runtime.generate\n", .{});
         const family_options = families_mod.FamilyGenerateOptions{
             .max_tokens = options.max_tokens,
             .context_length = options.context_length,

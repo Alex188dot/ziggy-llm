@@ -357,12 +357,23 @@ int ziggy_metal_attention_fused_f32(
     uint32_t context_length,
     uint32_t position,
     uint32_t layer_base,
+    uint32_t window_start,
     float scale,
+    float softcap,
     char *error_message,
     size_t error_message_len
 );
 
 int ziggy_metal_silu_mul_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *gate,
+    const ZiggyMetalBuffer *up,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_gelu_mul_f32(
     ZiggyMetalContext *ctx,
     ZiggyMetalBuffer *gate,
     const ZiggyMetalBuffer *up,
@@ -415,6 +426,7 @@ int ziggy_metal_rms_norm_f32(
     ZiggyMetalBuffer *output,
     uint32_t count,
     float eps,
+    float weight_offset,
     char *error_message,
     size_t error_message_len
 );
@@ -427,6 +439,7 @@ int ziggy_metal_rms_norm_per_head_f32(
     uint32_t head_count,
     uint32_t head_dim,
     float eps,
+    float weight_offset,
     char *error_message,
     size_t error_message_len
 );
@@ -523,6 +536,7 @@ int ziggy_metal_batch_rms_norm_f32(
     ZiggyMetalBuffer *output,
     uint32_t count,
     float eps,
+    float weight_offset,
     uint32_t batch_idx,
     char *error_message,
     size_t error_message_len

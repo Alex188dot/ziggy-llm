@@ -310,3 +310,442 @@ The following are intentionally deferred until dense support is stable:
 - **Lower Priority**:
   - AWQ quantization support
   - GGUF creation from HuggingFace models
+
+---
+
+## FROM HERMES AGENT, FINDINGS ON QWEN 3.5 IMPLEMENTATION
+
+**Source**: llama.cpp master branch (latest), scraped from GitHub raw content on 2026-04-19
+**Source URLs**:
+- `src/llama-arch.h` - Architecture enum, tensor/KV key definitions
+- `src/llama-arch.cpp` - Architecture name mapping, classification functions
+- `src/llama-hparams.h` - Hyperparameter struct
+- `src/llama-vocab.h` - Vocab pre-type enum
+- `src/llama-model.h` - Layer struct, LLM_TYPE enum
+- `src/llama-model.cpp` (partial) - hparams loading, tensor split logic, model type classification
+
+---
+
+### 1. ARCHITECTURE ENUM AND NAME MAPPING
+
+**In `llama-arch.h`**:
+```c
+enum llm_arch {
+    // ... existing arches ...
+    LLM_ARCH_QWEN3NEXT,
+    LLM_ARCH_QWEN3VL,
+    LLM_ARCH_QWEN3VLMOE,
+    LLM_ARCH_QWEN35,        // <-- Qwen3.5 dense
+    LLM_ARCH_QWEN35MOE,     // <-- Qwen3.5 MoE
+    // ...
+};
+```
+
+**In `llama-arch.cpp`**:
+```c
+{LLM_ARCH_QWEN3NEXT, "qwen3next"},
+{LLM_ARCH_QWEN35,   "qwen35"},     // architecture string in GGUF = "qwen35"
+{LLM_ARCH_QWEN35MOE, "qwen35moe"}, // architecture string in GGUF = "qwen35moe"
+```
+
+**Key insight**: Qwen3.5 (dense) maps to `LLM_ARCH_QWEN35` with architecture name `"qwen35"`. Qwen3.5 MoE maps to `LLM_ARCH_QWEN35MOE` with name `"qwen35moe"`.
+
+---
+
+### 2. VOCABULARY PRETYPE
+
+**In `llama-vocab.h`**:
+```c
+LLAMA_VOCAB_PRE_TYPE_QWEN35 = 46,
+```
+
+This is a dedicated vocab pretokenization type for Qwen3.5 (distinct from `LLAMA_VOCAB_PRE_TYPE_QWEN2 = 11`). The tokenizer uses SPM-style BPE with spaces replaced by `▁` before BPE merges.
+
+---
+
+### 3. ARCHITECTURE CLASSIFICATION
+
+**In `llama-arch.cpp`**:
+
+```c
+// llm_arch_is_hybrid()
+case LLM_ARCH_QWEN3NEXT:
+case LLM_ARCH_KIMI_LINEAR:
+case LLM_ARCH_QWEN35:
+case LLM_ARCH_QWEN35MOE:
+    return true;
+```
+
+**Critical**: Qwen3.5 is classified as **hybrid** (not purely recurrent, not purely dense attention). This means it mixes standard attention layers with SSM/linear attention layers.
+
+**Not recurrent** (unlike Qwen3Next which is also hybrid):
+```c
+// llm_arch_is_recurrent() - QWEN35 is NOT listed here
+case LLM_ARCH_MAMBA:
+case LLM_ARCH_MAMBA2:
+case LLM_ARCH_RWKV6:
+case LLM_ARCH_RWKV6QWEN2:
+case LLM_ARCH_RWKV7:
+case LLM_ARCH_ARWKV7:
+    return true;
+```
+
+---
+
+### 4. HYPERPARAMETERS (llama-hparams.h)
+
+Qwen3.5 uses these SSM-related hyperparameters (same system as Mamba/Kimi Linear/Granite Hybrid):
+
+```c
+struct llama_hparams {
+    // SSM parameters (used by Qwen3.5):
+    uint32_t ssm_d_conv = 0;       // SSM conv kernel size
+    uint32_t ssm_d_inner = 0;      // SSM inner size
+    uint32_t ssm_d_state = 0;      // SSM state size (aka head_dim for SSM)
+    uint32_t ssm_dt_rank = 0;      // Delta-t rank
+    uint32_t ssm_n_group = 0;      // SSM group count (for Qwen3.5: n_k_heads)
+    // ...
+};
+```
+
+**Also notable in hparams** - `n_embd_per_layer` (used by Gemma4, may be relevant for Qwen3.5):
+```c
+uint32_t n_embd_per_layer = 0;  // gemma4 per-layer embedding
+```
+
+---
+
+### 5. LAYER STRUCTURE (llama-model.h)
+
+Per-layer tensors for Qwen3.5 include **both standard attention AND SSM tensors**:
+
+```c
+struct llama_layer {
+    // SSM / State Space Model tensors (Qwen3.5):
+    struct ggml_tensor * ssm_in = nullptr;
+    struct ggml_tensor * ssm_x = nullptr;
+    struct ggml_tensor * ssm_dt = nullptr;
+    struct ggml_tensor * ssm_out = nullptr;
+    struct ggml_tensor * ssm_conv1d = nullptr;
+    struct ggml_tensor * ssm_a = nullptr;
+    struct ggml_tensor * ssm_d = nullptr;
+    struct ggml_tensor * ssm_conv1d_b = nullptr;
+    struct ggml_tensor * ssm_dt_b = nullptr;
+    struct ggml_tensor * ssm_beta_alpha = nullptr;  // qwen3next
+    struct ggml_tensor * ssm_alpha = nullptr;       // qwen3.5
+    struct ggml_tensor * ssm_norm = nullptr;
+    struct ggml_tensor * ssm_dt_norm = nullptr;
+    struct ggml_tensor * ssm_b_norm = nullptr;
+    struct ggml_tensor * ssm_c_norm = nullptr;
+
+    // Standard attention tensors:
+    struct ggml_tensor * attn_norm = nullptr;
+    struct ggml_tensor * wq = nullptr;
+    struct ggml_tensor * wk = nullptr;
+    struct ggml_tensor * wv = nullptr;
+    struct ggml_tensor * wo = nullptr;
+    struct ggml_tensor * wqkv = nullptr;  // combined QKV
+    struct ggml_tensor * attn_out_norm = nullptr;
+
+    // FFN:
+    struct ggml_tensor * ffn_norm = nullptr;
+    struct ggml_tensor * ffn_gate = nullptr;
+    struct ggml_tensor * ffn_down = nullptr;
+    struct ggml_tensor * ffn_up = nullptr;
+};
+```
+
+**Tensor naming** (from `LLM_TENSOR_NAMES` in `llama-arch.cpp`):
+```
+blk.%d.ssm_conv1d      - SSM conv1d
+blk.%d.ssm_dt          - Delta-t
+blk.%d.ssm_a           - SSM A matrix
+blk.%d.ssm_d           - SSM D vector
+blk.%d.ssm_out         - SSM output projection
+blk.%d.ssm_alpha       - Qwen3.5 alpha (Gated DeltaNet gate)
+blk.%d.ssm_beta        - Qwen3.5 beta (shared with Kimi)
+blk.%d.ssm_ba          - Qwen3Next beta-alpha combined
+blk.%d.ssm_norm        - SSM normalization
+blk.%d.ssm_b_norm      - SSM B normalization
+blk.%d.ssm_c_norm      - SSM C normalization
+blk.%d.ssm_dt_norm     - SSM dt normalization
+blk.%d.attn_qkv        - Combined QKV projection
+blk.%d.attn_output     - Output projection
+blk.%d.ffn_gate        - FFN gate (SwiGLU)
+blk.%d.ffn_down        - FFN down projection
+blk.%d.ffn_up          - FFN up projection
+blk.%d.attn_norm       - Attention RMSNorm
+blk.%d.ffn_norm        - FFN RMSNorm
+```
+
+---
+
+### 6. TENSOR OPERATIONS AND INFERENCE KERNELS
+
+**From `LLM_TENSOR_INFOS` in `llama-arch.cpp`**:
+```c
+{LLM_TENSOR_SSM_CONV1D,  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+{LLM_TENSOR_SSM_A,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_SCAN}},
+{LLM_TENSOR_SSM_A_NOSCAN,{LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // MUL variant for Qwen3Next
+{LLM_TENSOR_SSM_DT,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+{LLM_TENSOR_SSM_OUT,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+{LLM_TENSOR_SSM_ALPHA,   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+{LLM_TENSOR_SSM_BETA_ALPHA,{LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+{LLM_TENSOR_SSM_X,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+{LLM_TENSOR_SSM_D,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+{LLM_TENSOR_SSM_DT_NORM, {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+{LLM_TENSOR_SSM_B_NORM,  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+{LLM_TENSOR_SSM_C_NORM,  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+{LLM_TENSOR_SSM_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+```
+
+**Critical inference operations needed**:
+- `GGML_OP_SSM_CONV` - 1D convolution for SSM input
+- `GGML_OP_SSM_SCAN` - Selective scan operation (the core SSM computation)
+- Standard `GGML_OP_MUL_MAT` for projections
+- Standard `GGML_OP_MUL` for elementwise operations
+
+---
+
+### 7. MULTI-DEVICE TENSOR SPLIT LOGIC (CRITICAL FOR GPU OFFLOAD)
+
+**From `llama_meta_device_get_split_state()` in `llama-model.cpp`**, Qwen3.5 has **special multi-device split handling**:
+
+```cpp
+if (ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+    ud->model->arch == LLM_ARCH_QWEN35 ||
+    ud->model->arch == LLM_ARCH_QWEN35MOE) {
+    const int64_t head_k_dim = hparams.ssm_d_state;
+    const int64_t head_v_dim = hparams.ssm_d_state;
+    const int64_t n_k_heads = hparams.ssm_n_group;
+    const int64_t n_v_heads = hparams.ssm_dt_rank;
+    const int64_t key_dim = head_k_dim * n_k_heads;
+    const int64_t value_dim = head_v_dim * n_v_heads;
+```
+
+**Key split difference between Qwen3Next and Qwen3.5**:
+
+```cpp
+// Qwen3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] pattern
+if (ud->model->arch == LLM_ARCH_QWEN3NEXT) {
+    if (regex_match(pattern_qkv_weight) || regex_match(pattern_ssm_conv1d)) {
+        return {key_dim, key_dim, value_dim};
+    }
+}
+// Qwen3.5: [k0_v0, k1_v1, k0_v2, k1_v3] pattern (different broadcasting)
+// needs segmenting of V on the scale of K to get the correct pattern
+else {
+    const int64_t head_ratio = n_v_heads / n_k_heads;
+    if (regex_match(pattern_qkv_weight) || regex_match(pattern_ssm_conv1d)) {
+        return std::vector(2 + head_ratio, key_dim);  // e.g., [k, k, v0, v1]
+    }
+    if (regex_match(pattern_attn_gate_weight) || regex_match(pattern_ssm_out_weight)) {
+        return std::vector(head_ratio, key_dim);
+    }
+    if (regex_match(pattern_ssm_dt) || regex_match(pattern_ssm_a) ||
+        regex_match(pattern_ssm_alpha) || regex_match(pattern_ssm_beta)) {
+        return std::vector(head_ratio, n_k_heads);
+    }
+    if (regex_match(pattern_r_cache)) {
+        return std::vector(2 + head_ratio, key_dim * (hparams.ssm_d_conv - 1));
+    }
+    if (regex_match(pattern_s_cache)) {
+        return std::vector(head_ratio, n_k_heads * head_v_dim * head_v_dim);
+    }
+}
+```
+
+**Also notable**: For Qwen3.5, Q gate tensor granularity is doubled:
+```cpp
+if (ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+    ud->model->arch == LLM_ARCH_QWEN35 ||
+    ud->model->arch == LLM_ARCH_QWEN35MOE) {
+    return {std::lcm(2*n_embd_q, blck_size)};
+}
+```
+
+---
+
+### 8. SOFTMAX GATING FOR MoE
+
+For **Qwen3.5 MoE** (not dense):
+```c
+{LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func};
+```
+
+```c
+enum llama_expert_gating_func_type {
+    LLAMA_EXPERT_GATING_FUNC_TYPE_NONE = 0,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX = 1,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID = 2,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to router weights
+};
+```
+
+---
+
+### 9. MODEL TYPE CLASSIFICATION (LLM_TYPE)
+
+From `llama-model.h` and the hparams loading in `llama-model.cpp`:
+```c
+// Qwen3.5 model type classification from n_layer:
+// Note: Qwen3.5 dense uses standard switch-case based on n_layer
+// MoE types from llm_type enum:
+LLM_TYPE_35B_A3B,        // Qwen3.5 dense (35B, 3B active?)
+LLM_TYPE_48B_A3B,        // Another Qwen3.5 variant
+LLM_TYPE_122B_A10B,      // Qwen3.5 MoE
+LLM_TYPE_397B_A17B,      // Qwen3.5 MoE large
+```
+
+---
+
+### 10. QWEN3NEXT vs QWEN3.5 KEY DIFFERENCES
+
+| Feature | Qwen3Next | Qwen3.5 |
+|---------|-----------|---------|
+| Architecture | Hybrid SSM + attention | Hybrid SSM + attention |
+| SSM variant | Uses `ssm_ba` (beta-alpha fused) | Uses `ssm_alpha` + `ssm_beta` separate |
+| V broadcasting | [k0_v0, k0_v1, k1_v2, k1_v3] | [k0_v0, k1_v1, k0_v2, k1_v3] |
+| head_ratio handling | Not needed | n_v_heads / n_k_heads |
+| R/S cache split | 3 segments | 2 + head_ratio segments |
+| Model sizes | 80B-A3B (Qwen3Next) | 35B, 48B dense; 122B, 397B MoE |
+
+---
+
+### 11. IMPLEMENTATION CHECKLIST FOR ZIGGY-LLM
+
+Based on the llama.cpp analysis, here's what's needed to implement Qwen3.5:
+
+#### A. Architecture Registration
+- [ ] Map `"qwen35"` → `LLM_ARCH_QWEN35` in `mod.zig`
+- [ ] Map `"qwen35moe"` → `LLM_ARCH_QWEN35MOE` in `mod.zig`
+- [ ] Register as hybrid architecture (not recurrent)
+
+#### B. Vocabulary
+- [ ] Add `LLAMA_VOCAB_PRE_TYPE_QWEN35` tokenizer handling
+- [ ] SPM-style BPE with `▁` replacement before merges
+- [ ] BOS/EOS token handling (standard Qwen2/Qwen3 style)
+
+#### C. Hyperparameters to Parse from GGUF
+- [ ] `ssm_d_conv` → SSM conv kernel
+- [ ] `ssm_d_state` → state dimension
+- [ ] `ssm_dt_rank` → delta-t rank
+- [ ] `ssm_n_group` → number of K heads in SSM
+- [ ] Standard: `n_embd`, `n_layer`, `n_head`, `n_head_kv`, `n_ff`
+
+#### D. Tensor Name Mapping
+Required tensor names for dense Qwen3.5:
+```
+token_embd
+blk.{i}.ssm_conv1d
+blk.{i}.ssm_dt
+blk.{i}.ssm_a
+blk.{i}.ssm_alpha   (Qwen3.5 specific!)
+blk.{i}.ssm_beta    (Qwen3.5 specific!)
+blk.{i}.ssm_norm
+blk.{i}.ssm_b_norm
+blk.{i}.ssm_c_norm
+blk.{i}.ssm_dt_norm
+blk.{i}.ssm_out
+blk.{i}.ssm_x       (input for SSM)
+blk.{i}.ssm_d       (D vector, elementwise)
+blk.{i}.attn_qkv    (combined QKV)
+blk.{i}.attn_output
+blk.{i}.ffn_gate
+blk.{i}.ffn_down
+blk.{i}.ffn_up
+blk.{i}.attn_norm
+blk.{i}.ffn_norm
+output
+output_norm
+```
+
+#### E. Compute Kernels Needed
+1. **SSM Conv** (`GGML_OP_SSM_CONV`) - 1D causal convolution
+2. **SSM Scan** (`GGML_OP_SSM_SCAN`) - Selective scan / state space computation
+3. **SSM Elementwise** - for `ssm_d`, `ssm_dt_norm`, `ssm_b_norm`, `ssm_c_norm`, `ssm_norm`
+4. **Standard MatMul** for projections (`attn_qkv`, `attn_output`, `ffn_*`)
+5. **RMSNorm** for `attn_norm`, `ffn_norm`, SSM norms
+6. **Silu** activation for FFN gate
+
+#### F. Multi-Device Split Logic
+- [ ] Qwen3.5 V broadcasting: segments = `[key_dim, key_dim, v0, v1, ...]` pattern
+- [ ] Q gate granularity doubled (like Qwen3Next)
+- [ ] head_ratio = n_v_heads / n_k_heads for split calculations
+- [ ] R cache and S cache split accounting for head_ratio
+
+#### G. KV Cache
+- Qwen3.5 uses standard attention layers interleaved with SSM layers
+- KV cache format: standard for attention, SSM state cache for SSM layers
+- `n_layer_kv_from_start` may be relevant if some layers share KV
+
+#### H. RoPE
+- Standard YaRN scaling for extended context
+- Check `rope_scaling_type_train`, `rope_freq_base_train`
+- Qwen3.5 supports up to 262,144 context (per test model metadata)
+
+---
+
+### 12. SIMILAR ARCHITECTURES FOR REFERENCE
+
+The following architectures share similar patterns that can inform implementation:
+
+1. **Qwen3Next** (`LLM_ARCH_QWEN3NEXT`) - Most similar, uses `ssm_ba` instead of separate `ssm_alpha`/`ssm_beta`
+2. **GraniteHybrid** (`LLM_ARCH_GRANITE_HYBRID`) - SSM + attention hybrid
+3. **Mamba2** (`LLM_ARCH_MAMBA2`) - Pure SSM (non-hybrid)
+4. **KimiLinear** (`LLM_ARCH_KIMI_LINEAR`) - Also hybrid SSM+attention with similar SSM tensor names
+
+---
+
+### 13. GGUF KV KEYS FOR QWEN3.5
+
+From `LLM_KV_NAMES` (formatted with arch prefix):
+```
+qwen35.vocab_size
+qwen35.context_length
+qwen35.embedding_length
+qwen35.block_count
+qwen35.feed_forward_length
+qwen35.expert_feed_forward_length (MoE)
+qwen35.attention.head_count
+qwen35.attention.head_count_kv
+qwen35.attention.layer_norm_rms_epsilon
+qwen35.ssm.inner_size
+qwen35.ssm.state_size
+qwen35.ssm.time_step_rank
+qwen35.ssm.conv_kernel
+qwen35.ssm.group_count
+qwen35.rope.dimension_count
+qwen35.rope.freq_base
+qwen35.rope.scaling.type
+qwen35.rope.scaling.factor
+qwen35.rope.scaling.original_context_length
+```
+
+---
+
+### 14. QUANTIZATION CONSIDERATIONS
+
+Qwen3.5 uses standard quantization paths for the attention layers. SSM layers (ssm_conv1d, ssm_a, ssm_dt, etc.) are typically quantized with the same type as other linear layers. The Q4_K_M quantization of the test model should work for both attention and SSM projections.
+
+Key: `ssm_alpha` and `ssm_beta` are elementwise tensors (1D) that may need special handling if they appear in quantized form.
+
+---
+
+### 15. RUNTIME MEMORY ESTIMATION
+
+For Qwen3.5 2B model (rough estimates):
+- Embeddings: ~16MB
+- Per SSM layer: ~2B params × 2 (SSM + FFN) / n_layers
+- Attention projections: ~same
+- KV cache: standard attention + SSM state
+- Total: ~2.4GB for Q4_K_M
+
+---
+
+### 16. REFERENCES
+
+- llama.cpp repo: https://github.com/ggml-org/llama.cpp
+- Qwen3.5 HF page: https://huggingface.co/Qwen/Qwen3.5-2B
+- Related architectures for cross-reference: Granite Hybrid, Kimi Linear, Mamba2
+

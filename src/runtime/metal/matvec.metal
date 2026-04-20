@@ -891,7 +891,9 @@ kernel void attention_fused_f32(
     constant uint &context_length [[buffer(8)]],
     constant uint &position [[buffer(9)]],
     constant uint &layer_base [[buffer(10)]],
-    constant float &scale [[buffer(11)]],
+    constant uint &window_start [[buffer(11)]],
+    constant float &scale [[buffer(12)]],
+    constant float &softcap [[buffer(13)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -905,7 +907,7 @@ kernel void attention_fused_f32(
     const uint kv_offset = kv_head * head_dim;
     device const float *q_head = q + head * head_dim;
 
-    const uint token_count = position + 1;
+    const uint token_count = position - window_start + 1;
 
     float local_m = -INFINITY;
     float local_l = 0.0f;
@@ -914,7 +916,8 @@ kernel void attention_fused_f32(
         local_out[d] = 0.0f;
     }
 
-    for (uint token = lane; token < token_count; token += threads_per_group) {
+    for (uint token_index = lane; token_index < token_count; token_index += threads_per_group) {
+        const uint token = window_start + token_index;
         device const half *k_head = k_cache + layer_base + token * kv_dim + kv_offset;
         device const half *v_head = v_cache + layer_base + token * kv_dim + kv_offset;
 
@@ -923,6 +926,9 @@ kernel void attention_fused_f32(
             s += q_head[d] * float(k_head[d]);
         }
         s *= scale;
+        if (softcap > 0.0f) {
+            s = tanh(s / softcap) * softcap;
+        }
 
         float m_new = max(local_m, s);
         float exp_diff = exp(local_m - m_new);
@@ -1001,6 +1007,20 @@ kernel void silu_mul_f32(
     gate[index] = (value / (1.0f + exp(-value))) * up[index];
 }
 
+kernel void gelu_mul_f32(
+    device float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    const float value = gate[index];
+    const float sqrt_2_over_pi = 0.7978845608028654f;
+    const float cubic = value * value * value;
+    const float gelu = 0.5f * value * (1.0f + tanh(sqrt_2_over_pi * (value + 0.044715f * cubic)));
+    gate[index] = gelu * up[index];
+}
+
 kernel void add_in_place_f32(
     device float *dst [[buffer(0)]],
     device const float *src [[buffer(1)]],
@@ -1017,6 +1037,7 @@ kernel void rms_norm_f32(
     device float *output [[buffer(2)]],
     constant uint &count [[buffer(3)]],
     constant float &eps [[buffer(4)]],
+    constant float &weight_offset [[buffer(5)]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -1047,7 +1068,7 @@ kernel void rms_norm_f32(
 
     const float scale = partial_sums[0];
     for (uint index = lane; index < count; index += threads_per_group) {
-        output[index] = input[index] * scale * weights[index];
+        output[index] = input[index] * scale * (weights[index] + weight_offset);
     }
 }
 
@@ -1058,6 +1079,7 @@ kernel void rms_norm_per_head_f32(
     constant uint &head_count [[buffer(3)]],
     constant uint &head_dim [[buffer(4)]],
     constant float &eps [[buffer(5)]],
+    constant float &weight_offset [[buffer(6)]],
     uint head [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -1095,7 +1117,7 @@ kernel void rms_norm_per_head_f32(
 
     const float scale = partial_sums[0];
     for (uint i = lane; i < head_dim; i += threads_per_group) {
-        h_out[i] = h_in[i] * scale * h_w[i];
+        h_out[i] = h_in[i] * scale * (h_w[i] + weight_offset);
     }
 }
 
@@ -1644,7 +1666,8 @@ kernel void batch_rms_norm_f32(
     device float *output [[buffer(2)]],
     constant uint &count [[buffer(3)]],
     constant float &eps [[buffer(4)]],
-    constant uint &batch_idx [[buffer(5)]],
+    constant float &weight_offset [[buffer(5)]],
+    constant uint &batch_idx [[buffer(6)]],
     uint lane [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -1677,7 +1700,7 @@ kernel void batch_rms_norm_f32(
 
     const float scale = partial_sums[0];
     for (uint index = lane; index < count; index += threads_per_group) {
-        batch_output[index] = batch_input[index] * scale * weights[index];
+        batch_output[index] = batch_input[index] * scale * (weights[index] + weight_offset);
     }
 }
 

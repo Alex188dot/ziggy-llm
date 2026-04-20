@@ -93,7 +93,7 @@ pub fn trimAssistantReply(reply: []const u8) []const u8 {
         offset += line.len + 1;
     }
 
-    const markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" };
+    const markers = [_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>", "<start_of_turn>", "<end_of_turn>" };
     for (markers) |marker| {
         if (std.mem.indexOf(u8, reply[0..end], marker)) |index| {
             end = @min(end, index);
@@ -111,7 +111,7 @@ pub fn hasCompletedAssistantReply(reply: []const u8) bool {
         offset += line.len + 1;
     }
 
-    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>" }) |marker| {
+    for ([_][]const u8{ "</s>", "<|user|>", "<|assistant|>", "<|system|>", "<user|>", "<assistant|>", "<system|>", "<|im_end|>", "<|im_start|>", "<start_of_turn>", "<end_of_turn>" }) |marker| {
         if (std.mem.indexOf(u8, reply, marker) != null) return true;
     }
     return false;
@@ -124,6 +124,8 @@ fn isDialogueBoundary(line: []const u8) bool {
         "<|im_start|>user",
         "<|im_start|>assistant",
         "<|im_start|>system",
+        "<start_of_turn>user",
+        "<start_of_turn>model",
         "<|user|>",
         "<|assistant|>",
         "<|system|>",
@@ -227,6 +229,46 @@ fn renderConversation(
             }
             try writer.print("<|im_start|>assistant\n", .{});
         },
+        .gemma => {
+            try writer.print("<bos>", .{});
+
+            var first_user_emitted = false;
+            for (messages) |message| {
+                switch (message.role) {
+                    .system => {},
+                    .user => {
+                        if (!first_user_emitted and system_messages.len > 0) {
+                            try writer.print("<start_of_turn>user\n", .{});
+                            for (system_messages, 0..) |system_msg, index| {
+                                if (index > 0) try writer.print("\n\n", .{});
+                                try writer.print("{s}", .{system_msg.content});
+                            }
+                            if (message.content.len > 0) {
+                                try writer.print("\n\n{s}", .{message.content});
+                            }
+                            try writer.print("<end_of_turn>\n", .{});
+                            first_user_emitted = true;
+                            continue;
+                        }
+
+                        try writer.print("<start_of_turn>user\n{s}<end_of_turn>\n", .{message.content});
+                        first_user_emitted = true;
+                    },
+                    .assistant => try writer.print("<start_of_turn>model\n{s}<end_of_turn>\n", .{message.content}),
+                }
+            }
+
+            if (!first_user_emitted and system_messages.len > 0) {
+                try writer.print("<start_of_turn>user\n", .{});
+                for (system_messages, 0..) |message, index| {
+                    if (index > 0) try writer.print("\n\n", .{});
+                    try writer.print("{s}", .{message.content});
+                }
+                try writer.print("<end_of_turn>\n", .{});
+            }
+
+            try writer.print("<start_of_turn>model\n", .{});
+        },
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -281,6 +323,13 @@ fn countRenderedMessageTokens(
             };
             break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, content });
         },
+        .gemma => blk: {
+            const tag = switch (role) {
+                .system, .user => "user",
+                .assistant => "model",
+            };
+            break :blk try std.fmt.allocPrint(std.heap.page_allocator, "<start_of_turn>{s}\n{s}<end_of_turn>\n", .{ tag, content });
+        },
     };
     defer std.heap.page_allocator.free(snippet);
     return runtime_cache.promptTokenCount(model_path, snippet, backend);
@@ -291,6 +340,7 @@ fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system
         .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
         .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
         .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
+        .gemma => if (include_default_system) "<bos><start_of_turn>user\n" ++ system_message ++ "<end_of_turn>\n<start_of_turn>model\n" else "<bos><start_of_turn>model\n",
     };
 }
 
