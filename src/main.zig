@@ -1,11 +1,13 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
-const update = @import("update.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        const status = gpa.deinit();
+        if (status == .leak) std.debug.panic("memory leak detected", .{});
+    }
     const allocator = gpa.allocator();
 
     const args = try std.process.argsAlloc(allocator);
@@ -14,7 +16,8 @@ pub fn main() !void {
     const config = try cli.parseArgs(args);
 
     if (config.command != .help and config.command != .version and config.command != .update) {
-        // update.checkForUpdates(allocator);
+        // Automatic update checks are intentionally disabled until the CLI has a
+        // clear non-interactive policy for background network activity.
     }
 
     var stdout_buffer: [4096]u8 = undefined;

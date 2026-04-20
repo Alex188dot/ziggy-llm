@@ -5,3 +5,5 @@ zig-out/
 models
 AGENTS.md
 docs/experiments
+.tmp_*.zig
+new.zig
