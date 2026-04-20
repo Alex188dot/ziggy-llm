@@ -144,7 +144,7 @@ Autoregressive generation requires previous token's output to generate next toke
 
 - Commit asynchronously and continue CPU work
 - Overlap commit wait with next token's CPU-side work
-- Complexity: High (requires careful synchronization)
+- Complexity: Very High (requires major architectural changes)
 - Expected improvement: 30-50% reduction in perceived latency
 
 **Option C: Batch Layer Operations Within Single Token**
@@ -157,6 +157,34 @@ Autoregressive generation requires previous token's output to generate next toke
 #### Recommended Approach
 
 Start with Option A (Speculative Decoding) since it's already partially implemented and uses existing batch kernels.
+
+---
+
+### Phase 3B: Async Commit with CPU-GPU Overlap - FAILED
+
+#### Attempt
+
+Implemented async commit mechanism in Metal bridge:
+
+- Added `ziggy_commit_async` to commit without waiting
+- Added `ziggy_wait_for_completion` to wait when needed
+- Added C API functions and Zig wrappers
+- Attempted to use in runtime for prompt token processing
+
+#### Results
+
+**FAILED** - Encountered "Metal sequence already active" error when trying to begin new sequence while previous async commit was still pending.
+
+**Root Cause**: The current architecture processes tokens sequentially with each token depending on the previous token's hidden state. The Metal command buffer system doesn't support multiple concurrent sequences in the current design. To achieve true CPU-GPU overlap, would require:
+
+1. Restructuring the generation loop to interleave CPU work with GPU execution
+2. Decoupling token encoding from commit
+3. Careful synchronization to ensure dependencies are respected
+4. Major architectural changes to the token generation pipeline
+
+**Complexity**: Very high - requires fundamental restructuring of the inference pipeline, not just adding async calls.
+
+**Conclusion**: Async commit with CPU-GPU overlap is not feasible without major architectural refactoring that doesn't meet the "efficiency evidence + no regressions" requirement.
 
 ---
 
