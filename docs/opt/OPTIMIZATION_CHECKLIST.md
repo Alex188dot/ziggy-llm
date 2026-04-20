@@ -156,12 +156,31 @@ This document contains all identified optimization opportunities organized by pr
 
 ## Section 5: Max TPS (Tokens Per Second) Optimization
 
-**DEFERRED** - Requires significant architectural changes. commit_wait bottleneck (7-8ms per token) is 70-80x larger than shader compute time. Batch kernels exist in Metal bridge but are not integrated into Zig runtime. Addressing this would require:
+**SKIPPED** - Requires major architectural refactoring. commit_wait bottleneck (7-8ms per token) is 70-80x larger than shader compute time. All attempted approaches failed:
 
-1. Redesigning the commit pattern to batch operations
-2. Integrating existing batch kernels (batchMatvecAdd, batchSiluMul, etc.) into runtime
-3. Extensive testing to ensure correctness
-4. Cannot meet "efficiency evidence + no regressions" requirement without major refactoring.
+### Phase 2: Prompt Token Batching - FAILED
+
+- Only affects initial prompt processing via `runPrompt()`, not generation loop
+- Generation loop uses different path that still commits after each token
+- Benchmarking showed no reduction in commit count
+- Root cause: commit_wait bottleneck is in generation path, not prompt processing
+
+### Phase 3B: Async Commit with CPU-GPU Overlap - FAILED
+
+- Implemented async commit mechanism in Metal bridge
+- Encountered "Metal sequence already active" error
+- Root cause: Current architecture processes tokens sequentially with dependencies
+- Metal command buffer system doesn't support multiple concurrent sequences
+- Requires fundamental restructuring of inference pipeline
+
+### Phase 1: Batch Kernel Integration - NOT ATTEMPTED
+
+- Batch kernels exist (batchSiluMul, batchAddInPlace, batchRmsNorm)
+- Current architecture processes one token at a time through layers sequentially
+- To use batch kernels effectively would require restructuring similar to Phase 2
+- Would not address the dominant commit_wait bottleneck
+
+**Conclusion**: Section 5 requires major architectural refactoring that doesn't meet the "efficiency evidence + no regressions" requirement. The commit_wait bottleneck is fundamental to the current synchronous token-by-token design.
 
 ### Profiling-Driven Optimization
 
