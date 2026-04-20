@@ -23,9 +23,10 @@ We benchmark honestly and optimize ruthlessly for single-user, local text genera
 | ------------------ | ------ | ----------------- | ------------ | ----------------- |
 | **TinyLlama 1.1B** | Q4_K_M | ~123 tok/s        | —            | 151.4 tok/s       |
 | **Llama 3.2 3B**   | Q4_K_M | ~48 tok/s         | —            | 53.5 tok/s        |
-| **Llama 3.1 8B**   | Q4_K_M | ~18.9 tok/s       | ~10 tok/s    | 23.1 tok/s        |
+| **Llama 3.1 8B**   | Q4_K_M | ~22.4 tok/s       | ~10 tok/s    | 23.1 tok/s        |
 | **Mistral 7B**     | Q4_K_M | ~20 tok/s         | —            | 28.0 tok/s        |
 | **Ministral 3B**   | Q4_K_M | ~45.5 tok/s       | —            | 43.7 tok/s        |
+| **Gemma 2 2B**     | Q4_K_M | ~48 tok/s         | —            | —                 |
 | **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
 | **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
 
@@ -99,7 +100,7 @@ Update:
 
 ## Supported Models & Quants 🧠
 
-Our goal is to support a deliberately narrow, highly-optimized matrix of popular models. Currently, we focus on the Qwen (2, 3), LLaMA (3.1, 3.2, TinyLlama), Mistral (and Ministral), and Gemma architectures (coming soon). 🎯
+Our goal is to support a deliberately narrow, highly-optimized matrix of popular models. Currently, we focus on the Qwen (2, 3), LLaMA (3.1, 3.2, TinyLlama), Mistral (and Ministral) and Gemma architectures (Gemma 2 and 3 for now, Gemma 4 coming soon). 🎯
 
 For quantizations, we recommend our specialized MoonQuant targets: `Q4_K_M`, `Q6_K`, and `Q8_0`. We also fully support `F16` and `F32` formats as reference paths. 📉
 
@@ -115,22 +116,9 @@ zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --
 zig build run -- bench -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
 ```
 
-Right now, `inspect`, `run`, and `bench` are native Zig code. `chat` and `serve` are still scaffold commands.
+Right now, `inspect`, `run`, `chat` and `bench` are native Zig code. `serve` is still a scaffold command.
 
 `--backend auto` is the default. On Apple Silicon builds with Metal enabled, the `llama` path will use Metal when it can initialize and fall back to CPU otherwise.
-
-## GGUF Support
-
-`ziggy-llm inspect` currently supports:
-
-- architecture
-- tensor count
-- metadata count
-- file alignment
-- GGUF file-type quantization when present
-- dominant tensor type across the tensor table
-- tokenizer model and pre-tokenizer metadata when present
-- tokenizer token count and common special-token ids when present
 
 ## Planned HTTP API 🔌
 
@@ -149,7 +137,7 @@ The API exists to make testing and integration easy. It should not drag the proj
 ziggy-llm is open source and in active development, and we would love your help to make it even better. Check out our issue tracker for things that need immediate attention: 🏗️
 
 - [ ] Implement OpenAI compatible server
-- [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants), Gemma and Mistral model families
+- [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants) and Gemma 4
 - [ ] Make chat more robust
 - [ ] Test all quants (currently tested only Q4_K_M)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance

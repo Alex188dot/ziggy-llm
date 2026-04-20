@@ -359,6 +359,7 @@ Current implementation note:
 | ---------- | --------------------------------------------------- | ------------------- | ------- | ------------------------------ | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
 | 2026-04-18 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |   1746.644 |   388.895 | 2136.813 |     43.890 |
 | 2026-04-18 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits  | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |      0.003 |   348.031 |  349.321 |     44.060 |
+| 2026-04-19 | Cold `chat`, `temp 0`, CPU logits                  | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            11 |              128 |   3405.411 |   949.786 | 4355.360 |     47.960 |
 
 ## Benchmark Table — Gemma 3 4B
 
