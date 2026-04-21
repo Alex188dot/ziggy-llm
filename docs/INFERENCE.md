@@ -355,14 +355,23 @@ Current implementation note:
 
 ## Benchmark Table — Gemma 2 2B
 
-| Date       | Mode                                                | Machine             | Backend | Model                          | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
-| ---------- | --------------------------------------------------- | ------------------- | ------- | ------------------------------ | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
+| Date       | Mode                                                | Machine             | Backend | Model                       | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
+| ---------- | --------------------------------------------------- | ------------------- | ------- | --------------------------- | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
 | 2026-04-18 | Cold `bench --bench-runs 5`, `temp 0.7`, CPU logits | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |   1746.644 |   388.895 | 2136.813 |     43.890 |
 | 2026-04-18 | Warm avg (`4` reused runs), `temp 0.7`, CPU logits  | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            19 |              128 |      0.003 |   348.031 |  349.321 |     44.060 |
-| 2026-04-19 | Cold `chat`, `temp 0`, CPU logits                  | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            11 |              128 |   3405.411 |   949.786 | 4355.360 |     47.960 |
+| 2026-04-19 | Cold `chat`, `temp 0`, CPU logits                   | MacBook Pro M3 18GB | `metal` | `gemma-2-2b-it-Q4_K_M.gguf` |            11 |              128 |   3405.411 |   949.786 | 4355.360 |     47.960 |
 
 ## Benchmark Table — Gemma 3 4B
 
-| Date       | Mode                                                | Machine             | Backend | Model                            | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
-| ---------- | --------------------------------------------------- | ------------------- | ------- | -------------------------------- | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
-| 2026-04-18 | GPU inference not yet working (InvalidTensorMetadata) | MacBook Pro M3 18GB | `metal` | `gemma-3-4b-it-Q4_K_M.gguf` |           - |              - |         - |         - |       - |          - |
+| Date       | Mode                                                  | Machine             | Backend | Model                       | Prompt tokens | Generated tokens | Startup ms | Prompt ms | TTFT ms | Decode TPS |
+| ---------- | ----------------------------------------------------- | ------------------- | ------- | --------------------------- | ------------: | ---------------: | ---------: | --------: | ------: | ---------: |
+| 2026-04-18 | GPU inference not yet working (InvalidTensorMetadata) | MacBook Pro M3 18GB | `metal` | `gemma-3-4b-it-Q4_K_M.gguf` |             - |                - |          - |         - |       - |          - |
+
+## Benchmark Table — Qwen3.5 2B
+
+| Date       | Mode                                                      | Machine             | Backend | Model                    | Prompt tokens | Generated tokens | Startup ms | Prompt ms |  TTFT ms | Decode TPS |
+| ---------- | --------------------------------------------------------- | ------------------- | ------- | ------------------------ | ------------: | ---------------: | ---------: | --------: | -------: | ---------: |
+| 2026-04-21 | Cold `bench --bench-runs 10`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2660.378 | 2660.378 |     48.489 |
+| 2026-04-21 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2691.854 | 2691.854 |     47.922 |
+| 2026-04-21 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2635.272 | 2635.272 |     48.951 |
+| 2026-04-21 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2640.460 | 2640.460 |     48.855 |
