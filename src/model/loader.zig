@@ -1245,7 +1245,7 @@ const Session = struct {
             for (window_start..self.position + 1) |token_index| {
                 const k_base = layer_base + token_index * self.model.kv_dimension + kv_offset;
                 const k_head = self.k_cache[k_base..][0..head_dim];
-                self.scores[token_index - window_start] = dot(q_head, k_head) * scale;
+                self.scores[token_index - window_start] = dotSimd(q_head, k_head) * scale;
             }
             if (self.model.attn_logit_softcapping) |cap| applySoftcapInPlace(self.scores[0..token_count], cap);
             softmaxInPlace(self.scores[0..token_count]);
@@ -1781,6 +1781,7 @@ pub fn generateLoadedStreaming(
     const gpu_greedy = sampling_path == .gpu_greedy_argmax;
     const gpu_topk = sampling_path == .gpu_topk_sampler;
     const gpu_shortlist = sampling_path == .gpu_shortlist_cpu_sampler;
+    const needs_sample_timing = profiler.enabled;
     var greedy_next_token: ?u32 = if (gpu_greedy) (session.pending_greedy_token orelse argmax(session.logits)) else null;
     const max_draft_len = 3;
     var accepted_tokens: [max_draft_len + 1]u32 = undefined;
@@ -1791,7 +1792,7 @@ pub fn generateLoadedStreaming(
         const next_token = if (gpu_greedy or gpu_topk) blk: {
             break :blk greedy_next_token.?;
         } else if (gpu_shortlist) blk: {
-            const sample_begin = std.time.nanoTimestamp();
+            const sample_begin = if (needs_sample_timing) std.time.nanoTimestamp() else 0;
             const sampled = sampling.sampleShortlist(
                 session.pending_shortlist[0..session.pending_shortlist_len],
                 session.token_buffer[0..session.position],
@@ -1799,12 +1800,12 @@ pub fn generateLoadedStreaming(
                 random,
                 sample_candidates,
             );
-            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            if (needs_sample_timing) profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         } else blk: {
-            const sample_begin = std.time.nanoTimestamp();
+            const sample_begin = if (needs_sample_timing) std.time.nanoTimestamp() else 0;
             const sampled = sampling.sampleToken(session.logits, session.token_buffer[0..session.position], options, random, sample_candidates);
-            profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
+            if (needs_sample_timing) profiler.record(.cpu_sampling, runtime_types.deltaNs(sample_begin, std.time.nanoTimestamp()));
             break :blk sampled;
         };
 
@@ -1831,7 +1832,8 @@ pub fn generateLoadedStreaming(
             ttft_ns = deltaNs(startup_begin, std.time.nanoTimestamp());
         }
 
-        const step_begin = std.time.nanoTimestamp();
+        const needs_step_timing = generated_token_count == 0;
+        const step_begin = if (needs_step_timing) std.time.nanoTimestamp() else 0;
         if (gpu_greedy) {
             const draft_tokens = session.findDraftTokens(next_token, max_draft_len);
             if (draft_tokens.len > 0) {
@@ -1901,7 +1903,7 @@ pub fn generateLoadedStreaming(
             _ = try session.step(next_token);
         }
 
-        if (generated_token_count == 0) {
+        if (needs_step_timing) {
             first_decode_step_ns = deltaNs(step_begin, std.time.nanoTimestamp());
         }
         profiler.endDecodeToken();
@@ -2945,10 +2947,22 @@ fn rmsNorm(out: []f32, input: []const f32, model: *const Model, tensor: TensorRe
 pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_len: usize) !void {
     switch (tensor_type) {
         .f32 => {
-            for (0..row_len) |index| out[index] = readF32(row[index * 4 ..][0..4]);
+            var index: usize = 0;
+            while (index + simd_lane_count <= row_len) : (index += simd_lane_count) {
+                @as(*[simd_lane_count]f32, @ptrCast(out[index..])).* = loadF32Vec(row[index * 4 ..][0 .. simd_lane_count * 4]);
+            }
+            while (index < row_len) : (index += 1) {
+                out[index] = readF32(row[index * 4 ..][0..4]);
+            }
         },
         .f16 => {
-            for (0..row_len) |index| out[index] = readF16AsF32(row[index * 2 ..][0..2]);
+            var index: usize = 0;
+            while (index + simd_lane_count <= row_len) : (index += simd_lane_count) {
+                @as(*[simd_lane_count]f32, @ptrCast(out[index..])).* = loadF16Vec(row[index * 2 ..][0 .. simd_lane_count * 2]);
+            }
+            while (index < row_len) : (index += 1) {
+                out[index] = readF16AsF32(row[index * 2 ..][0..2]);
+            }
         },
         .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
@@ -3436,6 +3450,10 @@ fn loadQ6Q4Vec(ql: []const u8, qh: []const u8, base: usize) F32x {
 }
 
 fn dot(a: []const f32, b: []const f32) f32 {
+    return dotSimd(a, b);
+}
+
+fn dotSimd(a: []const f32, b: []const f32) f32 {
     var acc = zeroSimd();
     var index: usize = 0;
     while (index + simd_lane_count <= a.len) : (index += simd_lane_count) {
