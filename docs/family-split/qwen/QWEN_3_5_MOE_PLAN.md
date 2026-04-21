@@ -56,12 +56,12 @@ Route Qwen 3.5 MoE GGUFs into the correct family handler.
 
 ### Tasks
 
-- update `detectModelFamily()` to recognize `qwen35moe`
-- keep support for existing `qwen2_moe` / `qwen3_moe` aliases if they are still encountered
-- add tests for:
-  - `qwen35moe`
-  - `qwen2_moe`
-  - `qwen3_moe`
+- [ ] update `detectModelFamily()` to recognize `qwen35moe`
+- [ ] keep support for existing `qwen2_moe` / `qwen3_moe` aliases if they are still encountered
+- [ ] add tests for:
+  - [ ] `qwen35moe`
+  - [ ] `qwen2_moe`
+  - [ ] `qwen3_moe`
 
 ### Acceptance Criteria
 
@@ -80,18 +80,18 @@ Extend the model loader to represent Qwen 3.5 MoE layer structure explicitly.
 
 ### Tasks
 
-- define MoE-specific layer structures in the model representation
-- add metadata fields required for MoE, including:
-  - expert feed-forward length
-  - expert count
-  - experts-per-token / active expert count if present in GGUF metadata
-  - gating function metadata if present
-- add parsing for MoE tensors such as:
-  - router / gate input weights
-  - expert `ffn_up` tensors
-  - expert `ffn_down` tensors
-  - any shared-expert tensors if present in the target GGUF layout
-- preserve existing dense Qwen 3.5 handling without regression
+- [ ] define MoE-specific layer structures in the model representation
+- [ ] add metadata fields required for MoE, including:
+  - [ ] expert feed-forward length
+  - [ ] expert count
+  - [ ] experts-per-token / active expert count if present in GGUF metadata
+  - [ ] gating function metadata if present
+- [ ] add parsing for MoE tensors such as:
+  - [ ] router / gate input weights
+  - [ ] expert `ffn_up` tensors
+  - [ ] expert `ffn_down` tensors
+  - [ ] any shared-expert tensors if present in the target GGUF layout
+- [ ] preserve existing dense Qwen 3.5 handling without regression
 
 ### Notes
 
@@ -128,15 +128,15 @@ Implement a correct CPU inference path for Qwen 3.5 MoE.
 
 ### Tasks
 
-- replace the placeholder runtime with a real generation path
-- implement router evaluation for each token
-- implement top-k expert selection
-- implement expert weight normalization according to the GGUF metadata / architecture behavior
-- implement expert FFN evaluation:
-  - evaluate selected experts only
-  - combine outputs with routing weights
-- integrate the MoE layer path into the existing token generation loop
-- document and isolate any assumptions that are specific to Qwen 3.5 MoE
+- [ ] replace the placeholder runtime with a real generation path
+- [ ] implement router evaluation for each token
+- [ ] implement top-k expert selection
+- [ ] implement expert weight normalization according to the GGUF metadata / architecture behavior
+- [ ] implement expert FFN evaluation:
+  - [ ] evaluate selected experts only
+  - [ ] combine outputs with routing weights
+- [ ] integrate the MoE layer path into the existing token generation loop
+- [ ] document and isolate any assumptions that are specific to Qwen 3.5 MoE
 
 ### Recommended Module Split
 
@@ -175,11 +175,11 @@ Add the first quantization set required by this plan:
 
 ### Tasks
 
-- implement `dequantizeRowQ2K()`
-- implement `dequantizeRowQ3K()`
-- wire both into `dequantizeRow()`
-- verify `tensorRowByteSize()` and layout handling match the actual block definitions already encoded in the loader and GGUF inspector
-- extend fixtures/tests so `Q2_K` and `Q3_K` tensors can be parsed and dequantized
+- [ ] implement `dequantizeRowQ2K()`
+- [ ] implement `dequantizeRowQ3K()`
+- [ ] wire both into `dequantizeRow()`
+- [ ] verify `tensorRowByteSize()` and layout handling match the actual block definitions already encoded in the loader and GGUF inspector
+- [ ] extend fixtures/tests so `Q2_K` and `Q3_K` tensors can be parsed and dequantized
 
 ### Why This Quant Set First
 
@@ -208,10 +208,10 @@ Avoid forcing `Q2_K` and `Q3_K` tensors through dense `f32` expansion during Met
 
 ### Tasks
 
-- extend raw quantized tensor handling to include `q2_k`
-- extend raw quantized tensor handling to include `q3_k`
-- ensure prewarm/caching logic treats the new raw quantized tensor types consistently
-- add tests or validation hooks showing the tensor store preserves raw quantized bytes for the initial target quant formats
+- [ ] extend raw quantized tensor handling to include `q2_k`
+- [ ] extend raw quantized tensor handling to include `q3_k`
+- [ ] ensure prewarm/caching logic treats the new raw quantized tensor types consistently
+- [ ] add tests or validation hooks showing the tensor store preserves raw quantized bytes for the initial target quant formats
 
 ### Notes
 
@@ -241,11 +241,11 @@ Advertise realistic family capabilities and fail clearly when unsupported combin
 
 ### Tasks
 
-- update `supported_quant_types` to include the initial quant targets once implemented
-- enable CPU capability once the CPU path is working
-- enable Metal capability only after the raw quant upload path is working
-- return precise unsupported-quant errors for formats outside the initial matrix
-- return precise missing-feature errors if optional MoE behaviors are encountered but not implemented yet
+- [ ] update `supported_quant_types` to include the initial quant targets once implemented
+- [ ] enable CPU capability once the CPU path is working
+- [ ] enable Metal capability only after the raw quant upload path is working
+- [ ] return precise unsupported-quant errors for formats outside the initial matrix
+- [ ] return precise missing-feature errors if optional MoE behaviors are encountered but not implemented yet
 
 ### Acceptance Criteria
 
@@ -269,12 +269,12 @@ Validate correctness before widening support.
 
 ### Minimum Validation Cases
 
-1. family detection for `qwen35moe`
-2. model load for a Qwen 3.5 MoE GGUF
-3. `Q2_K` tensor dequant fixture
-4. `Q3_K` tensor dequant fixture
-5. CPU single-prompt generation
-6. Metal startup / tensor prewarm without dense fallback for Q2/Q3
+- [ ] family detection for `qwen35moe`
+- [ ] model load for a Qwen 3.5 MoE GGUF
+- [ ] `Q2_K` tensor dequant fixture
+- [ ] `Q3_K` tensor dequant fixture
+- [ ] CPU single-prompt generation
+- [ ] Metal startup / tensor prewarm without dense fallback for Q2/Q3
 
 ### Acceptance Criteria
 
@@ -295,10 +295,10 @@ Document the exact initial support boundary.
 
 ### Tasks
 
-- document that initial Qwen 3.5 MoE support targets `Q2_K` and `Q3_K`
-- document any explicitly unsupported formats
-- document backend capability status
-- add example commands for inspect and run once support exists
+- [ ] document that initial Qwen 3.5 MoE support targets `Q2_K` and `Q3_K`
+- [ ] document any explicitly unsupported formats
+- [ ] document backend capability status
+- [ ] add example commands for inspect and run once support exists
 
 ### Acceptance Criteria
 
@@ -319,10 +319,10 @@ Reduce KV cache footprint after the initial model path is stable.
 
 ### Tasks
 
-- add KV cache quantization support behind an explicit option
-- keep the feature independent from weight quantization support
-- validate correctness against the unquantized KV cache path
-- document tradeoffs and supported modes
+- [ ] add KV cache quantization support behind an explicit option
+- [ ] keep the feature independent from weight quantization support
+- [ ] validate correctness against the unquantized KV cache path
+- [ ] document tradeoffs and supported modes
 
 ### Notes
 
@@ -344,9 +344,9 @@ KV cache quantization should be treated as a follow-on optimization. It is not a
 
 Qwen 3.5 MoE support is considered initially implemented when all of the following are true:
 
-- `qwen35moe` routes to the Qwen 3.5 MoE family
-- a Qwen 3.5 MoE GGUF loads successfully
-- CPU generation works
-- `Q2_K` and `Q3_K` are supported end-to-end
-- Metal tensor preparation supports the initial quant targets without forced dense expansion
-- documentation clearly states the initial support matrix
+- [ ] `qwen35moe` routes to the Qwen 3.5 MoE family
+- [ ] a Qwen 3.5 MoE GGUF loads successfully
+- [ ] CPU generation works
+- [ ] `Q2_K` and `Q3_K` are supported end-to-end
+- [ ] Metal tensor preparation supports the initial quant targets without forced dense expansion
+- [ ] documentation clearly states the initial support matrix
