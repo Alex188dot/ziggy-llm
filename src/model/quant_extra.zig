@@ -295,3 +295,24 @@ fn readF16AsF32(bytes: []const u8) f32 {
     const raw = std.mem.readInt(u16, bytes[0..2], .little);
     return @as(f32, @floatCast(@as(f16, @bitCast(raw))));
 }
+
+test "q3_k zero block dequantizes to zeros" {
+    var out: [qk_k]f32 = undefined;
+    const row = [_]u8{0} ** q3_k_block_size;
+    try dequantizeRowQ3K(&out, &row, qk_k);
+    for (out) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}
+
+test "iq3_xxs zero block dequantizes to zeros" {
+    var out: [qk_k]f32 = undefined;
+    const row = [_]u8{0} ** iq3_xxs_block_size;
+    try dequantizeRowIQ3XXS(&out, &row, qk_k);
+    for (out) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}
+
+test "iq4_xs zero block dequantizes to zeros" {
+    var out: [qk_k]f32 = undefined;
+    const row = [_]u8{0} ** iq4_xs_block_size;
+    try dequantizeRowIQ4XS(&out, &row, qk_k);
+    for (out) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}

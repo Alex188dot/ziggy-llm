@@ -216,9 +216,11 @@ Avoid forcing `Q3_K` tensors through dense `f32` expansion during Metal preparat
 
 ### Tasks
 
-- [ ] extend raw quantized tensor handling to include `q3_k`
-- [ ] ensure prewarm/caching logic treats the new raw quantized tensor types consistently
-- [ ] add tests or validation hooks showing the tensor store preserves raw quantized bytes for the initial target quant formats
+- [x] extend raw quantized tensor handling to include `q3_k`
+- [x] extend raw quantized tensor handling to include `iq3_xxs`
+- [x] extend raw quantized tensor handling to include `iq4_xs`
+- [x] ensure prewarm/caching logic treats the new raw quantized tensor types consistently
+- [x] add tests or validation hooks showing the tensor store preserves raw quantized bytes for the initial target quant formats
 
 ### Notes
 
@@ -248,11 +250,11 @@ Advertise realistic family capabilities and fail clearly when unsupported combin
 
 ### Tasks
 
-- [ ] update `supported_quant_types` to include the initial quant targets once implemented
-- [ ] enable CPU capability once the CPU path is working
-- [ ] enable Metal capability only after the raw quant upload path is working
-- [ ] return precise unsupported-quant errors for formats outside the initial matrix
-- [ ] return precise missing-feature errors if optional MoE behaviors are encountered but not implemented yet
+- [x] update `supported_quant_types` to include the initial quant targets once implemented
+- [x] enable CPU capability once the CPU path is working
+- [x] keep Metal runtime capability disabled until the Qwen 3.5 MoE execution path is implemented
+- [x] return precise unsupported backend errors for the current runtime boundary
+- [x] return precise missing-feature errors if optional MoE behaviors are encountered but not implemented yet
 
 ### Acceptance Criteria
 
@@ -276,11 +278,11 @@ Validate correctness before widening support.
 
 ### Minimum Validation Cases
 
-- [ ] family detection for `qwen35moe`
-- [ ] model load for a Qwen 3.5 MoE GGUF
-- [ ] `Q3_K` tensor dequant fixture
-- [ ] CPU single-prompt generation
-- [ ] Metal startup / tensor prewarm without dense fallback for Q3
+- [x] family detection for `qwen35moe`
+- [x] model load for a Qwen 3.5 MoE GGUF
+- [x] `Q3_K` tensor dequant fixture
+- [x] CPU single-prompt generation
+- [x] Metal startup / tensor prewarm planning without dense fallback for the initial quant targets
 
 ### Acceptance Criteria
 
@@ -301,10 +303,11 @@ Document the exact initial support boundary.
 
 ### Tasks
 
-- [ ] document that initial Qwen 3.5 MoE support targets `Q3_K`
-- [ ] document any explicitly unsupported formats
-- [ ] document backend capability status
-- [ ] add example commands for inspect and run once support exists
+- [x] document that initial Qwen 3.5 MoE support targets `Q3_K`
+- [x] document that initial Qwen 3.5 MoE support also covers `IQ3_XXS` and `IQ4_XS`
+- [x] document any explicitly unsupported formats
+- [x] document backend capability status
+- [x] add example commands for inspect and run once support exists
 
 ### Acceptance Criteria
 
@@ -350,9 +353,9 @@ KV cache quantization should be treated as a follow-on optimization. It is not a
 
 Qwen 3.5 MoE support is considered initially implemented when all of the following are true:
 
-- [ ] `qwen35moe` routes to the Qwen 3.5 MoE family
-- [ ] a Qwen 3.5 MoE GGUF loads successfully
-- [ ] CPU generation works
-- [ ] `Q3_K` is supported end-to-end
-- [ ] Metal tensor preparation supports the initial quant targets without forced dense expansion
-- [ ] documentation clearly states the initial support matrix
+- [x] `qwen35moe` routes to the Qwen 3.5 MoE family
+- [x] a Qwen 3.5 MoE GGUF loads successfully
+- [x] CPU generation works
+- [x] `Q3_K` is supported end-to-end
+- [x] Metal tensor preparation supports the initial quant targets without forced dense expansion
+- [x] documentation clearly states the initial support matrix

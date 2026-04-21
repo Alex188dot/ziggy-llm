@@ -105,6 +105,13 @@ Our goal is to support a deliberately narrow, highly-optimized matrix of popular
 
 For quantizations, we recommend our specialized MoonQuant targets: `Q4_K_M`, `Q6_K`, and `Q8_0`. We also fully support `F16` and `F32` formats as reference paths. 📉
 
+Initial Qwen 3.5 MoE support is now available with a deliberately narrow boundary:
+
+- runtime: CPU
+- initial GGUF quant targets: `Q3_K`, `IQ3_XXS`, `IQ4_XS`
+- Metal status: tensor preparation supports the initial Qwen 3.5 MoE quant targets, but end-to-end Qwen 3.5 MoE generation remains CPU-only
+- unsupported for this initial slice: broader `IQ*` coverage beyond the listed formats and Qwen 3.5 MoE Metal generation
+
 ## CLI
 
 Current commands:
@@ -115,6 +122,8 @@ zig build run -- inspect -m /path/to/model.gguf
 zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend auto
 zig build run -- run -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
 zig build run -- bench -m /path/to/model.gguf -p "What is the meaning of life?" --max-tokens 8 --seed 7 --backend metal
+zig build run -- inspect -m models/Qwen3.5-35B-A3B-Q3_K_M.gguf
+zig build run -- run -m models/Qwen3.5-35B-A3B-Q3_K_M.gguf -p "Hello" --max-tokens 16 --backend cpu
 ```
 
 Right now, `inspect`, `run`, `chat` and `bench` are native Zig code. `serve` is still a scaffold command.
@@ -138,7 +147,7 @@ The API exists to make testing and integration easy. It should not drag the proj
 ziggy-llm is open source and in active development, and we would love your help to make it even better. Check out our issue tracker for things that need immediate attention: 🏗️
 
 - [ ] Implement OpenAI compatible server
-- [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants) and Gemma 4
+- [ ] Expand Qwen 3.5 MoE beyond the initial CPU-only `Q3_K` / `IQ3_XXS` / `IQ4_XS` support boundary and add Gemma 4
 - [ ] Make chat more robust
 - [ ] Test all quants (currently tested only Q4_K_M and Q6_K)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
