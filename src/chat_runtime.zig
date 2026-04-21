@@ -77,8 +77,9 @@ fn handleUserTurn(
         try writer.flush();
     }
 
-    var stream_state = StreamState.init(allocator, writer);
+    var stream_state = StreamState.init(allocator, writer, shouldStartQwen3InsideThink(model_path, prompt));
     defer stream_state.deinit();
+    try stream_state.begin();
 
     var report = try cache.generateStreaming(model_path, prompt, generationOptions(config, max_tokens), &stream_state, streamChunk);
     defer report.deinit(allocator);
@@ -119,12 +120,18 @@ const StreamState = struct {
     emitted_len: usize = 0,
     stopped: bool = false,
     in_think: bool = false,
+    think_style_active: bool = false,
 
-    fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer) StreamState {
+    fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer, starts_in_think: bool) StreamState {
         return .{
             .allocator = allocator,
             .writer = writer,
+            .in_think = starts_in_think,
         };
+    }
+
+    fn begin(self: *StreamState) !void {
+        if (self.in_think) try self.enterThinkStyle();
     }
 
     fn deinit(self: *StreamState) void {
@@ -172,19 +179,15 @@ const StreamState = struct {
 
     fn flushFinal(self: *StreamState, final_trimmed: []const u8) !void {
         if (final_trimmed.len <= self.emitted_len) {
-            if (self.in_think) {
-                try self.writer.print("\x1b[0m", .{});
-                try self.writer.flush();
-            }
+            try self.resetStyleIfNeeded();
+            try self.writer.flush();
             return;
         }
 
         const chunk = final_trimmed[self.emitted_len..];
         try self.printChunk(chunk);
 
-        if (self.in_think) {
-            try self.writer.print("\x1b[0m", .{});
-        }
+        try self.resetStyleIfNeeded();
         try self.writer.flush();
         self.emitted_len = final_trimmed.len;
     }
@@ -198,7 +201,7 @@ const StreamState = struct {
             if (!self.in_think) {
                 if (std.mem.startsWith(u8, chunk[i..], think_tag)) {
                     self.in_think = true;
-                    try self.writer.print("\x1b[3m\x1b[90m", .{});
+                    try self.enterThinkStyle();
                     i += think_tag.len;
                     if (i < chunk.len and chunk[i] == '\n') i += 1;
                 } else {
@@ -208,7 +211,7 @@ const StreamState = struct {
             } else {
                 if (std.mem.startsWith(u8, chunk[i..], end_think_tag)) {
                     self.in_think = false;
-                    try self.writer.print("\x1b[0m", .{});
+                    try self.resetStyleIfNeeded();
                     i += end_think_tag.len;
                     if (i < chunk.len and chunk[i] == '\n') i += 1;
                 } else {
@@ -218,7 +221,34 @@ const StreamState = struct {
             }
         }
     }
+
+    fn enterThinkStyle(self: *StreamState) !void {
+        if (self.think_style_active) return;
+        try self.writer.print("\x1b[3m\x1b[90m", .{});
+        self.think_style_active = true;
+    }
+
+    fn resetStyleIfNeeded(self: *StreamState) !void {
+        if (!self.think_style_active) return;
+        try self.writer.print("\x1b[0m", .{});
+        self.think_style_active = false;
+    }
 };
+
+fn shouldStartQwen3InsideThink(model_path: []const u8, prompt: []const u8) bool {
+    if (!std.mem.endsWith(u8, prompt, "<think>\n")) return false;
+    return isQwen3ModelPath(model_path) and !isQwen35ModelPath(model_path);
+}
+
+fn isQwen3ModelPath(model_path: []const u8) bool {
+    return std.mem.indexOf(u8, model_path, "Qwen3-") != null or
+        std.mem.indexOf(u8, model_path, "qwen3-") != null;
+}
+
+fn isQwen35ModelPath(model_path: []const u8) bool {
+    return std.mem.indexOf(u8, model_path, "Qwen3.5") != null or
+        std.mem.indexOf(u8, model_path, "qwen3.5") != null;
+}
 
 fn streamChunk(ctx: ?*anyopaque, chunk: []const u8) anyerror!void {
     const state: *StreamState = @ptrCast(@alignCast(ctx.?));

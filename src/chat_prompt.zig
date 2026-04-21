@@ -391,7 +391,7 @@ test "renderConversation uses chatml markers when GGUF template requests it" {
     const messages = [_]Message{
         .{ .role = .user, .content = @constCast("my name is alessio") },
     };
-    const rendered = try renderConversation(std.testing.allocator, .chatml, &.{}, &messages, false);
+    const rendered = try renderConversation(std.testing.allocator, .chatml, &.{}, &messages, false, false);
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expectEqualStrings(
