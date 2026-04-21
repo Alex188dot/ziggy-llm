@@ -6,7 +6,6 @@ This document defines a staged implementation plan for Qwen 3.5 MoE support in z
 
 Implement end-to-end support for Qwen 3.5 MoE GGUF models with a practical initial quantization matrix:
 
-- `Q2_K`
 - `Q3_K`
 
 Optional later work:
@@ -33,7 +32,7 @@ Current code already contains partial family scaffolding for Qwen 3.5:
 - `src/runtime/families/mod.zig` routes older `qwen2_moe` / `qwen3_moe` names, but not `qwen35moe`
 - `src/model/loader.zig` is structured around dense FFN tensors and does not yet parse MoE expert arrays
 - dequantization currently supports `q8_0`, `q4_k`, `q5_k`, and `q6_k`
-- `Q2_K` and `Q3_K` have row-size metadata, but not runtime dequant support
+- `Q3_K` has row-size metadata, but not runtime dequant support
 - Metal tensor upload currently preserves raw quantized bytes only for `q4_k`, `q6_k`, and `q8_0`
 
 ## Design Principles
@@ -163,7 +162,6 @@ To keep the implementation modular and under file-size limits, split by responsi
 
 Add the first quantization set required by this plan:
 
-- `Q2_K`
 - `Q3_K`
 
 ### Files
@@ -175,15 +173,14 @@ Add the first quantization set required by this plan:
 
 ### Tasks
 
-- [ ] implement `dequantizeRowQ2K()`
 - [ ] implement `dequantizeRowQ3K()`
-- [ ] wire both into `dequantizeRow()`
+- [ ] wire it into `dequantizeRow()`
 - [ ] verify `tensorRowByteSize()` and layout handling match the actual block definitions already encoded in the loader and GGUF inspector
-- [ ] extend fixtures/tests so `Q2_K` and `Q3_K` tensors can be parsed and dequantized
+- [ ] extend fixtures/tests so `Q3_K` tensors can be parsed and dequantized
 
 ### Why This Quant Set First
 
-`Q2_K` and `Q3_K` are the best initial targets because:
+`Q3_K` is the best initial target because:
 
 - they are already modeled in the tensor enum and row-size logic
 - they are standard K-quants rather than more specialized `IQ*` formats
@@ -191,15 +188,14 @@ Add the first quantization set required by this plan:
 
 ### Acceptance Criteria
 
-- loader dequantizes `Q2_K` rows correctly
 - loader dequantizes `Q3_K` rows correctly
-- unit tests cover both formats
+- unit tests cover the format
 
-## Phase 5: Metal Tensor Upload Path for Q2/Q3
+## Phase 5: Metal Tensor Upload Path for Q3
 
 ### Goal
 
-Avoid forcing `Q2_K` and `Q3_K` tensors through dense `f32` expansion during Metal preparation.
+Avoid forcing `Q3_K` tensors through dense `f32` expansion during Metal preparation.
 
 ### Files
 
@@ -208,7 +204,6 @@ Avoid forcing `Q2_K` and `Q3_K` tensors through dense `f32` expansion during Met
 
 ### Tasks
 
-- [ ] extend raw quantized tensor handling to include `q2_k`
 - [ ] extend raw quantized tensor handling to include `q3_k`
 - [ ] ensure prewarm/caching logic treats the new raw quantized tensor types consistently
 - [ ] add tests or validation hooks showing the tensor store preserves raw quantized bytes for the initial target quant formats
@@ -221,11 +216,11 @@ Current Metal tensor preparation treats these as raw quantized tensors:
 - `q6_k`
 - `q8_0`
 
-Everything else is expanded to dense `f32`, which is not the right long-term path for initial Q2/Q3 support.
+Everything else is expanded to dense `f32`, which is not the right long-term path for initial Q3 support.
 
 ### Acceptance Criteria
 
-- `Q2_K` and `Q3_K` tensors are stored in raw quantized form for Metal preparation
+- `Q3_K` tensors are stored in raw quantized form for Metal preparation
 - quantized upload path remains correct for existing `q4_k`, `q6_k`, and `q8_0`
 
 ## Phase 6: Family Capabilities and Error Handling
@@ -271,10 +266,9 @@ Validate correctness before widening support.
 
 - [ ] family detection for `qwen35moe`
 - [ ] model load for a Qwen 3.5 MoE GGUF
-- [ ] `Q2_K` tensor dequant fixture
 - [ ] `Q3_K` tensor dequant fixture
 - [ ] CPU single-prompt generation
-- [ ] Metal startup / tensor prewarm without dense fallback for Q2/Q3
+- [ ] Metal startup / tensor prewarm without dense fallback for Q3
 
 ### Acceptance Criteria
 
@@ -295,7 +289,7 @@ Document the exact initial support boundary.
 
 ### Tasks
 
-- [ ] document that initial Qwen 3.5 MoE support targets `Q2_K` and `Q3_K`
+- [ ] document that initial Qwen 3.5 MoE support targets `Q3_K`
 - [ ] document any explicitly unsupported formats
 - [ ] document backend capability status
 - [ ] add example commands for inspect and run once support exists
@@ -334,7 +328,7 @@ KV cache quantization should be treated as a follow-on optimization. It is not a
 2. Phase 2: Model representation for MoE
 3. Phase 3: CPU MoE execution
 4. Phase 4: Initial quantization support
-5. Phase 5: Metal tensor upload path for Q2/Q3
+5. Phase 5: Metal tensor upload path for Q3
 6. Phase 6: Family capabilities and error handling
 7. Phase 7: Validation matrix
 8. Phase 8: Documentation update
@@ -347,6 +341,6 @@ Qwen 3.5 MoE support is considered initially implemented when all of the followi
 - [ ] `qwen35moe` routes to the Qwen 3.5 MoE family
 - [ ] a Qwen 3.5 MoE GGUF loads successfully
 - [ ] CPU generation works
-- [ ] `Q2_K` and `Q3_K` are supported end-to-end
+- [ ] `Q3_K` is supported end-to-end
 - [ ] Metal tensor preparation supports the initial quant targets without forced dense expansion
 - [ ] documentation clearly states the initial support matrix
