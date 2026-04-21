@@ -3734,6 +3734,7 @@ test "gpt2 tokenizer merges byte pieces with rank order" {
         .pad_token_id = null,
         .add_bos_token = false,
         .add_eos_token = false,
+        .add_space_prefix = false,
     };
     defer tokenizer.deinit(allocator);
 

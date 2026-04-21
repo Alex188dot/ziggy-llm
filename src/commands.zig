@@ -168,6 +168,7 @@ fn inspectDetailed(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_p
                         .string => {
                             const len = try reader.readInt(u64);
                             const bytes = try reader.readBytes(len);
+                            defer allocator.free(bytes);
                             try writer.print("    [{d}] \"{s}\"\n", .{ elem_idx, bytes });
                         },
                         .uint8, .int8 => {
@@ -275,6 +276,7 @@ fn readExactString(reader: *ParsingReader, comptime len: usize) ![len]u8 {
 fn readLengthPrefixedString(allocator: std.mem.Allocator, reader: *ParsingReader) ![]u8 {
     const len = try reader.readInt(u64);
     const bytes = try reader.readBytes(len);
+    defer allocator.free(bytes);
     const owned = try allocator.dupe(u8, bytes);
     return owned;
 }
