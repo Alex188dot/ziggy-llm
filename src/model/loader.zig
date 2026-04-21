@@ -854,10 +854,10 @@ const Session = struct {
         const linear_num_v_heads = model.linear_num_value_heads;
         const linear_value_dim_per_head = model.linear_value_head_dim;
         const linear_key_dim_per_head = model.linear_key_head_dim;
-        const conv_state_per_layer = linear_num_v_heads * linear_value_dim_per_head * model.linear_conv_kernel_dim;
-        const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
         const linear_qkv_dim = 2 * model.linear_num_key_heads * linear_key_dim_per_head + linear_num_v_heads * linear_value_dim_per_head;
         const linear_z_dim = linear_num_v_heads * linear_value_dim_per_head;
+        const conv_state_per_layer = linear_qkv_dim * (model.linear_conv_kernel_dim - 1);
+        const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
 
         var session = Session{
             .model = model,
@@ -1138,9 +1138,25 @@ const Session = struct {
                 addInPlace(self.hidden, self.attn_tmp);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
+                var q_gate: ?[]f32 = null;
                 if (layer.attn_q) |q| {
                     try self.recordCalibration(q, .attn_q, self.normed);
-                    try self.matVec(self.q, q, self.normed);
+                    const q_rows = try q.rowCount();
+                    if (q_rows == self.q.len * 2) {
+                        const packed_q = self.up[0..q_rows];
+                        try self.matVec(packed_q, q, self.normed);
+
+                        var head_index: usize = 0;
+                        while (head_index < self.model.head_count) : (head_index += 1) {
+                            const packed_base = head_index * self.model.key_head_dimension * 2;
+                            const q_base = head_index * self.model.key_head_dimension;
+                            @memcpy(self.q[q_base..][0..self.model.key_head_dimension], packed_q[packed_base..][0..self.model.key_head_dimension]);
+                            @memcpy(self.gate[q_base..][0..self.model.key_head_dimension], packed_q[packed_base + self.model.key_head_dimension ..][0..self.model.key_head_dimension]);
+                        }
+                        q_gate = self.gate[0..self.q.len];
+                    } else {
+                        try self.matVec(self.q, q, self.normed);
+                    }
                 }
                 if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
                 if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.key_head_dimension);
@@ -1163,6 +1179,11 @@ const Session = struct {
                 applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
+                if (q_gate) |gate_values| {
+                    for (self.attn_out, gate_values) |*attn, gate_value| {
+                        attn.* *= sigmoidScalar(gate_value);
+                    }
+                }
                 if (layer.attn_output) |o| {
                     try self.recordCalibration(o, .attn_output, self.attn_out);
                     try self.matVec(self.attn_tmp, o, self.attn_out);
@@ -1292,24 +1313,17 @@ const Session = struct {
         const kernel_dim = model.linear_conv_kernel_dim;
         const q_dim = num_key_heads * key_head_dim;
         const v_dim = num_value_heads * value_head_dim;
-
         const qkv_dim = q_dim + q_dim + v_dim;
-        const num_heads = num_key_heads;
-
         try self.matVec(self.linear_qkv[0..qkv_dim], linear_attn.in_proj_qkv, self.normed);
-
-        const q_out = self.linear_qkv[0..q_dim];
-        const v_out = self.linear_qkv[q_dim + q_dim ..][0..v_dim];
-
         try self.matVec(self.linear_z[0..v_dim], linear_attn.in_proj_z, self.normed);
+        try self.matVec(self.linear_a[0..num_value_heads], linear_attn.in_proj_a, self.normed);
+        try self.matVec(self.linear_b[0..num_value_heads], linear_attn.in_proj_b, self.normed);
 
-        try self.matVec(self.linear_a[0..num_heads], linear_attn.in_proj_a, q_out);
-
+        if (key_head_dim != value_head_dim) return error.InvalidTensorMetadata;
         const dt_bias_bytes = try tensorBytes(model, linear_attn.dt_bias);
         const a_log_bytes = try tensorBytes(model, linear_attn.A_log);
 
-        for (0..num_heads) |h| {
-            const a_val = self.linear_a[h];
+        for (0..num_value_heads) |h| {
             const dt_bias_val = switch (linear_attn.dt_bias.tensor_type) {
                 .f32 => readF32(dt_bias_bytes[h * 4 ..][0..4]),
                 .f16 => readF16AsF32(dt_bias_bytes[h * 2 ..][0..2]),
@@ -1320,84 +1334,98 @@ const Session = struct {
                 .f16 => readF16AsF32(a_log_bytes[h * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
-
-            const softplus_val = if (a_val + dt_bias_val > 20.0) a_val + dt_bias_val else std.math.log1p(@exp(a_val + dt_bias_val));
-            const g_val = -@exp(a_log_val) * softplus_val;
-            self.linear_g[h] = g_val;
+            const alpha_pre = self.linear_a[h] + dt_bias_val;
+            const beta_pre = self.linear_b[h];
+            const softplus_val = softplusScalar(alpha_pre);
+            self.linear_g[h] = a_log_val * softplus_val;
+            self.linear_b[h] = sigmoidScalar(beta_pre);
         }
 
-        const conv_state_per_layer = num_value_heads * value_head_dim * kernel_dim;
+        const conv_state_per_layer = qkv_dim * (kernel_dim - 1);
         const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
         const conv_state_base = layer_index * conv_state_per_layer;
         const recurrent_state_base = layer_index * recurrent_state_per_layer;
 
         const conv1d_bytes = try tensorBytes(model, linear_attn.conv1d);
-        const conv_out = self.linear_conv_tmp[0..v_dim];
-
+        const conv_out = self.linear_conv_tmp[0..qkv_dim];
         @memset(conv_out, 0);
 
-        var head_idx: usize = 0;
-        while (head_idx < num_value_heads) : (head_idx += 1) {
-            const v_head_base = head_idx * value_head_dim;
-            const v_head = v_out[v_head_base..][0..value_head_dim];
-            const conv_head_base = head_idx * value_head_dim;
-            const conv_head_out = conv_out[conv_head_base..][0..value_head_dim];
-
-            var offset: usize = 0;
-            while (offset < value_head_dim) : (offset += 1) {
-                var kernel_idx: usize = 0;
-                while (kernel_idx < kernel_dim - 1) : (kernel_idx += 1) {
-                    const state_idx = kernel_idx * value_head_dim + offset;
-                    const state_offset = conv_state_base + head_idx * value_head_dim * kernel_dim + state_idx;
-                    const w_idx = kernel_idx * value_head_dim * value_head_dim + offset * value_head_dim + offset;
-                    const w_val = switch (linear_attn.conv1d.tensor_type) {
-                        .f32 => readF32(conv1d_bytes[w_idx * 4 ..][0..4]),
-                        .f16 => readF16AsF32(conv1d_bytes[w_idx * 2 ..][0..2]),
-                        else => return error.UnsupportedTensorType,
-                    };
-                    conv_head_out[offset] += self.linear_conv_state[state_offset] * w_val;
-                }
-
-                const w_idx = (kernel_dim - 1) * value_head_dim * value_head_dim + offset * value_head_dim + offset;
-                const w_val = switch (linear_attn.conv1d.tensor_type) {
-                    .f32 => readF32(conv1d_bytes[w_idx * 4 ..][0..4]),
-                    .f16 => readF16AsF32(conv1d_bytes[w_idx * 2 ..][0..2]),
+        for (0..qkv_dim) |channel| {
+            var acc: f32 = 0;
+            for (0..kernel_dim - 1) |kernel_idx| {
+                const state_offset = conv_state_base + kernel_idx * qkv_dim + channel;
+                const weight_index = channel * kernel_dim + kernel_idx;
+                const weight = switch (linear_attn.conv1d.tensor_type) {
+                    .f32 => readF32(conv1d_bytes[weight_index * 4 ..][0..4]),
+                    .f16 => readF16AsF32(conv1d_bytes[weight_index * 2 ..][0..2]),
                     else => return error.UnsupportedTensorType,
                 };
-                conv_head_out[offset] += v_head[offset] * w_val;
+                acc += self.linear_conv_state[state_offset] * weight;
             }
-        }
-
-        var shift_offset: usize = 0;
-        while (shift_offset < value_head_dim * (kernel_dim - 1)) : (shift_offset += value_head_dim) {
-            const src_offset = conv_state_base + shift_offset;
-            const dst_offset = conv_state_base + value_head_dim + shift_offset;
-            @memcpy(self.linear_conv_state[dst_offset..][0..value_head_dim], self.linear_conv_state[src_offset..][0..value_head_dim]);
-        }
-        @memcpy(self.linear_conv_state[conv_state_base..][0..value_head_dim], v_out[0..v_dim]);
-
-        var g_idx: usize = 0;
-        while (g_idx < num_heads) : (g_idx += 1) {
-            const g_val = self.linear_g[g_idx];
-            const recurrent_offset = recurrent_state_base + g_idx * key_head_dim * value_head_dim;
-            const conv_head_offset = g_idx * value_head_dim;
-
-            var j: usize = 0;
-            while (j < key_head_dim * value_head_dim) : (j += 1) {
-                const conv_idx = conv_head_offset + j;
-                self.linear_recurrent_state[recurrent_offset + j] = g_val * self.linear_recurrent_state[recurrent_offset + j] + (1 - g_val) * conv_out[conv_idx];
-            }
-        }
-
-        const norm_bytes = try tensorBytes(model, linear_attn.norm_weight);
-        var norm_idx: usize = 0;
-        while (norm_idx < v_dim) : (norm_idx += 1) {
-            const norm_w = switch (linear_attn.norm_weight.tensor_type) {
-                .f32 => readF32(norm_bytes[norm_idx * 4 ..][0..4]),
-                .f16 => readF16AsF32(norm_bytes[norm_idx * 2 ..][0..2]),
+            const current_weight_index = channel * kernel_dim + (kernel_dim - 1);
+            const current_weight = switch (linear_attn.conv1d.tensor_type) {
+                .f32 => readF32(conv1d_bytes[current_weight_index * 4 ..][0..4]),
+                .f16 => readF16AsF32(conv1d_bytes[current_weight_index * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
-            self.linear_z[norm_idx] *= norm_w;
+            acc += self.linear_qkv[channel] * current_weight;
+            conv_out[channel] = siluScalar(acc);
+        }
+
+        if (kernel_dim > 1) {
+            var state_idx: usize = 0;
+            while (state_idx + qkv_dim < conv_state_per_layer) : (state_idx += qkv_dim) {
+                const src_offset = conv_state_base + state_idx + qkv_dim;
+                const dst_offset = conv_state_base + state_idx;
+                std.mem.copyForwards(f32, self.linear_conv_state[dst_offset..][0..qkv_dim], self.linear_conv_state[src_offset..][0..qkv_dim]);
+            }
+            const last_offset = conv_state_base + (kernel_dim - 2) * qkv_dim;
+            @memcpy(self.linear_conv_state[last_offset..][0..qkv_dim], self.linear_qkv[0..qkv_dim]);
+        }
+
+        const q_conv = conv_out[0..q_dim];
+        const k_conv = conv_out[q_dim .. q_dim * 2];
+        const v_conv = conv_out[q_dim * 2 ..][0..v_dim];
+        l2NormalizePerHead(q_conv, num_key_heads, key_head_dim, model.rms_norm_eps);
+        l2NormalizePerHead(k_conv, num_key_heads, key_head_dim, model.rms_norm_eps);
+
+        const delta_out = self.linear_qkv[0..v_dim];
+        const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
+        for (0..num_value_heads) |head| {
+            const recurrent_offset = recurrent_state_base + head * value_head_dim * value_head_dim;
+            const q_head = q_conv[head * key_head_dim ..][0..key_head_dim];
+            const k_head = k_conv[head * key_head_dim ..][0..key_head_dim];
+            const v_head = v_conv[head * value_head_dim ..][0..value_head_dim];
+            const out_head = delta_out[head * value_head_dim ..][0..value_head_dim];
+            const state = self.linear_recurrent_state[recurrent_offset..][0 .. value_head_dim * value_head_dim];
+            const decay = @exp(self.linear_g[head]);
+            const beta = self.linear_b[head];
+
+            for (0..state.len) |idx| state[idx] *= decay;
+
+            for (0..value_head_dim) |col| {
+                var sk: f32 = 0;
+                for (0..value_head_dim) |row| {
+                    sk += state[row * value_head_dim + col] * k_head[row];
+                }
+                const delta = (v_head[col] - sk) * beta;
+                for (0..value_head_dim) |row| {
+                    state[row * value_head_dim + col] += k_head[row] * delta;
+                }
+            }
+
+            for (0..value_head_dim) |col| {
+                var acc: f32 = 0;
+                for (0..value_head_dim) |row| {
+                    acc += state[row * value_head_dim + col] * (q_head[row] * scale);
+                }
+                out_head[col] = acc;
+            }
+        }
+
+        try self.rmsNormPerHead(self.linear_conv_tmp[0..v_dim], delta_out, linear_attn.norm_weight, num_value_heads, value_head_dim);
+        for (0..v_dim) |idx| {
+            self.linear_z[idx] = self.linear_conv_tmp[idx] * siluScalar(self.linear_z[idx]);
         }
 
         try self.matVec(self.attn_tmp, linear_attn.out_proj, self.linear_z[0..v_dim]);
@@ -2302,27 +2330,43 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         }
     }
 
+    const is_qwen35_dense = std.mem.eql(u8, architecture, "qwen35");
     const layers = try allocator.alloc(LayerRefs, block_count);
     errdefer allocator.free(layers);
     for (0..block_count) |index| {
+        const is_qwen35_linear = is_qwen35_dense and hasLayerTensor(&tensors, index, "attn_qkv.weight");
+        const ffn_norm = if (is_qwen35_dense and !hasLayerTensor(&tensors, index, "ffn_norm.weight"))
+            try takeLayerTensor(allocator, &tensors, index, "post_attention_norm.weight")
+        else
+            try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight");
         layers[index] = .{
             .attn_norm = try takeLayerTensor(allocator, &tensors, index, "attn_norm.weight"),
-            .attn_q = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.weight"),
-            .attn_q_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
-            .attn_q_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
-            .attn_k = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.weight"),
-            .attn_k_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
-            .attn_k_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
-            .attn_v = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.weight"),
-            .attn_v_bias = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
-            .attn_output = try takeOptionalLayerTensor(allocator, &tensors, index, "attn_output.weight"),
-            .ffn_norm = try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight"),
+            .attn_q = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.weight"),
+            .attn_q_bias = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q.bias"),
+            .attn_q_norm = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_q_norm.weight"),
+            .attn_k = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.weight"),
+            .attn_k_bias = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k.bias"),
+            .attn_k_norm = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_k_norm.weight"),
+            .attn_v = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.weight"),
+            .attn_v_bias = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
+            .attn_output = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_output.weight"),
+            .ffn_norm = ffn_norm,
             .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
             .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
             .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-            .post_attention_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
+            .post_attention_norm = if (is_qwen35_dense) null else try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
             .post_ffw_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_ffw_norm.weight"),
-            .linear_attn = null,
+            .linear_attn = if (is_qwen35_linear) .{
+                .in_proj_qkv = try takeLayerTensor(allocator, &tensors, index, "attn_qkv.weight"),
+                .in_proj_z = try takeLayerTensor(allocator, &tensors, index, "attn_gate.weight"),
+                .in_proj_b = try takeLayerTensor(allocator, &tensors, index, "ssm_beta.weight"),
+                .in_proj_a = try takeLayerTensor(allocator, &tensors, index, "ssm_alpha.weight"),
+                .conv1d = try takeLayerTensor(allocator, &tensors, index, "ssm_conv1d.weight"),
+                .dt_bias = try takeLayerTensor(allocator, &tensors, index, "ssm_dt.bias"),
+                .A_log = try takeLayerTensor(allocator, &tensors, index, "ssm_a"),
+                .norm_weight = try takeLayerTensor(allocator, &tensors, index, "ssm_norm.weight"),
+                .out_proj = try takeLayerTensor(allocator, &tensors, index, "ssm_out.weight"),
+            } else null,
         };
     }
 
@@ -2702,7 +2746,15 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.linear_num_key_heads = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".ssm.group_count")) {
+        metadata.linear_num_key_heads = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
     if (std.mem.eql(u8, key, "linear_num_value_heads")) {
+        metadata.linear_num_value_heads = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".ssm.time_step_rank")) {
         metadata.linear_num_value_heads = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
@@ -2710,11 +2762,21 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.linear_key_head_dim = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".ssm.state_size")) {
+        const state_size = try readExpectedUnsigned(u32, parser, value_type);
+        metadata.linear_key_head_dim = state_size;
+        metadata.linear_value_head_dim = state_size;
+        return;
+    }
     if (std.mem.eql(u8, key, "linear_value_head_dim")) {
         metadata.linear_value_head_dim = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
     if (std.mem.eql(u8, key, "linear_conv_kernel_dim")) {
+        metadata.linear_conv_kernel_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".ssm.conv_kernel")) {
         metadata.linear_conv_kernel_dim = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
@@ -2825,6 +2887,12 @@ fn takeLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(Ten
     var buffer: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix });
     return takeTensor(allocator, tensors, name);
+}
+
+fn hasLayerTensor(tensors: *const std.StringHashMap(TensorRef), layer_index: usize, suffix: []const u8) bool {
+    var buffer: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&buffer, "blk.{d}.{s}", .{ layer_index, suffix }) catch return false;
+    return tensors.contains(name);
 }
 
 fn takeOptionalLayerTensor(allocator: std.mem.Allocator, tensors: *std.StringHashMap(TensorRef), layer_index: usize, suffix: []const u8) !?TensorRef {
@@ -3350,7 +3418,29 @@ fn siluInPlace(values: []f32) void {
         @as(*[simd_lane_count]f32, @ptrCast(values[i..])).* = result;
     }
     while (i < values.len) : (i += 1) {
-        values[i] = values[i] / (1 + @exp(-values[i]));
+        values[i] = siluScalar(values[i]);
+    }
+}
+
+fn siluScalar(value: f32) f32 {
+    return value / (1 + @exp(-value));
+}
+
+fn sigmoidScalar(value: f32) f32 {
+    return 1 / (1 + @exp(-value));
+}
+
+fn softplusScalar(value: f32) f32 {
+    return if (value > 20.0) value else std.math.log1p(@exp(value));
+}
+
+fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f32) void {
+    for (0..head_count) |head_index| {
+        const head = values[head_index * head_dim ..][0..head_dim];
+        var norm_sq: f32 = 0;
+        for (head) |value| norm_sq += value * value;
+        const scale = @as(f32, 1.0) / @sqrt(norm_sq + eps);
+        for (head) |*value| value.* *= scale;
     }
 }
 
