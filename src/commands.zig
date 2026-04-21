@@ -83,7 +83,7 @@ fn inspectDetailed(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_p
     defer file.close();
 
     const stat = try file.stat();
-    var reader = ParsingReader{ .file = file, .pos = 0 };
+    var reader = ParsingReader{ .allocator = allocator, .file = file, .pos = 0 };
 
     const magic = try readExactString(&reader, 4);
     if (!std.mem.eql(u8, &magic, "GGUF")) return error.InvalidMagic;
@@ -168,6 +168,7 @@ fn inspectDetailed(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_p
                         .string => {
                             const len = try reader.readInt(u64);
                             const bytes = try reader.readBytes(len);
+                            defer allocator.free(bytes);
                             try writer.print("    [{d}] \"{s}\"\n", .{ elem_idx, bytes });
                         },
                         .uint8, .int8 => {
@@ -241,6 +242,7 @@ fn inspectDetailed(writer: *std.Io.Writer, allocator: std.mem.Allocator, model_p
 }
 
 const ParsingReader = struct {
+    allocator: std.mem.Allocator,
     file: std.fs.File,
     pos: u64 = 0,
 
@@ -254,8 +256,8 @@ const ParsingReader = struct {
 
     fn readBytes(self: *ParsingReader, len: usize) ![]u8 {
         const pos = self.pos;
-        const bytes = try std.heap.page_allocator.alloc(u8, len);
-        errdefer std.heap.page_allocator.free(bytes);
+        const bytes = try self.allocator.alloc(u8, len);
+        errdefer self.allocator.free(bytes);
         const actual = try self.file.preadAll(bytes, pos);
         if (actual != len) return error.TruncatedFile;
         self.pos = pos + len;
@@ -274,6 +276,7 @@ fn readExactString(reader: *ParsingReader, comptime len: usize) ![len]u8 {
 fn readLengthPrefixedString(allocator: std.mem.Allocator, reader: *ParsingReader) ![]u8 {
     const len = try reader.readInt(u64);
     const bytes = try reader.readBytes(len);
+    defer allocator.free(bytes);
     const owned = try allocator.dupe(u8, bytes);
     return owned;
 }

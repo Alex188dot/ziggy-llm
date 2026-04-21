@@ -5,6 +5,7 @@ const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
 const llama_metal = @import("gpu/metal/tensor_store.zig");
 const metal_backend = @import("metal_backend.zig");
+const qwen35_metal_fallback = @import("qwen35_metal_fallback.zig");
 const types = @import("types.zig");
 
 pub const ResidentRuntime = struct {
@@ -51,6 +52,11 @@ pub const ResidentRuntime = struct {
         return self.loaded.?.chat_template_style;
     }
 
+    pub fn chatTemplateNeedsThinkingPrefix(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference, context_length_limit: usize) !bool {
+        try self.ensureLoaded(model_path, backend, context_length_limit, false);
+        return self.loaded.?.chat_template_needs_thinking_prefix;
+    }
+
     pub fn generate(
         self: *ResidentRuntime,
         model_path: []const u8,
@@ -72,6 +78,19 @@ pub const ResidentRuntime = struct {
         try self.ensureLoaded(model_path, options.backend, options.context_length, options.metal_profile);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
+
+        if (try qwen35_metal_fallback.maybeGenerate(
+            self.allocator,
+            &loaded.model,
+            loaded.execution.backend != null and loaded.execution.backend.?.label == .metal,
+            model_path,
+            prompt,
+            options,
+            stream_ctx,
+            stream_callback,
+        )) |fallback_report| {
+            return try self.finalizeReport(loaded, fallback_report, options);
+        }
 
         const lookup = if (loaded.execution.dense_tensors) |*dense_tensors|
             llama_cpu.DenseTensorLookup{
@@ -143,31 +162,7 @@ pub const ResidentRuntime = struct {
             report.startup_breakdown.metal_prewarm_ns = 0;
         }
 
-        const combined_profile_summary = try combineProfileSummaries(
-            self.allocator,
-            loaded.execution.startup_profile_summary,
-            report.metal_profile_summary,
-        );
-        if (report.metal_profile_summary) |summary| self.allocator.free(summary);
-
-        return .{
-            .generated_text = report.generated_text,
-            .prompt_token_count = report.prompt_token_count,
-            .reused_prompt_token_count = report.reused_prompt_token_count,
-            .generated_token_count = report.generated_token_count,
-            .startup_ns = report.startup_ns,
-            .prompt_ns = report.prompt_ns,
-            .ttft_ns = report.ttft_ns,
-            .decode_ns = report.decode_ns,
-            .seed = options.seed,
-            .temperature = options.temperature,
-            .backend = report.backend,
-            .sampling_strategy = report.sampling_strategy,
-            .sampling_path = report.sampling_path,
-            .readback_mode = report.readback_mode,
-            .startup_breakdown = report.startup_breakdown,
-            .metal_profile_summary = combined_profile_summary,
-        };
+        return try self.finalizeReport(loaded, report, options);
     }
 
     pub fn promptTokenCount(self: *ResidentRuntime, model_path: []const u8, prompt: []const u8, backend: types.BackendPreference) !usize {
@@ -213,13 +208,16 @@ pub const ResidentRuntime = struct {
 
         var inspect_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer inspect_arena.deinit();
-        const chat_template_style = (try gguf.inspectFile(inspect_arena.allocator(), model_path)).chatTemplateStyle();
+        const inspect_report = try gguf.inspectFile(inspect_arena.allocator(), model_path);
+        const chat_template_style = inspect_report.chatTemplateStyle();
+        const chat_template_needs_thinking_prefix = gguf.chatTemplateNeedsThinkingPrefix(inspect_report.chat_template);
 
         self.loaded = .{
             .model_path = owned_model_path,
             .backend_pref = backend_pref,
             .context_length_limit = context_length_limit,
             .chat_template_style = chat_template_style,
+            .chat_template_needs_thinking_prefix = chat_template_needs_thinking_prefix,
             .model = model,
             .execution = execution,
             .reusable_session = reusable_session,
@@ -249,6 +247,39 @@ pub const ResidentRuntime = struct {
             loaded.reusable_session.session.dense_tensors = null;
         }
     }
+
+    fn finalizeReport(
+        self: *ResidentRuntime,
+        loaded: *LoadedModel,
+        report: anytype,
+        options: types.GenerationOptions,
+    ) !types.GenerationReport {
+        const combined_profile_summary = try combineProfileSummaries(
+            self.allocator,
+            loaded.execution.startup_profile_summary,
+            report.metal_profile_summary,
+        );
+        if (report.metal_profile_summary) |summary| self.allocator.free(summary);
+
+        return .{
+            .generated_text = report.generated_text,
+            .prompt_token_count = report.prompt_token_count,
+            .reused_prompt_token_count = report.reused_prompt_token_count,
+            .generated_token_count = report.generated_token_count,
+            .startup_ns = report.startup_ns,
+            .prompt_ns = report.prompt_ns,
+            .ttft_ns = report.ttft_ns,
+            .decode_ns = report.decode_ns,
+            .seed = options.seed,
+            .temperature = options.temperature,
+            .backend = report.backend,
+            .sampling_strategy = report.sampling_strategy,
+            .sampling_path = report.sampling_path,
+            .readback_mode = report.readback_mode,
+            .startup_breakdown = report.startup_breakdown,
+            .metal_profile_summary = combined_profile_summary,
+        };
+    }
 };
 
 const LoadedModel = struct {
@@ -256,6 +287,7 @@ const LoadedModel = struct {
     backend_pref: types.BackendPreference,
     context_length_limit: usize,
     chat_template_style: gguf.ChatTemplateStyle,
+    chat_template_needs_thinking_prefix: bool,
     model: llama_cpu.Model,
     execution: ExecutionResources,
     reusable_session: llama_cpu.ReusableSession,

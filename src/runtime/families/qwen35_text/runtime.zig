@@ -1,5 +1,7 @@
 const std = @import("std");
 const llama_runtime = @import("../../llama_runtime.zig");
+const loader = @import("../../../model/loader.zig");
+const qwen35_metal_fallback = @import("../../qwen35_metal_fallback.zig");
 const types = @import("../../types.zig");
 const families_mod = @import("../mod.zig");
 
@@ -27,6 +29,40 @@ fn qwen35TextGenerate(
         .metal_profile = options.metal_profile,
         .sampling_strategy = options.sampling_strategy,
     };
+
+    var model = try loader.loadModel(allocator, model_path);
+    defer model.deinit(allocator);
+
+    if (try qwen35_metal_fallback.maybeGenerate(
+        allocator,
+        &model,
+        options.backend == .metal,
+        model_path,
+        prompt,
+        gen_opts,
+        null,
+        null,
+    )) |report| {
+        return families_mod.FamilyReport{
+            .generated_text = report.generated_text,
+            .prompt_token_count = report.prompt_token_count,
+            .reused_prompt_token_count = report.reused_prompt_token_count,
+            .generated_token_count = report.generated_token_count,
+            .startup_ns = report.startup_ns,
+            .prompt_ns = report.prompt_ns,
+            .ttft_ns = report.ttft_ns,
+            .decode_ns = report.decode_ns,
+            .seed = report.seed,
+            .temperature = report.temperature,
+            .backend = @enumFromInt(@intFromEnum(report.backend)),
+            .sampling_strategy = report.sampling_strategy,
+            .sampling_path = report.sampling_path,
+            .readback_mode = report.readback_mode,
+            .startup_breakdown = report.startup_breakdown,
+            .metal_profile_summary = report.metal_profile_summary,
+        };
+    }
+
     const report = try llama_runtime.generate(allocator, model_path, prompt, gen_opts);
     return families_mod.FamilyReport{
         .generated_text = report.generated_text,

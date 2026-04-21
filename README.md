@@ -2,7 +2,7 @@
 
 ![ziggy-llm logo](assets/ziggy-llm-logo.png)
 
-Welcome to **ziggy-llm** — a Mac-first, Zig-native GGUF inference engine built specifically for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
+Welcome to **ziggy-llm**, a Zig-native GGUF inference engine built specifically for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
 
 We don't try to do everything for everyone; instead, we do one thing exceptionally well. By focusing exclusively on Apple Metal and GGUF files, we deliver a single-binary, highly optimized CLI experience 💎
 
@@ -28,7 +28,8 @@ We benchmark honestly and optimize ruthlessly for single-user, local text genera
 | **Ministral 3B**   | Q4_K_M | ~45.5 tok/s       | —            | 43.7 tok/s        |
 | **Gemma 2 2B**     | Q4_K_M | ~48 tok/s         | —            | —                 |
 | **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
-| **Qwen3 8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
+| **Qwen3.8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
+| **Qwen3.5 2B**     | Q4_K_M | ~48.9 tok/s       | —            | 62.4 tok/s        |
 
 Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
 
@@ -100,7 +101,7 @@ Update:
 
 ## Supported Models & Quants 🧠
 
-Our goal is to support a deliberately narrow, highly-optimized matrix of popular models. Currently, we focus on the Qwen (2, 3), LLaMA (3.1, 3.2, TinyLlama), Mistral (and Ministral) and Gemma architectures (Gemma 2 and 3 for now, Gemma 4 coming soon). 🎯
+Our goal is to support a deliberately narrow, highly-optimized matrix of popular models. Currently, we support the Qwen (2, 3, 3.5 dense), LLaMA (3.1, 3.2, TinyLlama), Mistral (and Ministral) and Gemma architectures (Gemma 2 and 3 for now, Gemma 4 coming soon). 🎯
 
 For quantizations, we recommend our specialized MoonQuant targets: `Q4_K_M`, `Q6_K`, and `Q8_0`. We also fully support `F16` and `F32` formats as reference paths. 📉
 
@@ -139,7 +140,7 @@ ziggy-llm is open source and in active development, and we would love your help 
 - [ ] Implement OpenAI compatible server
 - [ ] Add support for Qwen 3.5 (MoE and DeltaNet variants) and Gemma 4
 - [ ] Make chat more robust
-- [ ] Test all quants (currently tested only Q4_K_M)
+- [ ] Test all quants (currently tested only Q4_K_M and Q6_K)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
 
 If you find this project interesting, please consider starring the repo ⭐️. It genuinely helps us grow and reach more developers in the local AI ecosystem!

@@ -38,15 +38,15 @@ pub const nsToMs = types.nsToMs;
 fn getRegistry() *registry_mod.FamilyRegistry {
     const reg = registry_mod.getGlobalRegistry();
     if (reg.count == 0) {
-        reg.register(llama_family.FamilyHandler) catch unreachable;
-        reg.register(qwen_family.FamilyHandler) catch unreachable;
-        reg.register(mistral_family.FamilyHandler) catch unreachable;
-        reg.register(mistral3_family.FamilyHandler) catch unreachable;
-        reg.register(gemma_family.FamilyHandler) catch unreachable;
-        reg.register(gemma2_family.FamilyHandler) catch unreachable;
-        reg.register(gemma3_family.FamilyHandler) catch unreachable;
-        reg.register(qwen35_family.FamilyHandler) catch unreachable;
-        reg.register(qwen35_text_family.FamilyHandler) catch unreachable;
+        reg.register(llama_family.FamilyHandler) catch |err| std.debug.panic("failed to register llama family: {}", .{err});
+        reg.register(qwen_family.FamilyHandler) catch |err| std.debug.panic("failed to register qwen family: {}", .{err});
+        reg.register(mistral_family.FamilyHandler) catch |err| std.debug.panic("failed to register mistral family: {}", .{err});
+        reg.register(mistral3_family.FamilyHandler) catch |err| std.debug.panic("failed to register ministral3 family: {}", .{err});
+        reg.register(gemma_family.FamilyHandler) catch |err| std.debug.panic("failed to register gemma family: {}", .{err});
+        reg.register(gemma2_family.FamilyHandler) catch |err| std.debug.panic("failed to register gemma2 family: {}", .{err});
+        reg.register(gemma3_family.FamilyHandler) catch |err| std.debug.panic("failed to register gemma3 family: {}", .{err});
+        reg.register(qwen35_family.FamilyHandler) catch |err| std.debug.panic("failed to register qwen35 family: {}", .{err});
+        reg.register(qwen35_text_family.FamilyHandler) catch |err| std.debug.panic("failed to register qwen35-text family: {}", .{err});
     }
     return reg;
 }

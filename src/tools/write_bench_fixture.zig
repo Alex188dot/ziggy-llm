@@ -5,7 +5,10 @@ const llama_fixture = ziggy.llama_fixture;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        const status = gpa.deinit();
+        if (status == .leak) std.debug.panic("memory leak detected", .{});
+    }
     const allocator = gpa.allocator();
 
     const args = try std.process.argsAlloc(allocator);
