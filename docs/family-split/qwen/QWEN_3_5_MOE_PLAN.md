@@ -7,6 +7,8 @@ This document defines a staged implementation plan for Qwen 3.5 MoE support in z
 Implement end-to-end support for Qwen 3.5 MoE GGUF models with a practical initial quantization matrix:
 
 - `Q3_K`
+- `IQ3_XXS`
+- `IQ4_XS`
 
 Optional later work:
 
@@ -55,12 +57,12 @@ Route Qwen 3.5 MoE GGUFs into the correct family handler.
 
 ### Tasks
 
-- [ ] update `detectModelFamily()` to recognize `qwen35moe`
-- [ ] keep support for existing `qwen2_moe` / `qwen3_moe` aliases if they are still encountered
-- [ ] add tests for:
-  - [ ] `qwen35moe`
-  - [ ] `qwen2_moe`
-  - [ ] `qwen3_moe`
+- [x] update `detectModelFamily()` to recognize `qwen35moe`
+- [x] keep support for existing `qwen2_moe` / `qwen3_moe` aliases if they are still encountered
+- [x] add tests for:
+  - [x] `qwen35moe`
+  - [x] `qwen2_moe`
+  - [x] `qwen3_moe`
 
 ### Acceptance Criteria
 
@@ -79,18 +81,18 @@ Extend the model loader to represent Qwen 3.5 MoE layer structure explicitly.
 
 ### Tasks
 
-- [ ] define MoE-specific layer structures in the model representation
-- [ ] add metadata fields required for MoE, including:
-  - [ ] expert feed-forward length
-  - [ ] expert count
-  - [ ] experts-per-token / active expert count if present in GGUF metadata
-  - [ ] gating function metadata if present
-- [ ] add parsing for MoE tensors such as:
-  - [ ] router / gate input weights
-  - [ ] expert `ffn_up` tensors
-  - [ ] expert `ffn_down` tensors
-  - [ ] any shared-expert tensors if present in the target GGUF layout
-- [ ] preserve existing dense Qwen 3.5 handling without regression
+- [x] define MoE-specific layer structures in the model representation
+- [x] add metadata fields required for MoE, including:
+  - [x] expert feed-forward length
+  - [x] expert count
+  - [x] experts-per-token / active expert count if present in GGUF metadata
+  - [x] gating function metadata if present
+- [x] add parsing for MoE tensors such as:
+  - [x] router / gate input weights
+  - [x] expert `ffn_up` tensors
+  - [x] expert `ffn_down` tensors
+  - [x] any shared-expert tensors if present in the target GGUF layout
+- [x] preserve existing dense Qwen 3.5 handling without regression
 
 ### Notes
 
@@ -127,15 +129,15 @@ Implement a correct CPU inference path for Qwen 3.5 MoE.
 
 ### Tasks
 
-- [ ] replace the placeholder runtime with a real generation path
-- [ ] implement router evaluation for each token
-- [ ] implement top-k expert selection
-- [ ] implement expert weight normalization according to the GGUF metadata / architecture behavior
-- [ ] implement expert FFN evaluation:
-  - [ ] evaluate selected experts only
-  - [ ] combine outputs with routing weights
-- [ ] integrate the MoE layer path into the existing token generation loop
-- [ ] document and isolate any assumptions that are specific to Qwen 3.5 MoE
+- [x] replace the placeholder runtime with a real generation path
+- [x] implement router evaluation for each token
+- [x] implement top-k expert selection
+- [x] implement expert weight normalization according to the GGUF metadata / architecture behavior
+- [x] implement expert FFN evaluation:
+  - [x] evaluate selected experts only
+  - [x] combine outputs with routing weights
+- [x] integrate the MoE layer path into the existing token generation loop
+- [x] document and isolate any assumptions that are specific to Qwen 3.5 MoE
 
 ### Recommended Module Split
 
@@ -150,6 +152,12 @@ To keep the implementation modular and under file-size limits, split by responsi
 - `src/runtime/families/qwen35/cpu.zig`
   - CPU execution orchestration
 
+### Current Assumptions
+
+- explicit Metal support is still deferred; the Qwen 3.5 MoE family runtime currently forces the CPU path
+- when expert gating metadata is absent, the implementation defaults to softmax gating with normalized top-k weights
+- shared-expert routing is applied through `ffn_gate_inp_shexp.weight` when present
+
 ### Acceptance Criteria
 
 - CPU generation runs for a Qwen 3.5 MoE model
@@ -163,27 +171,31 @@ To keep the implementation modular and under file-size limits, split by responsi
 Add the first quantization set required by this plan:
 
 - `Q3_K`
+- `IQ3_XXS`
+- `IQ4_XS`
 
 ### Files
 
 - `src/model/loader.zig`
-- `src/gguf.zig`
-- `src/runtime/llama_fixture.zig`
-- tests colocated with loader/runtime modules
+- `src/model/quant_extra.zig`
+- tests/integration validation through the local Qwen 3.5 MoE GGUF path
 
 ### Tasks
 
-- [ ] implement `dequantizeRowQ3K()`
-- [ ] wire it into `dequantizeRow()`
-- [ ] verify `tensorRowByteSize()` and layout handling match the actual block definitions already encoded in the loader and GGUF inspector
-- [ ] extend fixtures/tests so `Q3_K` tensors can be parsed and dequantized
+- [x] implement `dequantizeRowQ3K()`
+- [x] implement `dequantizeRowIQ3XXS()`
+- [x] implement `dequantizeRowIQ4XS()`
+- [x] wire the new formats into `dequantizeRow()`
+- [x] wire the new formats into the row-dot matvec path
+- [x] verify `tensorRowByteSize()` and layout handling match the actual block definitions already encoded in the loader and GGUF inspector
+- [x] validate the mixed-quant path through CPU model load and generation against the target GGUF
 
 ### Why This Quant Set First
 
-`Q3_K` is the best initial target because:
+`Q3_K`, `IQ3_XXS`, and `IQ4_XS` are the initial target because:
 
 - they are already modeled in the tensor enum and row-size logic
-- they are standard K-quants rather than more specialized `IQ*` formats
+- they are the exact formats required by the target Qwen 3.5 MoE GGUF
 - they provide a narrow initial matrix that is useful without overcommitting to broad quant support
 
 ### Acceptance Criteria

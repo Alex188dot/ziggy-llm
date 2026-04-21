@@ -141,7 +141,10 @@ pub fn detectModelFamily(architecture: []const u8) ModelFamily {
     if (std.mem.eql(u8, architecture, "qwen2") or std.mem.eql(u8, architecture, "qwen3")) {
         return .qwen;
     }
-    if (std.mem.startsWith(u8, architecture, "qwen2_moe") or std.mem.startsWith(u8, architecture, "qwen3_moe")) {
+    if (std.mem.eql(u8, architecture, "qwen35moe") or
+        std.mem.startsWith(u8, architecture, "qwen2_moe") or
+        std.mem.startsWith(u8, architecture, "qwen3_moe"))
+    {
         return .qwen35;
     }
     if (std.mem.eql(u8, architecture, "qwen35")) {
@@ -178,6 +181,7 @@ test "detectModelFamily recognizes qwen2 and qwen3" {
 }
 
 test "detectModelFamily recognizes qwen35 moe variants" {
+    try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen35moe"));
     try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen2_moe"));
     try std.testing.expectEqual(ModelFamily.qwen35, detectModelFamily("qwen3_moe"));
 }

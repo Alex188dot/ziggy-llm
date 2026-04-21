@@ -6,6 +6,7 @@ const metal_profile = @import("../runtime/metal_profile.zig");
 const moon_quant_calibration = @import("../moon_quant_calibration.zig");
 const runtime_types = @import("../runtime/types.zig");
 const sampling = @import("../sampling.zig");
+const quant_extra = @import("quant_extra.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -237,6 +238,7 @@ pub const LayerRefs = struct {
     post_attention_norm: ?TensorRef = null,
     post_ffw_norm: ?TensorRef = null,
     linear_attn: ?LinearAttnTensors = null,
+    moe: ?MoeFfnTensors = null,
 };
 
 pub const LinearAttnTensors = struct {
@@ -251,6 +253,14 @@ pub const LinearAttnTensors = struct {
     out_proj: TensorRef,
 };
 
+pub const MoeFfnTensors = struct {
+    router: TensorRef,
+    gate_exps: TensorRef,
+    down_exps: TensorRef,
+    up_exps: TensorRef,
+    shared_router_gate: ?TensorRef = null,
+};
+
 const Metadata = struct {
     architecture: ?[]u8 = null,
     alignment: u32 = default_alignment,
@@ -259,6 +269,13 @@ const Metadata = struct {
     embedding_length: ?u32 = null,
     block_count: ?u32 = null,
     feed_forward_length: ?u32 = null,
+    expert_count: ?u32 = null,
+    expert_used_count: ?u32 = null,
+    expert_feed_forward_length: ?u32 = null,
+    expert_shared_feed_forward_length: ?u32 = null,
+    expert_weights_scale: ?f32 = null,
+    expert_weights_norm: ?bool = null,
+    expert_gating_func: ?u32 = null,
     rope_dimension_count: ?u32 = null,
     rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: ?u32 = null,
@@ -278,6 +295,7 @@ const Metadata = struct {
     linear_key_head_dim: ?u32 = null,
     linear_value_head_dim: ?u32 = null,
     linear_conv_kernel_dim: ?u32 = null,
+    full_attention_interval: ?u32 = null,
     layer_types: std.ArrayList([]u8) = .empty,
     tokenizer_model: ?[]u8 = null,
     tokenizer_pre: ?[]u8 = null,
@@ -715,6 +733,13 @@ pub const Model = struct {
     embedding_length: usize,
     block_count: usize,
     feed_forward_length: usize,
+    expert_count: usize = 0,
+    expert_used_count: usize = 0,
+    expert_feed_forward_length: usize = 0,
+    expert_shared_feed_forward_length: usize = 0,
+    expert_weights_scale: f32 = 1.0,
+    expert_weights_norm: bool = true,
+    expert_gating_func: u32 = 1,
     rope_dimension_count: usize,
     rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: usize,
@@ -742,6 +767,7 @@ pub const Model = struct {
     output_norm: TensorRef,
     layers: []LayerRefs,
     is_qwen35_text: bool = false,
+    is_qwen35_moe: bool = false,
     partial_rotary_factor: f32 = 1.0,
     linear_num_key_heads: u32 = 16,
     linear_num_value_heads: u32 = 16,
@@ -767,6 +793,13 @@ pub const Model = struct {
             allocator.free(layer.ffn_gate.name);
             allocator.free(layer.ffn_down.name);
             allocator.free(layer.ffn_up.name);
+            if (layer.moe) |moe| {
+                allocator.free(moe.router.name);
+                allocator.free(moe.gate_exps.name);
+                allocator.free(moe.down_exps.name);
+                allocator.free(moe.up_exps.name);
+                if (moe.shared_router_gate) |gate| allocator.free(gate.name);
+            }
             if (layer.post_attention_norm) |n| allocator.free(n.name);
             if (layer.post_ffw_norm) |n| allocator.free(n.name);
             if (layer.linear_attn) |la| {
@@ -845,6 +878,9 @@ const Session = struct {
     attn_tmp: []f32,
     gate: []f32,
     up: []f32,
+    router_logits: []f32,
+    moe_selected_experts: []u32,
+    moe_selected_weights: []f32,
     logits: []f32,
     pending_greedy_token: ?u32 = null,
     pending_shortlist: [gpu.max_shortlist_len]gpu.ShortlistEntry = undefined,
@@ -897,6 +933,9 @@ const Session = struct {
             .attn_tmp = try allocator.alloc(f32, model.embedding_length),
             .gate = try allocator.alloc(f32, model.feed_forward_length),
             .up = try allocator.alloc(f32, model.feed_forward_length),
+            .router_logits = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_count)),
+            .moe_selected_experts = try allocator.alloc(u32, @max(@as(usize, 1), model.expert_used_count)),
+            .moe_selected_weights = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_used_count)),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
             .scores = try allocator.alloc(f32, context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
@@ -949,6 +988,9 @@ const Session = struct {
         allocator.free(self.attn_tmp);
         allocator.free(self.gate);
         allocator.free(self.up);
+        allocator.free(self.router_logits);
+        allocator.free(self.moe_selected_experts);
+        allocator.free(self.moe_selected_weights);
         allocator.free(self.logits);
         allocator.free(self.scores);
         allocator.free(self.k_cache);
@@ -1223,21 +1265,25 @@ const Session = struct {
                 addInPlace(self.hidden, self.attn_tmp);
 
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
-                try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
-                try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
-                try self.matVec(self.gate, layer.ffn_gate, self.normed);
-                try self.matVec(self.up, layer.ffn_up, self.normed);
-                if (self.model.use_gelu_ffn) {
-                    geluInPlace(self.gate);
+                if (layer.moe) |moe| {
+                    try self.computeMoeFfn(layer, moe);
                 } else {
-                    siluInPlace(self.gate);
+                    try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
+                    try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
+                    try self.matVec(self.gate, layer.ffn_gate, self.normed);
+                    try self.matVec(self.up, layer.ffn_up, self.normed);
+                    if (self.model.use_gelu_ffn) {
+                        geluInPlace(self.gate);
+                    } else {
+                        siluInPlace(self.gate);
+                    }
+                    for (self.gate, self.up) |*gate, up| {
+                        gate.* *= up;
+                    }
+                    try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
+                    try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
+                    if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
                 }
-                for (self.gate, self.up) |*gate, up| {
-                    gate.* *= up;
-                }
-                try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
-                try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
-                if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
                 addInPlace(self.hidden, self.attn_tmp);
             }
         }
@@ -1495,6 +1541,105 @@ const Session = struct {
             const row = bytes[row_index * row_size ..][0..row_size];
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
+    }
+
+    fn matVecRows(self: *Session, out: []f32, tensor: TensorRef, input: []const f32, row_offset: usize) !void {
+        if (self.backend != null) return error.UnsupportedBackend;
+
+        const row_len = try tensor.rowLen();
+        const total_rows = try tensor.rowCount();
+        if (row_len != input.len) return error.InvalidTensorMetadata;
+        if (row_offset + out.len > total_rows) return error.InvalidTensorMetadata;
+
+        const bytes = try tensorBytes(self.model, tensor);
+        const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        for (0..out.len) |index| {
+            const row_index = row_offset + index;
+            const row = bytes[row_index * row_size ..][0..row_size];
+            out[index] = try dotRow(tensor.tensor_type, row, row_len, input);
+        }
+    }
+
+    fn dotSingleRowTensor(self: *Session, tensor: TensorRef, input: []const f32) !f32 {
+        if (self.backend != null) return error.UnsupportedBackend;
+
+        const row_len = try tensor.rowLen();
+        const row_count = try tensor.rowCount();
+        if (row_count != 1 or row_len != input.len) return error.InvalidTensorMetadata;
+
+        const bytes = try tensorBytes(self.model, tensor);
+        const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        return dotRow(tensor.tensor_type, bytes[0..row_size], row_len, input);
+    }
+
+    fn computeSharedFfn(self: *Session, layer: LayerRefs, scale: f32) !void {
+        const hidden_len = try layer.ffn_gate.rowCount();
+        if (hidden_len != try layer.ffn_up.rowCount()) return error.InvalidTensorMetadata;
+        if (hidden_len > self.gate.len or hidden_len > self.up.len) return error.InvalidTensorMetadata;
+
+        const gate_buf = self.gate[0..hidden_len];
+        const up_buf = self.up[0..hidden_len];
+        try self.matVec(gate_buf, layer.ffn_gate, self.normed);
+        try self.matVec(up_buf, layer.ffn_up, self.normed);
+        if (self.model.use_gelu_ffn) {
+            geluInPlace(gate_buf);
+        } else {
+            siluInPlace(gate_buf);
+        }
+        for (gate_buf, up_buf) |*gate, up| gate.* *= up;
+
+        try self.matVec(self.up[0..self.model.embedding_length], layer.ffn_down, gate_buf);
+        addScaledInPlace(self.attn_tmp, self.up[0..self.model.embedding_length], scale);
+    }
+
+    fn computeExpertFfn(self: *Session, moe: MoeFfnTensors, expert_index: usize, scale: f32) !void {
+        const expert_ff_len = self.model.expert_feed_forward_length;
+        if (expert_ff_len == 0) return error.InvalidMetadataValue;
+        if (expert_ff_len > self.gate.len or expert_ff_len > self.up.len) return error.InvalidTensorMetadata;
+
+        const gate_offset = expert_index * expert_ff_len;
+        const down_offset = expert_index * self.model.embedding_length;
+        const gate_buf = self.gate[0..expert_ff_len];
+        const up_buf = self.up[0..expert_ff_len];
+
+        try self.matVecRows(gate_buf, moe.gate_exps, self.normed, gate_offset);
+        try self.matVecRows(up_buf, moe.up_exps, self.normed, gate_offset);
+        siluInPlace(gate_buf);
+        for (gate_buf, up_buf) |*gate, up| gate.* *= up;
+
+        try self.matVecRows(self.up[0..self.model.embedding_length], moe.down_exps, gate_buf, down_offset);
+        addScaledInPlace(self.attn_tmp, self.up[0..self.model.embedding_length], scale);
+    }
+
+    fn computeMoeFfn(self: *Session, layer: LayerRefs, moe: MoeFfnTensors) !void {
+        if (self.model.expert_count == 0 or self.model.expert_used_count == 0) return error.InvalidMetadataValue;
+
+        const router_logits = self.router_logits[0..self.model.expert_count];
+        try self.matVec(router_logits, moe.router, self.normed);
+        switch (self.model.expert_gating_func) {
+            0 => {},
+            1, 2 => softmaxInPlace(router_logits),
+            else => return error.InvalidMetadataValue,
+        }
+
+        const selected_experts = self.moe_selected_experts[0..self.model.expert_used_count];
+        const selected_weights = self.moe_selected_weights[0..self.model.expert_used_count];
+        selectTopK(router_logits, selected_experts, selected_weights);
+        if (self.model.expert_weights_norm) normalizePositiveWeights(selected_weights);
+        if (self.model.expert_weights_scale != 1.0) scaleInPlace(selected_weights, self.model.expert_weights_scale);
+
+        @memset(self.attn_tmp, 0);
+        for (selected_experts, selected_weights) |expert_index, weight| {
+            try self.computeExpertFfn(moe, expert_index, weight);
+        }
+
+        const shared_scale = if (moe.shared_router_gate) |gate_tensor|
+            sigmoidScalar(try self.dotSingleRowTensor(gate_tensor, self.normed))
+        else
+            1.0;
+        try self.computeSharedFfn(layer, shared_scale);
+
+        if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
     }
 
     fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
@@ -2289,9 +2434,11 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
     const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
     const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
+    const is_qwen35_moe = std.mem.eql(u8, architecture, "qwen35moe");
+    const is_qwen35_like = is_qwen35_text or is_qwen35_moe;
     const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
-    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text and !is_gemma) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (is_qwen35_text)
+    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_like and !is_gemma) return error.UnsupportedArchitecture;
+    const rope_style: RopeStyle = if (is_qwen35_like)
         .imrope
     else if (is_qwen or is_mistral or is_gemma)
         .neox
@@ -2319,7 +2466,19 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const block_count = metadata.block_count orelse return error.MissingRequiredMetadata;
     const embedding_length = metadata.embedding_length orelse return error.MissingRequiredMetadata;
     const context_length = metadata.context_length orelse return error.MissingRequiredMetadata;
-    const feed_forward_length = metadata.feed_forward_length orelse return error.MissingRequiredMetadata;
+    const expert_count = metadata.expert_count orelse 0;
+    const expert_used_count = metadata.expert_used_count orelse 0;
+    const expert_feed_forward_length = metadata.expert_feed_forward_length orelse 0;
+    const expert_shared_feed_forward_length = metadata.expert_shared_feed_forward_length orelse 0;
+    const expert_weights_scale = metadata.expert_weights_scale orelse 1.0;
+    const expert_weights_norm = metadata.expert_weights_norm orelse is_qwen35_moe;
+    const expert_gating_func = metadata.expert_gating_func orelse (if (is_qwen35_moe) @as(u32, 1) else @as(u32, 0));
+    const feed_forward_length = metadata.feed_forward_length orelse blk: {
+        if (!is_qwen35_moe) return error.MissingRequiredMetadata;
+        const derived = @max(expert_feed_forward_length, expert_shared_feed_forward_length);
+        if (derived == 0) return error.MissingRequiredMetadata;
+        break :blk derived;
+    };
     const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
     const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
 
@@ -2381,8 +2540,10 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const layers = try allocator.alloc(LayerRefs, block_count);
     errdefer allocator.free(layers);
     for (0..block_count) |index| {
-        const is_qwen35_linear = is_qwen35_dense and hasLayerTensor(&tensors, index, "attn_qkv.weight");
-        const ffn_norm = if (is_qwen35_dense and !hasLayerTensor(&tensors, index, "ffn_norm.weight"))
+        const is_qwen35_linear = is_qwen35_like and hasLayerTensor(&tensors, index, "attn_qkv.weight");
+        const has_moe = is_qwen35_moe and hasLayerTensor(&tensors, index, "ffn_gate_inp.weight");
+        const uses_post_attention_as_ffn_norm = is_qwen35_like and !hasLayerTensor(&tensors, index, "ffn_norm.weight");
+        const ffn_norm = if (uses_post_attention_as_ffn_norm)
             try takeLayerTensor(allocator, &tensors, index, "post_attention_norm.weight")
         else
             try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight");
@@ -2398,10 +2559,19 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
             .attn_v_bias = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
             .attn_output = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_output.weight"),
             .ffn_norm = ffn_norm,
-            .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
-            .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
-            .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-            .post_attention_norm = if (is_qwen35_dense) null else try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
+            .ffn_gate = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_gate_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+            .ffn_down = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_down_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+            .ffn_up = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_up_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+            .post_attention_norm = if (is_qwen35_dense or uses_post_attention_as_ffn_norm) null else try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
             .post_ffw_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_ffw_norm.weight"),
             .linear_attn = if (is_qwen35_linear) .{
                 .in_proj_qkv = try takeLayerTensor(allocator, &tensors, index, "attn_qkv.weight"),
@@ -2413,6 +2583,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
                 .A_log = try takeLayerTensor(allocator, &tensors, index, "ssm_a"),
                 .norm_weight = try takeLayerTensor(allocator, &tensors, index, "ssm_norm.weight"),
                 .out_proj = try takeLayerTensor(allocator, &tensors, index, "ssm_out.weight"),
+            } else null,
+            .moe = if (has_moe) .{
+                .router = try takeLayerTensor(allocator, &tensors, index, "ffn_gate_inp.weight"),
+                .gate_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_gate_exps.weight"),
+                .down_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_down_exps.weight"),
+                .up_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_up_exps.weight"),
+                .shared_router_gate = try takeOptionalLayerTensor(allocator, &tensors, index, "ffn_gate_inp_shexp.weight"),
             } else null,
         };
     }
@@ -2430,6 +2607,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .embedding_length = embedding_length,
         .block_count = block_count,
         .feed_forward_length = feed_forward_length,
+        .expert_count = expert_count,
+        .expert_used_count = expert_used_count,
+        .expert_feed_forward_length = expert_feed_forward_length,
+        .expert_shared_feed_forward_length = expert_shared_feed_forward_length,
+        .expert_weights_scale = expert_weights_scale,
+        .expert_weights_norm = expert_weights_norm,
+        .expert_gating_func = expert_gating_func,
         .rope_dimension_count = rope_dimension_count,
         .rope_dimension_sections = metadata.rope_dimension_sections,
         .head_count = head_count,
@@ -2457,6 +2641,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .output_norm = output_norm,
         .layers = layers,
         .is_qwen35_text = is_qwen35_text,
+        .is_qwen35_moe = is_qwen35_moe,
         .partial_rotary_factor = partial_rotary_factor,
         .linear_num_key_heads = linear_num_key_heads,
         .linear_num_value_heads = linear_num_value_heads,
@@ -2742,6 +2927,34 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".expert_count")) {
+        metadata.expert_count = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_used_count")) {
+        metadata.expert_used_count = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_feed_forward_length")) {
+        metadata.expert_feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_shared_feed_forward_length")) {
+        metadata.expert_shared_feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_weights_scale")) {
+        metadata.expert_weights_scale = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_weights_norm")) {
+        metadata.expert_weights_norm = try readExpectedBool(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_gating_func")) {
+        metadata.expert_gating_func = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
     if (std.mem.endsWith(u8, key, ".rope.dimension_count")) {
         metadata.rope_dimension_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
@@ -2834,6 +3047,10 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.endsWith(u8, key, ".ssm.conv_kernel")) {
         metadata.linear_conv_kernel_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".full_attention_interval")) {
+        metadata.full_attention_interval = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
     if (std.mem.eql(u8, key, "layer_types")) {
@@ -3025,7 +3242,15 @@ pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 256);
         },
-        .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 98);
+        },
+        .iq4_xs => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 136);
+        },
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
@@ -3089,10 +3314,13 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
             }
         },
         .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
+        .q3_k => try quant_extra.dequantizeRowQ3K(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
         .q6_k => try dequantizeRowQ6K(out, row, row_len),
         .q5_k => try dequantizeRowQ5K(out, row, row_len),
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => try quant_extra.dequantizeRowIQ3XXS(out, row, row_len),
+        .iq4_xs => try quant_extra.dequantizeRowIQ4XS(out, row, row_len),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     }
@@ -3117,10 +3345,13 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
         .q8_0 => try dotQ8_0Row(row, row_len, input),
+        .q3_k => try quant_extra.dotQ3KRow(row, row_len, input),
         .q4_k => try dotQ4KRow(row, row_len, input),
         .q6_k => try dotQ6KRow(row, row_len, input),
         .q5_k => try dotQ5KRow(row, row_len, input),
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => try quant_extra.dotIQ3XXSRow(row, row_len, input),
+        .iq4_xs => try quant_extra.dotIQ4XSRow(row, row_len, input),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
@@ -3147,10 +3378,13 @@ fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, i
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
         .q8_0 => dotQ8_0Row(row, row_len, input) catch unreachable,
+        .q3_k => quant_extra.dotQ3KRow(row, row_len, input) catch unreachable,
         .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
         .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
         .q5_k => dotQ5KRow(row, row_len, input) catch unreachable,
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => unreachable,
+        .iq3_xxs => quant_extra.dotIQ3XXSRow(row, row_len, input) catch unreachable,
+        .iq4_xs => quant_extra.dotIQ4XSRow(row, row_len, input) catch unreachable,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => unreachable,
         .i8, .i16, .i32, .i64, .f64, .bf16 => unreachable,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => unreachable,
     };
@@ -3499,6 +3733,63 @@ fn addInPlace(dst: []f32, src: []const f32) void {
     }
     while (i < dst.len) : (i += 1) {
         dst[i] += src[i];
+    }
+}
+
+fn addScaledInPlace(dst: []f32, src: []const f32, scale: f32) void {
+    if (scale == 1.0) {
+        addInPlace(dst, src);
+        return;
+    }
+
+    var i: usize = 0;
+    const scale_vec: F32x = @splat(scale);
+    while (i + simd_lane_count <= dst.len) : (i += simd_lane_count) {
+        const dst_vec = loadInputVec(dst, i);
+        const src_vec = loadInputVec(src, i);
+        @as(*[simd_lane_count]f32, @ptrCast(dst[i..])).* = @mulAdd(F32x, src_vec, scale_vec, dst_vec);
+    }
+    while (i < dst.len) : (i += 1) {
+        dst[i] += src[i] * scale;
+    }
+}
+
+fn selectTopK(probs: []const f32, out_indices: []u32, out_weights: []f32) void {
+    @memset(out_indices, 0);
+    @memset(out_weights, negative_infinity);
+
+    for (probs, 0..) |prob, index| {
+        var insert_at = out_weights.len;
+        for (out_weights, 0..) |current, slot| {
+            if (prob > current) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == out_weights.len) continue;
+
+        var shift = out_weights.len - 1;
+        while (shift > insert_at) : (shift -= 1) {
+            out_weights[shift] = out_weights[shift - 1];
+            out_indices[shift] = out_indices[shift - 1];
+        }
+        out_weights[insert_at] = prob;
+        out_indices[insert_at] = @intCast(index);
+    }
+}
+
+fn normalizePositiveWeights(weights: []f32) void {
+    var sum: f32 = 0;
+    for (weights) |weight| {
+        if (std.math.isFinite(weight) and weight > 0) sum += weight;
+    }
+    if (sum <= 0) {
+        @memset(weights, 0);
+        return;
+    }
+    const inv_sum = 1.0 / sum;
+    for (weights) |*weight| {
+        weight.* = if (std.math.isFinite(weight.*) and weight.* > 0) weight.* * inv_sum else 0;
     }
 }
 
