@@ -43,12 +43,13 @@ pub fn buildPrompt(
     messages: []Message,
 ) ![]u8 {
     const template_style = try runtime_cache.chatTemplateStyle(model_path, backend, context_length_limit);
+    const needs_thinking_prefix = try runtime_cache.chatTemplateNeedsThinkingPrefix(model_path, backend, context_length_limit);
     const context_length = try contextWindow(runtime_cache, model_path, backend, context_length_limit);
     const token_budget = context_length -| (max_tokens + token_safety_margin);
 
     const system_prefix_len = countLeadingSystemMessages(messages);
     const include_default_system = shouldInjectDefaultSystem(template_style, system_prefix_len);
-    const base_token_count = try promptBaseTokenCount(runtime_cache, model_path, backend, template_style, include_default_system);
+    const base_token_count = try promptBaseTokenCount(runtime_cache, model_path, backend, template_style, include_default_system, needs_thinking_prefix);
     var estimated_tokens = base_token_count;
 
     for (messages) |*message| {
@@ -77,7 +78,7 @@ pub fn buildPrompt(
         }
     }
 
-    return renderConversation(allocator, template_style, messages[0..system_prefix_len], messages[start_index..], include_default_system);
+    return renderConversation(allocator, template_style, messages[0..system_prefix_len], messages[start_index..], include_default_system, needs_thinking_prefix);
 }
 
 pub fn trimAssistantReply(reply: []const u8) []const u8 {
@@ -169,6 +170,7 @@ fn renderConversation(
     system_messages: []const Message,
     messages: []const Message,
     include_default_system: bool,
+    needs_thinking_prefix: bool,
 ) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -227,7 +229,11 @@ fn renderConversation(
                 };
                 try writer.print("<|im_start|>{s}\n{s}<|im_end|>\n", .{ tag, message.content });
             }
-            try writer.print("<|im_start|>assistant\n", .{});
+            if (needs_thinking_prefix) {
+                try writer.print("<|im_start|>assistant\n<think>\n", .{});
+            } else {
+                try writer.print("<|im_start|>assistant\n", .{});
+            }
         },
         .gemma => {
             try writer.print("<bos>", .{});
@@ -285,8 +291,9 @@ fn promptBaseTokenCount(
     backend: runtime.BackendPreference,
     template_style: gguf.ChatTemplateStyle,
     include_default_system: bool,
+    needs_thinking_prefix: bool,
 ) !usize {
-    const scaffold = promptScaffold(template_style, include_default_system);
+    const scaffold = promptScaffold(template_style, include_default_system, needs_thinking_prefix);
     return runtime_cache.promptTokenCount(model_path, scaffold, backend);
 }
 
@@ -335,11 +342,14 @@ fn countRenderedMessageTokens(
     return runtime_cache.promptTokenCount(model_path, snippet, backend);
 }
 
-fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system: bool) []const u8 {
+fn promptScaffold(template_style: gguf.ChatTemplateStyle, include_default_system: bool, needs_thinking_prefix: bool) []const u8 {
     return switch (template_style) {
         .generic => if (include_default_system) "System: " ++ system_message ++ "\nAssistant:" else "Assistant:",
         .chatml => if (include_default_system) "<|system|>\n" ++ system_message ++ "</s>\n<|assistant|>\n" else "<|assistant|>\n",
-        .qwen => if (include_default_system) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n" else "<|im_start|>assistant\n",
+        .qwen => if (include_default_system)
+            (if (needs_thinking_prefix) "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n" else "<|im_start|>system\n" ++ system_message ++ "<|im_end|>\n<|im_start|>assistant\n")
+        else
+            (if (needs_thinking_prefix) "<|im_start|>assistant\n<think>\n" else "<|im_start|>assistant\n"),
         .gemma => if (include_default_system) "<bos><start_of_turn>user\n" ++ system_message ++ "<end_of_turn>\n<start_of_turn>model\n" else "<bos><start_of_turn>model\n",
     };
 }

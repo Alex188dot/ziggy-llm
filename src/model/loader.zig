@@ -154,6 +154,7 @@ pub const TensorType = enum(u32) {
 pub const RopeStyle = enum(u32) {
     interleaved = 0,
     neox = 1,
+    imrope = 2,
 };
 
 const TokenType = enum(u32) {
@@ -259,6 +260,7 @@ const Metadata = struct {
     block_count: ?u32 = null,
     feed_forward_length: ?u32 = null,
     rope_dimension_count: ?u32 = null,
+    rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: ?u32 = null,
     head_count_kv: ?u32 = null,
     attention_key_length: ?u32 = null,
@@ -323,6 +325,7 @@ const Tokenizer = struct {
     add_eos_token: bool,
     add_space_prefix: bool,
     prefer_longest_match: bool = false,
+    pretokenizer: Pretokenizer = .none,
 
     const Mode = enum {
         score_dp,
@@ -337,6 +340,11 @@ const Tokenizer = struct {
     const MergeValue = struct {
         merged: u32,
         rank: u32,
+    };
+
+    const Pretokenizer = enum {
+        none,
+        qwen35,
     };
 
     fn deinit(self: *Tokenizer, allocator: std.mem.Allocator) void {
@@ -606,11 +614,25 @@ const Tokenizer = struct {
 
     fn encodeGpt2BpeChunk(self: Tokenizer, allocator: std.mem.Allocator, chunk: []const u8, pieces: *std.ArrayList(u32)) !void {
         if (chunk.len == 0) return;
+        if (self.pretokenizer == .qwen35) {
+            var pos: usize = 0;
+            while (pos < chunk.len) {
+                const end = nextQwen35ChunkBoundary(chunk, pos);
+                try self.encodeGpt2BpePiece(allocator, chunk[pos..end], pieces);
+                pos = end;
+            }
+            return;
+        }
+        try self.encodeGpt2BpePiece(allocator, chunk, pieces);
+    }
+
+    fn encodeGpt2BpePiece(self: Tokenizer, allocator: std.mem.Allocator, piece: []const u8, pieces: *std.ArrayList(u32)) !void {
+        if (piece.len == 0) return;
         var chunk_pieces = std.ArrayList(u32).empty;
         defer chunk_pieces.deinit(allocator);
-        try chunk_pieces.ensureTotalCapacity(allocator, chunk.len);
+        try chunk_pieces.ensureTotalCapacity(allocator, piece.len);
 
-        for (chunk) |byte| {
+        for (piece) |byte| {
             const token_id = self.byte_fallback[byte] orelse return error.UnknownToken;
             chunk_pieces.appendAssumeCapacity(token_id);
         }
@@ -694,6 +716,7 @@ pub const Model = struct {
     block_count: usize,
     feed_forward_length: usize,
     rope_dimension_count: usize,
+    rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: usize,
     head_count_kv: usize,
     head_dimension: usize,
@@ -882,10 +905,10 @@ const Session = struct {
             .linear_recurrent_state = try allocator.alloc(f32, model.block_count * recurrent_state_per_layer),
             .linear_qkv = try allocator.alloc(f32, linear_qkv_dim),
             .linear_z = try allocator.alloc(f32, linear_z_dim),
-            .linear_a = try allocator.alloc(f32, model.linear_num_key_heads),
-            .linear_b = try allocator.alloc(f32, model.linear_num_key_heads),
-            .linear_g = try allocator.alloc(f32, model.linear_num_key_heads),
-            .linear_conv_tmp = try allocator.alloc(f32, linear_z_dim),
+            .linear_a = try allocator.alloc(f32, linear_num_v_heads),
+            .linear_b = try allocator.alloc(f32, linear_num_v_heads),
+            .linear_g = try allocator.alloc(f32, linear_num_v_heads),
+            .linear_conv_tmp = try allocator.alloc(f32, linear_qkv_dim),
             .moon_quant_calibrator = moon_quant_calibrator,
         };
         errdefer session.deinit(allocator);
@@ -896,6 +919,9 @@ const Session = struct {
                 session.gpu_session = try gpu.Session.init(selected_backend, adaptDenseLookup(lookup), adaptModelDesc(model, context_length), profiler);
             }
         }
+
+        @memset(session.linear_conv_state, 0);
+        @memset(session.linear_recurrent_state, 0);
 
         if (backend == null) {
             const cpu_count = std.Thread.getCpuCount() catch 1;
@@ -1175,8 +1201,8 @@ const Session = struct {
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
                 const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
-                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style);
-                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style);
+                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 if (q_gate) |gate_values| {
@@ -1194,6 +1220,8 @@ const Session = struct {
             if (self.gpu_session) |*gpu_session| {
                 try gpu_session.runFfnBlock(adaptLayerDesc(layer));
             } else {
+                addInPlace(self.hidden, self.attn_tmp);
+
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
                 try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
                 try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
@@ -1210,8 +1238,8 @@ const Session = struct {
                 try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
                 try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
                 if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
+                addInPlace(self.hidden, self.attn_tmp);
             }
-            addInPlace(self.hidden, self.attn_tmp);
         }
     }
 
@@ -1423,7 +1451,7 @@ const Session = struct {
             }
         }
 
-        try self.rmsNormPerHead(self.linear_conv_tmp[0..v_dim], delta_out, linear_attn.norm_weight, num_value_heads, value_head_dim);
+        try self.rmsNormPerHeadWithOffset(self.linear_conv_tmp[0..v_dim], delta_out, linear_attn.norm_weight, num_value_heads, value_head_dim, 0.0);
         for (0..v_dim) |idx| {
             self.linear_z[idx] = self.linear_conv_tmp[idx] * siluScalar(self.linear_z[idx]);
         }
@@ -1484,6 +1512,18 @@ const Session = struct {
     }
 
     fn rmsNormPerHead(self: *Session, out: []f32, input: []const f32, tensor: TensorRef, head_count: usize, head_dim: usize) !void {
+        try self.rmsNormPerHeadWithOffset(out, input, tensor, head_count, head_dim, self.model.rms_norm_weight_offset);
+    }
+
+    fn rmsNormPerHeadWithOffset(
+        self: *Session,
+        out: []f32,
+        input: []const f32,
+        tensor: TensorRef,
+        head_count: usize,
+        head_dim: usize,
+        weight_offset: f32,
+    ) !void {
         const weights = try tensorBytes(self.model, tensor);
         if (tensor.tensor_type != .f32) return error.UnsupportedTensorType;
         if (try tensor.rowLen() != head_dim) return error.InvalidTensorMetadata;
@@ -1502,12 +1542,12 @@ const Session = struct {
                 const input_vec = loadInputVec(h_in, i);
                 const weight_vec = loadF32Vec(weights[i * 4 ..][0 .. simd_lane_count * 4]);
                 const scale_vec: F32x = @splat(scale);
-                const weight_offset_vec: F32x = @splat(self.model.rms_norm_weight_offset);
+                const weight_offset_vec: F32x = @splat(weight_offset);
                 const result = scale_vec * input_vec * (weight_vec + weight_offset_vec);
                 @as(*[simd_lane_count]f32, @ptrCast(h_out[i..])).* = result;
             }
             while (i < head_dim) : (i += 1) {
-                const weight = readF32(weights[i * 4 ..][0..4]) + self.model.rms_norm_weight_offset;
+                const weight = readF32(weights[i * 4 ..][0..4]) + weight_offset;
                 h_out[i] = h_in[i] * scale * weight;
             }
         }
@@ -1575,6 +1615,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .context_length = context_length,
         .feed_forward_length = model.feed_forward_length,
         .rope_dimension_count = model.rope_dimension_count,
+        .rope_dimension_sections = model.rope_dimension_sections,
         .head_count = model.head_count,
         .head_count_kv = model.head_count_kv,
         .head_dimension = model.head_dimension,
@@ -1585,6 +1626,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .kv_dimension = model.kv_dimension,
         .rope_freq_base = model.rope_freq_base,
         .rope_scaling_factor = model.rope_scaling_factor,
+        .partial_rotary_factor = model.partial_rotary_factor,
         .sliding_window = model.sliding_window,
         .attn_logit_softcapping = model.attn_logit_softcapping,
         .final_logit_softcapping = model.final_logit_softcapping,
@@ -2249,7 +2291,12 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
     const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
     if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text and !is_gemma) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (is_qwen or is_mistral or is_qwen35_text or is_gemma) .neox else .interleaved;
+    const rope_style: RopeStyle = if (is_qwen35_text)
+        .imrope
+    else if (is_qwen or is_mistral or is_gemma)
+        .neox
+    else
+        .interleaved;
 
     if (metadata.tokenizer_model) |tm| {
         if (!isSupportedTokenizerModel(tm)) return error.UnsupportedTokenizer;
@@ -2384,6 +2431,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .block_count = block_count,
         .feed_forward_length = feed_forward_length,
         .rope_dimension_count = rope_dimension_count,
+        .rope_dimension_sections = metadata.rope_dimension_sections,
         .head_count = head_count,
         .head_count_kv = head_count_kv,
         .head_dimension = head_dimension,
@@ -2646,6 +2694,10 @@ fn buildGpt2Tokenizer(allocator: std.mem.Allocator, metadata: *Metadata, token_c
         .add_eos_token = metadata.add_eos_token orelse false,
         .add_space_prefix = metadata.add_space_prefix orelse true,
         .prefer_longest_match = false,
+        .pretokenizer = if (metadata.tokenizer_pre) |pre|
+            if (std.mem.eql(u8, pre, "qwen35")) Tokenizer.Pretokenizer.qwen35 else Tokenizer.Pretokenizer.none
+        else
+            .none,
     };
 }
 
@@ -2694,6 +2746,10 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.rope_dimension_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".rope.dimension_sections")) {
+        metadata.rope_dimension_sections = try readExpectedFixedU32Array(parser, value_type, 4);
+        return;
+    }
     if (std.mem.endsWith(u8, key, ".attention.head_count")) {
         metadata.head_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
@@ -2738,7 +2794,7 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.final_logit_softcapping = try readExpectedFloat(parser, value_type);
         return;
     }
-    if (std.mem.eql(u8, key, "partial_rotary_factor")) {
+    if (std.mem.eql(u8, key, "partial_rotary_factor") or std.mem.endsWith(u8, key, ".partial_rotary_factor")) {
         metadata.partial_rotary_factor = try readExpectedFloat(parser, value_type);
         return;
     }
@@ -3338,36 +3394,86 @@ fn getScaleMinK4(index: usize, scale_bytes: []const u8) ScaleMinK4 {
         };
 }
 
-fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: RopeStyle) void {
+fn applyRoPE(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: RopeStyle, rope_sections: [4]u32) void {
     const n_rot = @min(rope_dim, head_dim);
     const pos_f32 = @as(f32, @floatFromInt(position));
     for (0..head_count) |head_index| {
         const head = values[head_index * head_dim ..][0..head_dim];
-        if (rope_style == .interleaved) {
-            var pair: usize = 0;
-            while (pair + 1 < n_rot) : (pair += 2) {
-                const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
-                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
-                const cos_theta = @cos(theta);
-                const sin_theta = @sin(theta);
-                const x0 = head[pair];
-                const x1 = head[pair + 1];
-                head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
-                head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
-            }
-        } else {
-            const half_rot = n_rot / 2;
-            for (0..half_rot) |i| {
-                const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(n_rot));
-                const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
-                const cos_theta = @cos(theta);
-                const sin_theta = @sin(theta);
-                const x0 = head[i];
-                const x1 = head[i + half_rot];
-                head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
-                head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
-            }
+        switch (rope_style) {
+            .interleaved => applyInterleavedRoPE(head, n_rot, pos_f32, freq_base),
+            .neox => applyNeoxRoPE(head, n_rot, pos_f32, freq_base),
+            .imrope => applyImrope(head, n_rot, pos_f32, freq_base, rope_sections),
         }
+    }
+}
+
+fn applyInterleavedRoPE(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32) void {
+    var pair: usize = 0;
+    while (pair + 1 < n_rot) : (pair += 2) {
+        const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
+        const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[pair];
+        const x1 = head[pair + 1];
+        head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+    }
+}
+
+fn applyNeoxRoPE(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32) void {
+    const half_rot = n_rot / 2;
+    for (0..half_rot) |i| {
+        const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(n_rot));
+        const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[i];
+        const x1 = head[i + half_rot];
+        head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+    }
+}
+
+fn applyImrope(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32, rope_sections: [4]u32) void {
+    const section_count = @as(usize, rope_sections[0] + rope_sections[1] + rope_sections[2] + rope_sections[3]);
+    if (section_count == 0) {
+        applyNeoxRoPE(head, n_rot, pos_f32, freq_base);
+        return;
+    }
+
+    const half_rot = n_rot / 2;
+    const theta_scale = std.math.pow(f32, freq_base, -2.0 / @as(f32, @floatFromInt(n_rot)));
+    const section_t = @as(usize, rope_sections[0]);
+    const section_h = @as(usize, rope_sections[1]);
+    const section_w = @as(usize, rope_sections[2]);
+
+    var theta_t = pos_f32;
+    var theta_h = pos_f32;
+    var theta_w = pos_f32;
+    var theta_e = pos_f32;
+
+    for (0..half_rot) |i| {
+        const sector = i % section_count;
+        const theta = if (sector % 3 == 1 and sector < 3 * section_h)
+            theta_h
+        else if (sector % 3 == 2 and sector < 3 * section_w)
+            theta_w
+        else if (sector % 3 == 0 and sector < 3 * section_t)
+            theta_t
+        else
+            theta_e;
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[i];
+        const x1 = head[i + half_rot];
+        head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+
+        theta_t *= theta_scale;
+        theta_h *= theta_scale;
+        theta_w *= theta_scale;
+        theta_e *= theta_scale;
     }
 }
 
@@ -3631,6 +3737,104 @@ fn gpt2EncodeByte(buffer: *[4]u8, byte: u8) []const u8 {
     return buffer[0..len];
 }
 
+fn nextQwen35ChunkBoundary(chunk: []const u8, start: usize) usize {
+    var pos = start;
+    const byte = chunk[pos];
+
+    if (isQwen35ContractionStart(chunk, pos)) {
+        return pos + qwen35ContractionLen(chunk[pos..]);
+    }
+
+    if (isAsciiLetter(byte) or isUtf8NonAscii(byte) or (isQwen35WordLead(byte) and pos + 1 < chunk.len and isQwen35LetterLike(chunk[pos + 1]))) {
+        if (!isQwen35LetterLike(byte)) pos += 1;
+        while (pos < chunk.len and isQwen35LetterLike(chunk[pos])) : (pos += 1) {}
+        return pos;
+    }
+
+    if (isAsciiDigit(byte)) return pos + 1;
+
+    if (isQwen35HorizontalSpace(byte) and pos + 1 < chunk.len and isQwen35Punctuation(chunk[pos + 1])) {
+        pos += 1;
+    }
+    if (isQwen35Punctuation(chunk[pos])) {
+        pos += 1;
+        while (pos < chunk.len and isQwen35Punctuation(chunk[pos])) : (pos += 1) {}
+        while (pos < chunk.len and isQwen35Newline(chunk[pos])) : (pos += 1) {}
+        return pos;
+    }
+
+    if (isQwen35HorizontalSpace(byte)) {
+        var scan = pos;
+        while (scan < chunk.len and isQwen35HorizontalSpace(chunk[scan])) : (scan += 1) {}
+        if (scan < chunk.len and isQwen35Newline(chunk[scan])) {
+            pos = scan;
+            while (pos < chunk.len and isQwen35Newline(chunk[pos])) : (pos += 1) {}
+            return pos;
+        }
+        return scan;
+    }
+
+    if (isQwen35Newline(byte)) {
+        pos += 1;
+        while (pos < chunk.len and isQwen35Newline(chunk[pos])) : (pos += 1) {}
+        return pos;
+    }
+
+    return pos + 1;
+}
+
+fn isQwen35ContractionStart(chunk: []const u8, index: usize) bool {
+    if (chunk[index] != '\'') return false;
+    return qwen35ContractionLen(chunk[index..]) > 0;
+}
+
+fn qwen35ContractionLen(chunk: []const u8) usize {
+    if (chunk.len >= 4 and asciiEqIgnoreCase(chunk[1], 'r') and asciiEqIgnoreCase(chunk[2], 'e')) return 3;
+    if (chunk.len >= 4 and asciiEqIgnoreCase(chunk[1], 'v') and asciiEqIgnoreCase(chunk[2], 'e')) return 3;
+    if (chunk.len >= 4 and asciiEqIgnoreCase(chunk[1], 'l') and asciiEqIgnoreCase(chunk[2], 'l')) return 3;
+    if (chunk.len >= 3 and (asciiEqIgnoreCase(chunk[1], 's') or asciiEqIgnoreCase(chunk[1], 't') or asciiEqIgnoreCase(chunk[1], 'm') or asciiEqIgnoreCase(chunk[1], 'd'))) return 2;
+    return 0;
+}
+
+fn asciiEqIgnoreCase(lhs: u8, rhs_lower: u8) bool {
+    return std.ascii.toLower(lhs) == rhs_lower;
+}
+
+fn isAsciiLetter(byte: u8) bool {
+    return std.ascii.isAlphabetic(byte);
+}
+
+fn isAsciiDigit(byte: u8) bool {
+    return std.ascii.isDigit(byte);
+}
+
+fn isUtf8NonAscii(byte: u8) bool {
+    return byte & 0x80 != 0;
+}
+
+fn isQwen35LetterLike(byte: u8) bool {
+    return isAsciiLetter(byte) or isUtf8NonAscii(byte);
+}
+
+fn isQwen35WordLead(byte: u8) bool {
+    return !isQwen35Newline(byte) and !isQwen35LetterLike(byte) and !isAsciiDigit(byte);
+}
+
+fn isQwen35Newline(byte: u8) bool {
+    return byte == '\n' or byte == '\r';
+}
+
+fn isQwen35HorizontalSpace(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', 0x0B, 0x0C => true,
+        else => false,
+    };
+}
+
+fn isQwen35Punctuation(byte: u8) bool {
+    return !isQwen35LetterLike(byte) and !isAsciiDigit(byte) and !isQwen35HorizontalSpace(byte) and !isQwen35Newline(byte);
+}
+
 fn parseByteFallback(token: []const u8) ?u8 {
     if (token.len != 6) return null;
     if (!std.mem.startsWith(u8, token, "<0x")) return null;
@@ -3662,6 +3866,31 @@ fn readExpectedUnsigned(comptime T: type, parser: *Parser, value_type: ValueType
         .uint64 => std.math.cast(T, try parser.readInt(u64)) orelse error.InvalidMetadataValue,
         else => error.InvalidMetadataType,
     };
+}
+
+fn readExpectedFixedU32Array(parser: *Parser, value_type: ValueType, comptime expected_len: usize) ![expected_len]u32 {
+    if (value_type != .array) return error.InvalidMetadataType;
+    const element_type = std.meta.intToEnum(ValueType, try parser.readInt(u32)) catch return error.InvalidMetadataType;
+    if (element_type != .uint8 and element_type != .uint16 and element_type != .uint32 and element_type != .uint64 and element_type != .int8 and element_type != .int16 and element_type != .int32 and element_type != .int64) return error.InvalidMetadataType;
+
+    const count = try parser.readInt(u64);
+    if (count != expected_len) return error.InvalidMetadataValue;
+
+    var out: [expected_len]u32 = undefined;
+    for (0..expected_len) |i| {
+        out[i] = switch (element_type) {
+            .uint8 => @as(u32, try parser.readInt(u8)),
+            .uint16 => @as(u32, try parser.readInt(u16)),
+            .uint32 => try parser.readInt(u32),
+            .uint64 => std.math.cast(u32, try parser.readInt(u64)) orelse return error.InvalidMetadataValue,
+            .int8 => std.math.cast(u32, try parser.readInt(i8)) orelse return error.InvalidMetadataValue,
+            .int16 => std.math.cast(u32, try parser.readInt(i16)) orelse return error.InvalidMetadataValue,
+            .int32 => std.math.cast(u32, try parser.readInt(i32)) orelse return error.InvalidMetadataValue,
+            .int64 => std.math.cast(u32, try parser.readInt(i64)) orelse return error.InvalidMetadataValue,
+            else => unreachable,
+        };
+    }
+    return out;
 }
 
 fn readExpectedFloat(parser: *Parser, value_type: ValueType) !f32 {

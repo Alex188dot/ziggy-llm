@@ -671,6 +671,12 @@ pub fn detectChatTemplateStyle(chat_template: ?[]const u8) ChatTemplateStyle {
     return .generic;
 }
 
+pub fn chatTemplateNeedsThinkingPrefix(chat_template: ?[]const u8) bool {
+    const template = chat_template orelse return false;
+    return std.mem.indexOf(u8, template, "<|im_start|>assistant") != null and
+        std.mem.indexOf(u8, template, "<think>") != null;
+}
+
 fn formatOptionalBool(value: ?bool) []const u8 {
     if (value) |v| return if (v) "true" else "false";
     return "<unset>";

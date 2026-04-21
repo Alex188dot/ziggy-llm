@@ -279,20 +279,11 @@ pub const Session = struct {
         if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.key_head_dimension);
 
         const q_rope_start = std.time.nanoTimestamp();
-        try metal_backend.applyRoPE(
-            self.backend,
-            self.q,
-            self.model.head_count,
-            self.model.rope_dimension_count,
-            self.model.key_head_dimension,
-            position,
-            self.model.rope_freq_base,
-            self.model.rope_style,
-        );
+        try self.applyRoPEBuffer(self.q, self.host_q_values, self.model.head_count, self.model.key_head_dimension, position);
         self.recordCategoryWithShape(.elementwise_ops, q_rope_start, .{
             .rows = self.model.head_count,
-            .cols = self.model.rope_dimension_count,
-            .depth = self.model.rope_dimension_count,
+            .cols = self.rotaryDimension(),
+            .depth = self.rotaryDimension(),
             .extra = position + 1,
         });
 
@@ -303,16 +294,7 @@ pub const Session = struct {
         try self.runProjection(layer.attn_k.?, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
         if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.key_head_dimension);
-        try metal_backend.applyRoPE(
-            self.backend,
-            self.k,
-            self.model.head_count_kv,
-            self.model.rope_dimension_count,
-            self.model.key_head_dimension,
-            position,
-            self.model.rope_freq_base,
-            self.model.rope_style,
-        );
+        try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
         try metal_backend.storeKvHalf(
             self.backend,
             self.k,
@@ -322,8 +304,8 @@ pub const Session = struct {
         );
         self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
-            .cols = self.model.rope_dimension_count,
-            .depth = self.model.rope_dimension_count,
+            .cols = self.rotaryDimension(),
+            .depth = self.rotaryDimension(),
             .extra = position + 1,
         });
         self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
@@ -536,10 +518,46 @@ pub const Session = struct {
         return (position + 1) - @min(position + 1, window);
     }
 
+    fn rotaryDimension(self: *const Session) usize {
+        return @min(
+            @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor)),
+            self.model.key_head_dimension,
+        );
+    }
+
     fn layerUsesSlidingWindow(self: *const Session, layer_index: usize) bool {
         if (self.model.sliding_window == 0) return false;
         if (self.model.global_attention_interval == 0) return true;
         return ((layer_index + 1) % self.model.global_attention_interval) != 0;
+    }
+
+    fn applyRoPEBuffer(
+        self: *Session,
+        buffer: metal_backend.BufferHandle,
+        host_values: []f32,
+        head_count: usize,
+        head_dim: usize,
+        position: usize,
+    ) !void {
+        const rope_dim = self.rotaryDimension();
+        const value_count = head_count * head_dim;
+        if (self.model.rope_style == 2) {
+            try metal_backend.readBufferF32(buffer, host_values[0..value_count]);
+            applyRoPEHost(host_values[0..value_count], head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+            try metal_backend.writeBufferF32(buffer, host_values[0..value_count]);
+            return;
+        }
+
+        try metal_backend.applyRoPE(
+            self.backend,
+            buffer,
+            head_count,
+            rope_dim,
+            head_dim,
+            position,
+            self.model.rope_freq_base,
+            self.model.rope_style,
+        );
     }
 
     fn softcapInPlace(values: []f32, cap: f32) void {
@@ -619,6 +637,18 @@ pub const Session = struct {
         head_count: usize,
         head_dim: usize,
     ) !void {
+        try self.runRmsNormPerHeadWithOffset(tensor, input, output, head_count, head_dim, self.model.rms_norm_weight_offset);
+    }
+
+    fn runRmsNormPerHeadWithOffset(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        head_count: usize,
+        head_dim: usize,
+        weight_offset: f32,
+    ) !void {
         const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
         if (tensor.cols != head_dim) return error.InvalidTensorMetadata;
         const start = std.time.nanoTimestamp();
@@ -630,7 +660,7 @@ pub const Session = struct {
             head_count,
             head_dim,
             self.model.rms_norm_eps,
-            self.model.rms_norm_weight_offset,
+            weight_offset,
         );
         self.recordCategoryWithShape(.normalization, start, .{
             .rows = head_count,
@@ -893,7 +923,7 @@ pub const Session = struct {
 
         const normed_delta = self.host_linear_conv_tmp[0..v_dim];
         try self.writeHostSlice(self.linear_qkv, delta_out);
-        try self.runRmsNormPerHead(la.norm_weight, self.linear_qkv, self.linear_z, num_value_heads, value_head_dim);
+        try self.runRmsNormPerHeadWithOffset(la.norm_weight, self.linear_qkv, self.linear_z, num_value_heads, value_head_dim, 0.0);
         try metal_backend.readBufferF32(self.linear_z, normed_delta);
         for (0..v_dim) |idx| {
             normed_delta[idx] *= siluScalar(z[idx]);
@@ -992,31 +1022,13 @@ pub const Session = struct {
                 try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
                 try self.runProjection(layer.attn_q, self.normed, self.q);
 
-                try metal_backend.applyRoPE(
-                    self.backend,
-                    self.q,
-                    self.model.head_count,
-                    self.model.rope_dimension_count,
-                    self.model.key_head_dimension,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
+                try self.applyRoPEBuffer(self.q, self.host_q_values, self.model.head_count, self.model.key_head_dimension, position);
 
                 const layer_base = layer_index * self.model.context_length * self.model.kv_projection_size;
                 const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
                 try self.runProjection(layer.attn_k, self.normed, self.k);
-                try metal_backend.applyRoPE(
-                    self.backend,
-                    self.k,
-                    self.model.head_count_kv,
-                    self.model.rope_dimension_count,
-                    self.model.key_head_dimension,
-                    position,
-                    self.model.rope_freq_base,
-                    self.model.rope_style,
-                );
+                try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
                 try metal_backend.storeKvHalf(
                     self.backend,
                     self.k,
@@ -1127,5 +1139,89 @@ fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f3
         for (head) |value| norm_sq += value * value;
         const scale = @as(f32, 1.0) / @sqrt(norm_sq + eps);
         for (head) |*value| value.* *= scale;
+    }
+}
+
+fn applyRoPEHost(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: u32, rope_sections: [4]u32) void {
+    const n_rot = @min(rope_dim, head_dim);
+    const pos_f32 = @as(f32, @floatFromInt(position));
+    for (0..head_count) |head_index| {
+        const head = values[head_index * head_dim ..][0..head_dim];
+        switch (rope_style) {
+            0 => applyInterleavedRoPE(head, n_rot, pos_f32, freq_base),
+            1 => applyNeoxRoPE(head, n_rot, pos_f32, freq_base),
+            2 => applyImrope(head, n_rot, pos_f32, freq_base, rope_sections),
+            else => applyNeoxRoPE(head, n_rot, pos_f32, freq_base),
+        }
+    }
+}
+
+fn applyInterleavedRoPE(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32) void {
+    var pair: usize = 0;
+    while (pair + 1 < n_rot) : (pair += 2) {
+        const exponent = @as(f32, @floatFromInt(pair)) / @as(f32, @floatFromInt(n_rot));
+        const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[pair];
+        const x1 = head[pair + 1];
+        head[pair] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[pair + 1] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+    }
+}
+
+fn applyNeoxRoPE(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32) void {
+    const half_rot = n_rot / 2;
+    for (0..half_rot) |i| {
+        const exponent = @as(f32, @floatFromInt(i * 2)) / @as(f32, @floatFromInt(n_rot));
+        const theta = pos_f32 / std.math.pow(f32, freq_base, exponent);
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[i];
+        const x1 = head[i + half_rot];
+        head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+    }
+}
+
+fn applyImrope(head: []f32, n_rot: usize, pos_f32: f32, freq_base: f32, rope_sections: [4]u32) void {
+    const section_count = @as(usize, rope_sections[0] + rope_sections[1] + rope_sections[2] + rope_sections[3]);
+    if (section_count == 0) {
+        applyNeoxRoPE(head, n_rot, pos_f32, freq_base);
+        return;
+    }
+
+    const half_rot = n_rot / 2;
+    const theta_scale = std.math.pow(f32, freq_base, -2.0 / @as(f32, @floatFromInt(n_rot)));
+    const section_t = @as(usize, rope_sections[0]);
+    const section_h = @as(usize, rope_sections[1]);
+    const section_w = @as(usize, rope_sections[2]);
+
+    var theta_t = pos_f32;
+    var theta_h = pos_f32;
+    var theta_w = pos_f32;
+    var theta_e = pos_f32;
+
+    for (0..half_rot) |i| {
+        const sector = i % section_count;
+        const theta = if (sector % 3 == 1 and sector < 3 * section_h)
+            theta_h
+        else if (sector % 3 == 2 and sector < 3 * section_w)
+            theta_w
+        else if (sector % 3 == 0 and sector < 3 * section_t)
+            theta_t
+        else
+            theta_e;
+        const cos_theta = @cos(theta);
+        const sin_theta = @sin(theta);
+        const x0 = head[i];
+        const x1 = head[i + half_rot];
+        head[i] = @mulAdd(f32, x0, cos_theta, -x1 * sin_theta);
+        head[i + half_rot] = @mulAdd(f32, x0, sin_theta, x1 * cos_theta);
+
+        theta_t *= theta_scale;
+        theta_h *= theta_scale;
+        theta_w *= theta_scale;
+        theta_e *= theta_scale;
     }
 }
