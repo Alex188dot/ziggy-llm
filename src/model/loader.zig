@@ -4,6 +4,7 @@ const backend_api = @import("../runtime/backend.zig");
 const gpu = @import("../runtime/gpu/session.zig");
 const metal_profile = @import("../runtime/metal_profile.zig");
 const moon_quant_calibration = @import("../moon_quant_calibration.zig");
+const qwen35_linear_common = @import("../runtime/qwen35_linear_common.zig");
 const runtime_types = @import("../runtime/types.zig");
 const sampling = @import("../sampling.zig");
 const quant_extra = @import("quant_extra.zig");
@@ -917,6 +918,8 @@ const Session = struct {
         const linear_z_dim = linear_num_v_heads * linear_value_dim_per_head;
         const conv_state_per_layer = linear_qkv_dim * (model.linear_conv_kernel_dim - 1);
         const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
+        const gate_capacity = @max(model.feed_forward_length, model.q_projection_size);
+        const up_capacity = @max(model.feed_forward_length, model.q_projection_size * 2);
 
         var session = Session{
             .model = model,
@@ -931,8 +934,8 @@ const Session = struct {
             .v = try allocator.alloc(f32, model.kv_projection_size),
             .attn_out = try allocator.alloc(f32, model.q_projection_size),
             .attn_tmp = try allocator.alloc(f32, model.embedding_length),
-            .gate = try allocator.alloc(f32, model.feed_forward_length),
-            .up = try allocator.alloc(f32, model.feed_forward_length),
+            .gate = try allocator.alloc(f32, gate_capacity),
+            .up = try allocator.alloc(f32, up_capacity),
             .router_logits = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_count)),
             .moe_selected_experts = try allocator.alloc(u32, @max(@as(usize, 1), model.expert_used_count)),
             .moe_selected_weights = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_used_count)),
@@ -1260,7 +1263,11 @@ const Session = struct {
             }
 
             if (self.gpu_session) |*gpu_session| {
-                try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+                if (layer.moe) |moe| {
+                    try self.runMoeFfnHybrid(gpu_session, layer, moe);
+                } else {
+                    try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+                }
             } else {
                 addInPlace(self.hidden, self.attn_tmp);
 
@@ -1393,7 +1400,6 @@ const Session = struct {
         try self.matVec(self.linear_a[0..num_value_heads], linear_attn.in_proj_a, self.normed);
         try self.matVec(self.linear_b[0..num_value_heads], linear_attn.in_proj_b, self.normed);
 
-        if (key_head_dim != value_head_dim) return error.InvalidTensorMetadata;
         const dt_bias_bytes = try tensorBytes(model, linear_attn.dt_bias);
         const a_log_bytes = try tensorBytes(model, linear_attn.A_log);
 
@@ -1466,12 +1472,13 @@ const Session = struct {
         const delta_out = self.linear_qkv[0..v_dim];
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
         for (0..num_value_heads) |head| {
-            const recurrent_offset = recurrent_state_base + head * value_head_dim * value_head_dim;
-            const q_head = q_conv[head * key_head_dim ..][0..key_head_dim];
-            const k_head = k_conv[head * key_head_dim ..][0..key_head_dim];
+            const qk_head = try qwen35_linear_common.qkHeadIndex(head, num_key_heads, num_value_heads);
+            const recurrent_offset = recurrent_state_base + head * key_head_dim * value_head_dim;
+            const q_head = q_conv[qk_head * key_head_dim ..][0..key_head_dim];
+            const k_head = k_conv[qk_head * key_head_dim ..][0..key_head_dim];
             const v_head = v_conv[head * value_head_dim ..][0..value_head_dim];
             const out_head = delta_out[head * value_head_dim ..][0..value_head_dim];
-            const state = self.linear_recurrent_state[recurrent_offset..][0 .. value_head_dim * value_head_dim];
+            const state = self.linear_recurrent_state[recurrent_offset..][0 .. key_head_dim * value_head_dim];
             const decay = @exp(self.linear_g[head]);
             const beta = self.linear_b[head];
 
@@ -1479,18 +1486,18 @@ const Session = struct {
 
             for (0..value_head_dim) |col| {
                 var sk: f32 = 0;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     sk += state[row * value_head_dim + col] * k_head[row];
                 }
                 const delta = (v_head[col] - sk) * beta;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     state[row * value_head_dim + col] += k_head[row] * delta;
                 }
             }
 
             for (0..value_head_dim) |col| {
                 var acc: f32 = 0;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     acc += state[row * value_head_dim + col] * (q_head[row] * scale);
                 }
                 out_head[col] = acc;
@@ -1511,10 +1518,12 @@ const Session = struct {
         if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
 
         if (self.backend) |backend| {
-            const dense_tensors = self.dense_tensors orelse return error.InvalidTensorMetadata;
-            const matrix = dense_tensors.get(tensor) orelse return error.InvalidTensorMetadata;
-            try backend.matVec(out, matrix, input, row_count, row_len);
-            return;
+            if (self.dense_tensors) |dense_tensors| {
+                if (dense_tensors.get(tensor)) |matrix| {
+                    try backend.matVec(out, matrix, input, row_count, row_len);
+                    return;
+                }
+            }
         }
 
         const bytes = try tensorBytes(self.model, tensor);
@@ -1544,8 +1553,6 @@ const Session = struct {
     }
 
     fn matVecRows(self: *Session, out: []f32, tensor: TensorRef, input: []const f32, row_offset: usize) !void {
-        if (self.backend != null) return error.UnsupportedBackend;
-
         const row_len = try tensor.rowLen();
         const total_rows = try tensor.rowCount();
         if (row_len != input.len) return error.InvalidTensorMetadata;
@@ -1561,8 +1568,6 @@ const Session = struct {
     }
 
     fn dotSingleRowTensor(self: *Session, tensor: TensorRef, input: []const f32) !f32 {
-        if (self.backend != null) return error.UnsupportedBackend;
-
         const row_len = try tensor.rowLen();
         const row_count = try tensor.rowCount();
         if (row_count != 1 or row_len != input.len) return error.InvalidTensorMetadata;
@@ -1640,6 +1645,14 @@ const Session = struct {
         try self.computeSharedFfn(layer, shared_scale);
 
         if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
+    }
+
+    fn runMoeFfnHybrid(self: *Session, gpu_session: *gpu.Session, layer: LayerRefs, moe: MoeFfnTensors) !void {
+        try gpu_session.readHidden(self.hidden);
+        try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
+        try self.computeMoeFfn(layer, moe);
+        addInPlace(self.hidden, self.attn_tmp);
+        try gpu_session.writeHidden(self.hidden);
     }
 
     fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {

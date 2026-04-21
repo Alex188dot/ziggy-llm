@@ -13,7 +13,6 @@ fn qwen35Generate(
     options: families_mod.FamilyGenerateOptions,
 ) !families_mod.FamilyReport {
     _ = ctx;
-    if (options.backend == .metal) return families_mod.FamilyError.UnsupportedBackend;
 
     const gen_opts = types.GenerationOptions{
         .max_tokens = options.max_tokens,
@@ -24,7 +23,7 @@ fn qwen35Generate(
         .top_k = options.top_k,
         .top_p = options.top_p,
         .min_p = options.min_p,
-        .backend = .cpu,
+        .backend = @enumFromInt(@intFromEnum(options.backend)),
         .moon_quant = options.moon_quant,
         .metal_profile = false,
         .sampling_strategy = options.sampling_strategy,
@@ -72,7 +71,7 @@ pub fn createQwen35FamilyHandler() families_mod.FamilyHandler {
         .family = .qwen35,
         .capabilities = families_mod.FamilyCapabilities{
             .supports_cpu = true,
-            .supports_metal = false,
+            .supports_metal = true,
             .supported_quant_types = &.{ .f32, .f16, .q8_0, .q4_k, .q5_k, .q6_k, .q3_k, .iq3_xxs, .iq4_xs },
             .max_context_length = 262144,
         },

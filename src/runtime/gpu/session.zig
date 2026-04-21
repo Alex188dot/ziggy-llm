@@ -2,6 +2,7 @@ const std = @import("std");
 const backend_api = @import("../backend.zig");
 const metal_backend = @import("../metal_backend.zig");
 const metal_profile = @import("../metal_profile.zig");
+const qwen35_linear_common = @import("../qwen35_linear_common.zig");
 const gpu_types = @import("types.zig");
 
 pub const DenseLookup = gpu_types.DenseLookup;
@@ -65,6 +66,8 @@ pub const Session = struct {
         const max_input = @max(model.embedding_length, model.feed_forward_length);
         const max_vec = @max(model.embedding_length, @max(model.feed_forward_length, model.vocab_size));
         const cache_len = model.block_count * model.context_length * model.kv_projection_size;
+        const gate_capacity = @max(model.feed_forward_length, model.q_projection_size);
+        const up_capacity = @max(model.feed_forward_length, model.q_projection_size * 2);
         const hidden = try metal_backend.createScratchBuffer(backend, max_input);
         errdefer metal_backend.destroyBuffer(hidden);
         const normed = try metal_backend.createScratchBuffer(backend, model.embedding_length);
@@ -77,9 +80,9 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(v);
         const attn = try metal_backend.createScratchBuffer(backend, model.q_projection_size);
         errdefer metal_backend.destroyBuffer(attn);
-        const gate = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        const gate = try metal_backend.createScratchBuffer(backend, gate_capacity);
         errdefer metal_backend.destroyBuffer(gate);
-        const up = try metal_backend.createScratchBuffer(backend, model.feed_forward_length);
+        const up = try metal_backend.createScratchBuffer(backend, up_capacity);
         errdefer metal_backend.destroyBuffer(up);
         const tmp = try metal_backend.createScratchBuffer(backend, max_vec);
         errdefer metal_backend.destroyBuffer(tmp);
@@ -240,6 +243,16 @@ pub const Session = struct {
     pub fn beginToken(self: *Session, input: []const f32) !void {
         try metal_backend.writeBufferF32(self.hidden, input);
         try metal_backend.beginSequence(self.backend);
+    }
+
+    pub fn readHidden(self: *Session, out: []f32) !void {
+        if (out.len < self.model.embedding_length) return error.InvalidTensorMetadata;
+        try metal_backend.readBufferF32(self.hidden, out[0..self.model.embedding_length]);
+    }
+
+    pub fn writeHidden(self: *Session, values: []const f32) !void {
+        if (values.len < self.model.embedding_length) return error.InvalidTensorMetadata;
+        try metal_backend.writeBufferF32(self.hidden, values[0..self.model.embedding_length]);
     }
 
     pub fn runAttentionBlock(
@@ -824,8 +837,6 @@ pub const Session = struct {
         const q_dim = num_key_heads * key_head_dim;
         const v_dim = num_value_heads * value_head_dim;
         const qkv_dim = q_dim + q_dim + v_dim;
-        if (key_head_dim != value_head_dim) return error.InvalidTensorMetadata;
-
         const conv_state_per_layer = qkv_dim * (kernel_dim - 1);
         const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
         const conv_state_base = layer_index * conv_state_per_layer;
@@ -892,8 +903,9 @@ pub const Session = struct {
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
         for (0..num_value_heads) |head| {
             const recurrent_offset = head * key_head_dim * value_head_dim;
-            const q_head = q_conv[head * key_head_dim ..][0..key_head_dim];
-            const k_head = k_conv[head * key_head_dim ..][0..key_head_dim];
+            const qk_head = try qwen35_linear_common.qkHeadIndex(head, num_key_heads, num_value_heads);
+            const q_head = q_conv[qk_head * key_head_dim ..][0..key_head_dim];
+            const k_head = k_conv[qk_head * key_head_dim ..][0..key_head_dim];
             const v_head = v_conv[head * value_head_dim ..][0..value_head_dim];
             const out_head = delta_out[head * value_head_dim ..][0..value_head_dim];
             const state = recurrent_state[recurrent_offset..][0 .. key_head_dim * value_head_dim];
