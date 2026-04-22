@@ -2529,8 +2529,11 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen35_like = is_qwen35_text or is_qwen35_moe;
     const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
     if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_like and !is_gemma) return error.UnsupportedArchitecture;
+    // For text-only inference, Qwen3.5's imrope is mathematically equivalent to neox
+    // because all position components (t, h, w) are set to the same text position.
+    // Using neox allows the GPU RoPE kernel to handle it without CPU roundtrips.
     const rope_style: RopeStyle = if (is_qwen35_like)
-        .imrope
+        .neox
     else if (is_qwen or is_mistral or is_gemma)
         .neox
     else

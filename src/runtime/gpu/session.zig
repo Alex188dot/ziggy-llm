@@ -63,6 +63,7 @@ pub const Session = struct {
     host_linear_conv_tmp: []f32,
     host_linear_conv_state: []f32,
     host_linear_recurrent_state: []f32,
+    host_linear_conv_weights: []f32,
 
     pub fn init(
         backend: backend_api.MatVecBackend,
@@ -158,6 +159,9 @@ pub const Session = struct {
         errdefer allocator.free(host_linear_conv_state);
         const host_linear_recurrent_state = try allocator.alloc(f32, model.block_count * recurrent_state_per_layer);
         errdefer allocator.free(host_linear_recurrent_state);
+        const max_conv_weights = linear_qkv_dim * @as(usize, @intCast(model.linear_conv_kernel_dim));
+        const host_linear_conv_weights = try allocator.alloc(f32, max_conv_weights);
+        errdefer allocator.free(host_linear_conv_weights);
         @memset(host_linear_conv_state, 0);
         @memset(host_linear_recurrent_state, 0);
         try metal_backend.writeBufferF32(linear_conv_state, host_linear_conv_state);
@@ -204,6 +208,7 @@ pub const Session = struct {
             .host_linear_conv_tmp = host_linear_conv_tmp,
             .host_linear_conv_state = host_linear_conv_state,
             .host_linear_recurrent_state = host_linear_recurrent_state,
+            .host_linear_conv_weights = host_linear_conv_weights,
         };
     }
 
@@ -245,6 +250,7 @@ pub const Session = struct {
         allocator.free(self.host_linear_conv_tmp);
         allocator.free(self.host_linear_conv_state);
         allocator.free(self.host_linear_recurrent_state);
+        allocator.free(self.host_linear_conv_weights);
         self.* = undefined;
     }
 
@@ -1139,6 +1145,27 @@ pub const Session = struct {
         }
     }
 
+    fn loadTensorF32(self: *Session, tensor: TensorDesc, out: []f32) !void {
+        const len = tensor.rows * tensor.cols;
+        if (out.len < len) return error.InvalidTensorMetadata;
+        switch (tensor.tensor_type) {
+            0 => {
+                const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                if (weights.len < len) return error.InvalidTensorMetadata;
+                @memcpy(out[0..len], weights[0..len]);
+            },
+            1 => {
+                const bytes = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                if (bytes.len < len * 2) return error.InvalidTensorMetadata;
+                for (0..len) |i| {
+                    const raw = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+                    out[i] = @floatCast(@as(f16, @bitCast(raw)));
+                }
+            },
+            else => return error.UnsupportedTensorType,
+        }
+    }
+
     fn runLinearAttention(
         self: *Session,
         layer: LayerDesc,
@@ -1168,21 +1195,31 @@ pub const Session = struct {
         const conv_out = self.host_linear_conv_tmp[0..qkv_dim];
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
 
+        // Run all linear projections on GPU, then batch the readback into one commit.
         try self.runProjection(la.in_proj_qkv, self.normed, self.linear_qkv);
-        try self.readBufferF32Committed(self.linear_qkv, qkv);
-
         try self.runProjectionToDst(la.in_proj_z, self.normed, self.linear_z, 0);
-        try self.readBufferF32Committed(self.linear_z, z);
-
         try self.runProjectionToDst(la.in_proj_a, self.normed, self.linear_a, 0);
-        try self.readBufferF32Committed(self.linear_a, alpha);
         try self.runProjectionToDst(la.in_proj_b, self.normed, self.linear_b, 0);
-        try self.readBufferF32Committed(self.linear_b, beta);
+        try self.flushSequenceForHostAccess();
+        try metal_backend.readBufferF32(self.linear_qkv, qkv);
+        try metal_backend.readBufferF32(self.linear_z, z);
+        try metal_backend.readBufferF32(self.linear_a, alpha);
+        try metal_backend.readBufferF32(self.linear_b, beta);
+
+        // Pre-cache small per-head weights and conv1d weights to avoid
+        // 1M+ readTensorValue calls per token.
+        if (num_value_heads > 128) return error.InvalidTensorMetadata;
+        var dt_bias_vals: [128]f32 = undefined;
+        var a_log_vals: [128]f32 = undefined;
+        try self.loadTensorF32(la.dt_bias, dt_bias_vals[0..num_value_heads]);
+        try self.loadTensorF32(la.A_log, a_log_vals[0..num_value_heads]);
+
+        const conv1d_len = qkv_dim * kernel_dim;
+        const conv1d_vals = self.host_linear_conv_weights[0..conv1d_len];
+        try self.loadTensorF32(la.conv1d, conv1d_vals);
 
         for (0..num_value_heads) |h| {
-            const dt_bias_val = try self.readTensorValue(la.dt_bias, h);
-            const ssm_a_val = try self.readTensorValue(la.A_log, h);
-            gate[h] = ssm_a_val * softplusScalar(alpha[h] + dt_bias_val);
+            gate[h] = a_log_vals[h] * softplusScalar(alpha[h] + dt_bias_vals[h]);
             beta[h] = sigmoidScalar(beta[h]);
         }
 
@@ -1192,10 +1229,10 @@ pub const Session = struct {
             for (0..kernel_dim - 1) |kernel_idx| {
                 const state_offset = kernel_idx * qkv_dim + channel;
                 const weight_index = channel * kernel_dim + kernel_idx;
-                acc += conv_state[state_offset] * try self.readTensorValue(la.conv1d, weight_index);
+                acc += conv_state[state_offset] * conv1d_vals[weight_index];
             }
             const current_weight_index = channel * kernel_dim + (kernel_dim - 1);
-            acc += qkv[channel] * try self.readTensorValue(la.conv1d, current_weight_index);
+            acc += qkv[channel] * conv1d_vals[current_weight_index];
             conv_out[channel] = siluScalar(acc);
         }
         if (kernel_dim > 1) {
@@ -1248,14 +1285,22 @@ pub const Session = struct {
             }
         }
 
-        const normed_delta = self.host_linear_conv_tmp[0..v_dim];
-        try self.writeHostSlice(self.linear_qkv, delta_out);
-        try self.runRmsNormPerHeadWithOffset(la.norm_weight, self.linear_qkv, self.linear_z, num_value_heads, value_head_dim, 0.0);
-        try self.readBufferF32Committed(self.linear_z, normed_delta);
-        for (0..v_dim) |idx| {
-            normed_delta[idx] *= siluScalar(z[idx]);
+        // Apply RMSNorm per head + silu gate on CPU, then write directly to GPU.
+        const norm_weights = self.dense_lookup.getDense(la.norm_weight.offset) orelse return error.InvalidTensorMetadata;
+        if (norm_weights.len < value_head_dim) return error.InvalidTensorMetadata;
+        for (0..num_value_heads) |head| {
+            const head_data = delta_out[head * value_head_dim ..][0..value_head_dim];
+            var sum_sq: f32 = 0;
+            for (head_data) |v| sum_sq += v * v;
+            const scale_norm = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(value_head_dim)) + model.rms_norm_eps);
+            for (head_data, 0..) |*v, i| {
+                v.* *= scale_norm * norm_weights[i];
+            }
         }
-        try self.writeHostSlice(self.linear_z, normed_delta);
+        for (0..v_dim) |idx| {
+            delta_out[idx] *= siluScalar(z[idx]);
+        }
+        try self.writeHostSlice(self.linear_z, delta_out);
         try self.runProjectionAdd(la.out_proj, self.linear_z, self.hidden);
     }
 

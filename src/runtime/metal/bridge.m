@@ -279,6 +279,27 @@ static void ziggy_dispatch_rowwise(
     [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
 }
 
+static void ziggy_dispatch_indexed_rowwise(
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLComputePipelineState> pipeline,
+    NSUInteger row_count,
+    NSUInteger cols
+) {
+    // Indexed matvec kernels dequantize one block per thread iteration.
+    // Use exactly one thread per block so no lanes are idle.
+    const NSUInteger values_per_block = 256;
+    NSUInteger block_count = cols / values_per_block;
+    if (block_count == 0) block_count = 1;
+
+    NSUInteger threads_per_group = block_count;
+    if (threads_per_group > 128) threads_per_group = 128;
+    if (threads_per_group < 1) threads_per_group = 1;
+
+    MTLSize grid_size = MTLSizeMake(row_count, 1, 1);
+    MTLSize group_size = MTLSizeMake(threads_per_group, 1, 1);
+    [encoder dispatchThreadgroups:grid_size threadsPerThreadgroup:group_size];
+}
+
 static int ziggy_commit_pending(
     ZiggyMetalState *state,
     ZiggyMetalCommitStats *out_stats,
@@ -2997,7 +3018,7 @@ static int ziggy_run_indexed_rowwise_matvec(
     [encoder setBuffer:entry_buffer.buffer offset:0 atIndex:5];
     [encoder setBytes:&slot_idx length:sizeof(slot_idx) atIndex:6];
     [encoder setBytes:&rows_per_expert length:sizeof(rows_per_expert) atIndex:7];
-    ziggy_dispatch_rowwise(encoder, pipeline, rows);
+    ziggy_dispatch_indexed_rowwise(encoder, pipeline, rows, cols);
     [encoder endEncoding];
 
     if (has_pending) return ZIGGY_METAL_OK;
@@ -3063,7 +3084,7 @@ static int ziggy_run_dual_indexed_rowwise_matvec(
     [encoder setBuffer:entry_buffer.buffer offset:0 atIndex:7];
     [encoder setBytes:&slot_idx length:sizeof(slot_idx) atIndex:8];
     [encoder setBytes:&rows_per_expert length:sizeof(rows_per_expert) atIndex:9];
-    ziggy_dispatch_rowwise(encoder, pipeline, rows);
+    ziggy_dispatch_indexed_rowwise(encoder, pipeline, rows, cols);
     [encoder endEncoding];
 
     if (has_pending) return ZIGGY_METAL_OK;
