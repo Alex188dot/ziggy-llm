@@ -87,8 +87,6 @@ const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
-const qwen35_debug_env = "ZIGGY_DEBUG_QWEN35";
-
 pub const LayerType = enum {
     full_attention,
     linear_attention,
@@ -1304,6 +1302,7 @@ const Session = struct {
                 }
                 addInPlace(self.hidden, self.attn_tmp);
             }
+
         }
     }
 
@@ -1462,7 +1461,6 @@ const Session = struct {
             acc += self.linear_qkv[channel] * current_weight;
             conv_out[channel] = siluScalar(acc);
         }
-
         if (kernel_dim > 1) {
             var state_idx: usize = 0;
             while (state_idx + qkv_dim < conv_state_per_layer) : (state_idx += qkv_dim) {
@@ -1514,7 +1512,6 @@ const Session = struct {
                 out_head[col] = acc;
             }
         }
-
         try self.rmsNormPerHeadWithOffset(self.linear_conv_tmp[0..v_dim], delta_out, linear_attn.norm_weight, num_value_heads, value_head_dim, 0.0);
         for (0..v_dim) |idx| {
             self.linear_z[idx] = self.linear_conv_tmp[idx] * siluScalar(self.linear_z[idx]);

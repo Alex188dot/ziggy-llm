@@ -157,9 +157,23 @@ To keep the implementation modular and under file-size limits, split by responsi
 - the native Metal path for `qwen35moe` is guarded rather than full-offload:
   - MoE FFN stays on CPU
   - Metal is used only for the attention/output path of the selected transformer layers
-  - `--gpu-layers auto` is conservative by design and currently means the first `8` attention layers
+  - `--gpu-layers auto` uses Metal's `recommendedMaxWorkingSetSize`
+  - if the estimated full attention residency fits within an `80%` safety margin, `auto` promotes to all attention layers
+  - otherwise `auto` falls back to the first `8` attention layers
 - when expert gating metadata is absent, the implementation defaults to softmax gating with normalized top-k weights
 - shared-expert routing is applied through `ffn_gate_inp_shexp.weight` when present
+
+### Correctness Notes
+
+- native CPU correctness required a `Q5_K` fix:
+  - the shared `qh` high-bit block must stay fixed across the full 256-value super-block
+  - advancing `qh` every 64 values corrupts tensors such as `attn_qkv.weight`
+- native Metal correctness required two additional fixes:
+  - host reads must flush the pending Metal sequence before reading GPU buffers back on CPU
+  - scalar reads from the Metal dense tensor store must treat stored tensors as column-major
+- the Metal dense tensor store is intentionally column-major because the matvec kernels expect that layout
+- any CPU-side scalar lookup in the native Metal session must remap logical row-major indices to the stored column-major layout
+- the most visible failure from the layout bug was gibberish generation in Qwen 3.5 linear-attention layers, because `conv1d` weights were being read from the wrong positions
 
 ### Guarded Native Metal Commands
 
@@ -178,8 +192,8 @@ Recommended guarded chat command:
 
 Exact meaning for `qwen35moe`:
 
-- `--gpu-layers auto`: offload the first `8` attention layers to Metal, keep all MoE FFN on CPU
-- `--gpu-layers 8`: same as the current guarded auto policy
+- `--gpu-layers auto`: if full attention residency fits the Metal working-set budget, offload all attention layers; otherwise offload the first `8` attention layers; always keep MoE FFN on CPU
+- `--gpu-layers 8`: offload the first `8` attention layers and keep all MoE FFN on CPU
 - `--gpu-layers all`: offload attention for all transformer layers, but still keep MoE FFN on CPU
 
 Recommended one-shot run command:

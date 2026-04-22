@@ -4,7 +4,6 @@ const metal_backend = @import("../metal_backend.zig");
 const metal_profile = @import("../metal_profile.zig");
 const qwen35_linear_common = @import("../qwen35_linear_common.zig");
 const gpu_types = @import("types.zig");
-
 pub const DenseLookup = gpu_types.DenseLookup;
 pub const TensorDesc = gpu_types.TensorDesc;
 pub const LayerDesc = gpu_types.LayerDesc;
@@ -275,7 +274,7 @@ pub const Session = struct {
 
     pub fn readHidden(self: *Session, out: []f32) !void {
         if (out.len < self.model.embedding_length) return error.InvalidTensorMetadata;
-        try metal_backend.readBufferF32(self.hidden, out[0..self.model.embedding_length]);
+        try self.readBufferF32Committed(self.hidden, out[0..self.model.embedding_length]);
     }
 
     pub fn writeHidden(self: *Session, values: []const f32) !void {
@@ -302,7 +301,7 @@ pub const Session = struct {
         if (attn_q.rows == self.model.q_projection_size * 2) {
             try self.runProjection(attn_q, self.normed, self.up);
             if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.up);
-            try metal_backend.readBufferF32(self.up, self.host_q_packed[0..attn_q.rows]);
+            try self.readBufferF32Committed(self.up, self.host_q_packed[0..attn_q.rows]);
 
             var head_index: usize = 0;
             while (head_index < self.model.head_count) : (head_index += 1) {
@@ -398,7 +397,7 @@ pub const Session = struct {
             .extra = self.model.head_count_kv,
         });
         if (q_gate) |gate_values| {
-            try metal_backend.readBufferF32(self.attn, self.host_attn_values);
+            try self.readBufferF32Committed(self.attn, self.host_attn_values);
             for (self.host_attn_values, gate_values) |*attn_value, gate_value| {
                 attn_value.* *= sigmoidScalar(gate_value);
             }
@@ -509,10 +508,10 @@ pub const Session = struct {
         var token: [1]u32 = .{0};
         if (tensor.tensor_type == 14) {
             var argmax_state: [2]u32 = .{ 0, 0 };
-            try metal_backend.readBufferU32(self.sampled_token_packed, &argmax_state);
+            try self.readBufferU32Committed(self.sampled_token_packed, &argmax_state);
             token[0] = argmax_state[1];
         } else {
-            try metal_backend.readBufferU32(self.sampled_token, &token);
+            try self.readBufferU32Committed(self.sampled_token, &token);
         }
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
@@ -548,7 +547,7 @@ pub const Session = struct {
         try self.commitOutputSequence(shape);
         var token: [1]u32 = .{0};
         const host_readback_start = std.time.nanoTimestamp();
-        try metal_backend.readBufferU32(self.sampled_token, &token);
+        try self.readBufferU32Committed(self.sampled_token, &token);
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }
@@ -582,6 +581,20 @@ pub const Session = struct {
             self.dense_lookup.getMoonQuant(offset) != null;
     }
 
+    fn flushSequenceForHostAccess(self: *Session) !void {
+        try metal_backend.commitSequence(self.backend);
+    }
+
+    fn readBufferF32Committed(self: *Session, buffer: metal_backend.BufferHandle, out: []f32) !void {
+        try self.flushSequenceForHostAccess();
+        try metal_backend.readBufferF32(buffer, out);
+    }
+
+    fn readBufferU32Committed(self: *Session, buffer: metal_backend.BufferHandle, out: []u32) !void {
+        try self.flushSequenceForHostAccess();
+        try metal_backend.readBufferU32(buffer, out);
+    }
+
     fn applyRoPEBuffer(
         self: *Session,
         buffer: metal_backend.BufferHandle,
@@ -593,7 +606,7 @@ pub const Session = struct {
         const rope_dim = self.rotaryDimension();
         const value_count = head_count * head_dim;
         if (self.model.rope_style == 2) {
-            try metal_backend.readBufferF32(buffer, host_values[0..value_count]);
+            try self.readBufferF32Committed(buffer, host_values[0..value_count]);
             applyRoPEHost(host_values[0..value_count], head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
             try metal_backend.writeBufferF32(buffer, host_values[0..value_count]);
             return;
@@ -887,19 +900,18 @@ pub const Session = struct {
         const beta = self.host_linear_b[0..num_value_heads];
         const gate = self.host_linear_g[0..num_value_heads];
         const conv_out = self.host_linear_conv_tmp[0..qkv_dim];
-
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
 
         try self.runProjection(la.in_proj_qkv, self.normed, self.linear_qkv);
-        try metal_backend.readBufferF32(self.linear_qkv, qkv);
+        try self.readBufferF32Committed(self.linear_qkv, qkv);
 
         try self.runProjectionToDst(la.in_proj_z, self.normed, self.linear_z, 0);
-        try metal_backend.readBufferF32(self.linear_z, z);
+        try self.readBufferF32Committed(self.linear_z, z);
 
         try self.runProjectionToDst(la.in_proj_a, self.normed, self.linear_a, 0);
-        try metal_backend.readBufferF32(self.linear_a, alpha);
+        try self.readBufferF32Committed(self.linear_a, alpha);
         try self.runProjectionToDst(la.in_proj_b, self.normed, self.linear_b, 0);
-        try metal_backend.readBufferF32(self.linear_b, beta);
+        try self.readBufferF32Committed(self.linear_b, beta);
 
         for (0..num_value_heads) |h| {
             const dt_bias_val = try self.readTensorValue(la.dt_bias, h);
@@ -920,7 +932,6 @@ pub const Session = struct {
             acc += qkv[channel] * try self.readTensorValue(la.conv1d, current_weight_index);
             conv_out[channel] = siluScalar(acc);
         }
-
         if (kernel_dim > 1) {
             var state_idx: usize = 0;
             while (state_idx + qkv_dim < conv_state_per_layer) : (state_idx += qkv_dim) {
@@ -974,7 +985,7 @@ pub const Session = struct {
         const normed_delta = self.host_linear_conv_tmp[0..v_dim];
         try self.writeHostSlice(self.linear_qkv, delta_out);
         try self.runRmsNormPerHeadWithOffset(la.norm_weight, self.linear_qkv, self.linear_z, num_value_heads, value_head_dim, 0.0);
-        try metal_backend.readBufferF32(self.linear_z, normed_delta);
+        try self.readBufferF32Committed(self.linear_z, normed_delta);
         for (0..v_dim) |idx| {
             normed_delta[idx] *= siluScalar(z[idx]);
         }
@@ -990,7 +1001,10 @@ pub const Session = struct {
         return switch (tensor.tensor_type) {
             0 => blk: {
                 const weights = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
-                break :blk weights[index];
+                if (index >= tensor.rows * tensor.cols) return error.InvalidTensorMetadata;
+                const row = index / tensor.cols;
+                const col = index % tensor.cols;
+                break :blk weights[row + col * tensor.rows];
             },
             1 => blk: {
                 const bytes = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1197,6 +1211,45 @@ fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f3
         const scale = @as(f32, 1.0) / @max(norm, eps);
         for (head) |*value| value.* *= scale;
     }
+}
+
+test "readTensorValue maps dense tensors from column-major storage to logical row-major order" {
+    const weights = [_]f32{
+        0, 10,
+        1, 11,
+        2, 12,
+    };
+    const DenseLookupTest = struct {
+        fn getDense(_: ?*const anyopaque, _: u64) ?[]const f32 {
+            return &weights;
+        }
+
+        fn getNoneU8(_: ?*const anyopaque, _: u64) ?[]const u8 {
+            return null;
+        }
+    };
+
+    var session: Session = undefined;
+    session.dense_lookup = .{
+        .ctx = null,
+        .get_dense_fn = DenseLookupTest.getDense,
+        .get_raw_fn = DenseLookupTest.getNoneU8,
+        .get_moon_quant_fn = DenseLookupTest.getNoneU8,
+    };
+
+    const tensor = TensorDesc{
+        .offset = 1,
+        .rows = 2,
+        .cols = 3,
+        .tensor_type = 0,
+    };
+
+    try std.testing.expectEqual(@as(f32, 0), try session.readTensorValue(tensor, 0));
+    try std.testing.expectEqual(@as(f32, 1), try session.readTensorValue(tensor, 1));
+    try std.testing.expectEqual(@as(f32, 2), try session.readTensorValue(tensor, 2));
+    try std.testing.expectEqual(@as(f32, 10), try session.readTensorValue(tensor, 3));
+    try std.testing.expectEqual(@as(f32, 11), try session.readTensorValue(tensor, 4));
+    try std.testing.expectEqual(@as(f32, 12), try session.readTensorValue(tensor, 5));
 }
 
 fn applyRoPEHost(values: []f32, head_count: usize, head_dim: usize, rope_dim: usize, position: usize, freq_base: f32, rope_style: u32, rope_sections: [4]u32) void {
