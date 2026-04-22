@@ -5,14 +5,15 @@ pub fn qkHeadIndex(value_head_index: usize, qk_head_count: usize, value_head_cou
     if (value_head_count % qk_head_count != 0) return error.InvalidMetadataValue;
     if (value_head_index >= value_head_count) return error.InvalidMetadataValue;
 
-    const values_per_qk = value_head_count / qk_head_count;
-    return @min(value_head_index / values_per_qk, qk_head_count - 1);
+    return value_head_index % qk_head_count;
 }
 
-test "qwen35 grouped qk head mapping handles two value heads per qk head" {
+test "qwen35 interleaved qk head mapping handles two value heads per qk head" {
     try std.testing.expectEqual(@as(usize, 0), try qkHeadIndex(0, 16, 32));
-    try std.testing.expectEqual(@as(usize, 0), try qkHeadIndex(1, 16, 32));
-    try std.testing.expectEqual(@as(usize, 1), try qkHeadIndex(2, 16, 32));
+    try std.testing.expectEqual(@as(usize, 1), try qkHeadIndex(1, 16, 32));
+    try std.testing.expectEqual(@as(usize, 2), try qkHeadIndex(2, 16, 32));
+    try std.testing.expectEqual(@as(usize, 15), try qkHeadIndex(15, 16, 32));
+    try std.testing.expectEqual(@as(usize, 0), try qkHeadIndex(16, 16, 32));
     try std.testing.expectEqual(@as(usize, 15), try qkHeadIndex(31, 16, 32));
 }
 

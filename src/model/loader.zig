@@ -87,6 +87,7 @@ const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
+const qwen35_debug_env = "ZIGGY_DEBUG_QWEN35";
 
 pub const LayerType = enum {
     full_attention,
@@ -860,6 +861,11 @@ pub const ReusableSession = struct {
     pub fn reset(self: *ReusableSession) void {
         self.session.position = 0;
         self.session.pending_greedy_token = null;
+        self.session.pending_shortlist_len = 0;
+        @memset(self.session.k_cache, 0);
+        @memset(self.session.v_cache, 0);
+        @memset(self.session.linear_conv_state, 0);
+        @memset(self.session.linear_recurrent_state, 0);
     }
 };
 
@@ -1211,7 +1217,6 @@ const Session = struct {
             } else if (is_linear_attn) {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 try self.computeLinearAttention(layer_index, layer.linear_attn.?);
-                addInPlace(self.hidden, self.attn_tmp);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 var q_gate: ?[]f32 = null;
@@ -1251,8 +1256,8 @@ const Session = struct {
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
                 const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
-                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
-                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+                applyRoPE(self.q, self.model.head_count, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 if (q_gate) |gate_values| {
@@ -1407,7 +1412,7 @@ const Session = struct {
         try self.matVec(self.linear_b[0..num_value_heads], linear_attn.in_proj_b, self.normed);
 
         const dt_bias_bytes = try tensorBytes(model, linear_attn.dt_bias);
-        const a_log_bytes = try tensorBytes(model, linear_attn.A_log);
+        const ssm_a_bytes = try tensorBytes(model, linear_attn.A_log);
 
         for (0..num_value_heads) |h| {
             const dt_bias_val = switch (linear_attn.dt_bias.tensor_type) {
@@ -1415,15 +1420,15 @@ const Session = struct {
                 .f16 => readF16AsF32(dt_bias_bytes[h * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
-            const a_log_val = switch (linear_attn.A_log.tensor_type) {
-                .f32 => readF32(a_log_bytes[h * 4 ..][0..4]),
-                .f16 => readF16AsF32(a_log_bytes[h * 2 ..][0..2]),
+            const ssm_a_val = switch (linear_attn.A_log.tensor_type) {
+                .f32 => readF32(ssm_a_bytes[h * 4 ..][0..4]),
+                .f16 => readF16AsF32(ssm_a_bytes[h * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
             const alpha_pre = self.linear_a[h] + dt_bias_val;
             const beta_pre = self.linear_b[h];
             const softplus_val = softplusScalar(alpha_pre);
-            self.linear_g[h] = a_log_val * softplus_val;
+            self.linear_g[h] = ssm_a_val * softplus_val;
             self.linear_b[h] = sigmoidScalar(beta_pre);
         }
 
@@ -1637,7 +1642,9 @@ const Session = struct {
         const selected_weights = self.moe_selected_weights[0..self.model.expert_used_count];
         selectTopK(router_logits, selected_experts, selected_weights);
         if (self.model.expert_weights_norm) normalizePositiveWeights(selected_weights);
-        if (self.model.expert_weights_scale != 1.0) scaleInPlace(selected_weights, self.model.expert_weights_scale);
+        if (self.model.expert_weights_scale != 1.0) {
+            scaleInPlace(selected_weights, self.model.expert_weights_scale);
+        }
 
         @memset(self.attn_tmp, 0);
         for (selected_experts, selected_weights) |expert_index, weight| {
@@ -2530,7 +2537,9 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const linear_value_head_dim = metadata.linear_value_head_dim orelse 128;
     const linear_conv_kernel_dim = metadata.linear_conv_kernel_dim orelse 4;
     const sliding_window = metadata.sliding_window orelse 0;
-    const global_attention_interval: usize = if (std.mem.eql(u8, architecture, "gemma2"))
+    const global_attention_interval: usize = if (metadata.full_attention_interval) |interval|
+        interval
+    else if (std.mem.eql(u8, architecture, "gemma2"))
         2
     else if (std.mem.eql(u8, architecture, "gemma3"))
         6
@@ -2677,14 +2686,14 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
     return model.tokenizer.encodeInto(allocator, prompt, token_buf);
 }
 
+pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
+    return model.tokenizer.encodeInto(allocator, prompt, out);
+}
+
 fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {
     return std.mem.eql(u8, tokenizer_model, "llama") or
         std.mem.eql(u8, tokenizer_model, "gpt2") or
         std.mem.startsWith(u8, tokenizer_model, "qwen");
-}
-
-pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
-    return model.tokenizer.encodeInto(allocator, prompt, out);
 }
 
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
@@ -3346,16 +3355,42 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
 }
 
 fn dequantizeRowQ5K(out: []f32, row: []const u8, row_len: usize) !void {
-    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    if (row_len % 256 != 0 or row.len != (row_len / 256) * 176) return error.InvalidTensorMetadata;
     var out_offset: usize = 0;
     var block_index: usize = 0;
     while (block_index < row.len) : (block_index += 176) {
         const block = row[block_index .. block_index + 176];
         const d = readF16AsF32(block[0..2]);
-        for (0..32) |index| {
-            out[out_offset + index] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index]))));
+        const dmin = readF16AsF32(block[2..4]);
+        const scales = block[4..16];
+        const qh: []const u8 = block[16..48];
+        var qs: []const u8 = block[48..176];
+        var scale_index: usize = 0;
+        var low_mask: u8 = 1;
+        var high_mask: u8 = 2;
+
+        var group: usize = 0;
+        while (group < 4) : (group += 1) {
+            const sm0 = getScaleMinK4(scale_index + 0, scales);
+            const sm1 = getScaleMinK4(scale_index + 1, scales);
+            const d1 = d * @as(f32, @floatFromInt(sm0.scale));
+            const m1 = dmin * @as(f32, @floatFromInt(sm0.min));
+            const d2 = d * @as(f32, @floatFromInt(sm1.scale));
+            const m2 = dmin * @as(f32, @floatFromInt(sm1.min));
+
+            for (0..32) |l| {
+                const q0 = @as(u32, qs[l] & 0x0F) + (if ((qh[l] & low_mask) != 0) @as(u32, 16) else 0);
+                const q1 = @as(u32, qs[l] >> 4) + (if ((qh[l] & high_mask) != 0) @as(u32, 16) else 0);
+                out[out_offset + l] = d1 * @as(f32, @floatFromInt(q0)) - m1;
+                out[out_offset + 32 + l] = d2 * @as(f32, @floatFromInt(q1)) - m2;
+            }
+
+            out_offset += 64;
+            qs = qs[32..];
+            scale_index += 2;
+            low_mask <<= 2;
+            high_mask <<= 2;
         }
-        out_offset += 32;
     }
 }
 
@@ -3377,17 +3412,55 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
 }
 
 fn dotQ5KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
-    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    if (row_len % 256 != 0 or row.len != (row_len / 256) * 176) return error.InvalidTensorMetadata;
     var sum: f32 = 0;
     var input_offset: usize = 0;
     var block_index: usize = 0;
     while (block_index < row.len) : (block_index += 176) {
         const block = row[block_index .. block_index + 176];
         const d = readF16AsF32(block[0..2]);
-        for (0..32) |index| {
-            sum = @mulAdd(f32, d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))), input[input_offset + index], sum);
+        const dmin = readF16AsF32(block[2..4]);
+        const scales = block[4..16];
+        const qh: []const u8 = block[16..48];
+        var qs: []const u8 = block[48..176];
+        var scale_index: usize = 0;
+        var low_mask: u8 = 1;
+        var high_mask: u8 = 2;
+
+        var group: usize = 0;
+        while (group < 4) : (group += 1) {
+            const sm0 = getScaleMinK4(scale_index + 0, scales);
+            const sm1 = getScaleMinK4(scale_index + 1, scales);
+            const d1 = d * @as(f32, @floatFromInt(sm0.scale));
+            const m1 = dmin * @as(f32, @floatFromInt(sm0.min));
+            const d2 = d * @as(f32, @floatFromInt(sm1.scale));
+            const m2 = dmin * @as(f32, @floatFromInt(sm1.min));
+
+            var low_q_dot: f32 = 0;
+            var low_input_sum: f32 = 0;
+            var high_q_dot: f32 = 0;
+            var high_input_sum: f32 = 0;
+
+            for (0..32) |l| {
+                const q0 = @as(u32, qs[l] & 0x0F) + (if ((qh[l] & low_mask) != 0) @as(u32, 16) else 0);
+                const q1 = @as(u32, qs[l] >> 4) + (if ((qh[l] & high_mask) != 0) @as(u32, 16) else 0);
+                low_q_dot = @mulAdd(f32, @as(f32, @floatFromInt(q0)), input[input_offset + l], low_q_dot);
+                low_input_sum += input[input_offset + l];
+                high_q_dot = @mulAdd(f32, @as(f32, @floatFromInt(q1)), input[input_offset + 32 + l], high_q_dot);
+                high_input_sum += input[input_offset + 32 + l];
+            }
+
+            sum = @mulAdd(f32, d1, low_q_dot, sum);
+            sum = @mulAdd(f32, -m1, low_input_sum, sum);
+            sum = @mulAdd(f32, d2, high_q_dot, sum);
+            sum = @mulAdd(f32, -m2, high_input_sum, sum);
+
+            input_offset += 64;
+            qs = qs[32..];
+            scale_index += 2;
+            low_mask <<= 2;
+            high_mask <<= 2;
         }
-        input_offset += 32;
     }
     return sum;
 }
@@ -3843,11 +3916,17 @@ fn siluScalar(value: f32) f32 {
 }
 
 fn sigmoidScalar(value: f32) f32 {
-    return 1 / (1 + @exp(-value));
+    if (value >= 0) {
+        const exp_neg = @exp(-value);
+        return 1 / (1 + exp_neg);
+    }
+    const exp_pos = @exp(value);
+    return exp_pos / (1 + exp_pos);
 }
 
 fn softplusScalar(value: f32) f32 {
-    return if (value > 20.0) value else std.math.log1p(@exp(value));
+    if (value > 0) return value + std.math.log1p(@exp(-value));
+    return std.math.log1p(@exp(value));
 }
 
 fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f32) void {
@@ -3855,7 +3934,8 @@ fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f3
         const head = values[head_index * head_dim ..][0..head_dim];
         var norm_sq: f32 = 0;
         for (head) |value| norm_sq += value * value;
-        const scale = @as(f32, 1.0) / @sqrt(norm_sq + eps);
+        const norm = @sqrt(norm_sq);
+        const scale = @as(f32, 1.0) / @max(norm, eps);
         for (head) |*value| value.* *= scale;
     }
 }
@@ -4410,4 +4490,27 @@ test "readU32Array rejects negative signed values" {
     defer out.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.InvalidMetadataValue, readU32Array(std.testing.allocator, &parser, .array, &out));
+}
+
+test "q5_k dequantize and dot keep the high-bit buffer fixed across 64-value groups" {
+    var row = [_]u8{0} ** 176;
+    std.mem.writeInt(u16, row[0..2], @bitCast(@as(f16, 1.0)), .little);
+    row[0 + 4] = 1;
+    row[1 + 4] = 1;
+    row[2 + 4] = 1;
+    row[3 + 4] = 1;
+    row[8] = 1;
+    row[9] = 1;
+    row[10] = 1;
+    row[11] = 1;
+    @memset(row[16..48], 0xFF);
+
+    var dense = [_]f32{0} ** 256;
+    try dequantizeRowQ5K(&dense, &row, 256);
+    for (dense) |value| {
+        try std.testing.expectEqual(@as(f32, 16.0), value);
+    }
+
+    const ones = [_]f32{1.0} ** 256;
+    try std.testing.expectEqual(@as(f32, 4096.0), try dotQ5KRow(&row, 256, &ones));
 }

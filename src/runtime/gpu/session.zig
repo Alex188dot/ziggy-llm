@@ -903,8 +903,8 @@ pub const Session = struct {
 
         for (0..num_value_heads) |h| {
             const dt_bias_val = try self.readTensorValue(la.dt_bias, h);
-            const a_log_val = try self.readTensorValue(la.A_log, h);
-            gate[h] = a_log_val * softplusScalar(alpha[h] + dt_bias_val);
+            const ssm_a_val = try self.readTensorValue(la.A_log, h);
+            gate[h] = ssm_a_val * softplusScalar(alpha[h] + dt_bias_val);
             beta[h] = sigmoidScalar(beta[h]);
         }
 
@@ -1175,11 +1175,17 @@ fn siluScalar(value: f32) f32 {
 }
 
 fn sigmoidScalar(value: f32) f32 {
-    return 1 / (1 + @exp(-value));
+    if (value >= 0) {
+        const exp_neg = @exp(-value);
+        return 1 / (1 + exp_neg);
+    }
+    const exp_pos = @exp(value);
+    return exp_pos / (1 + exp_pos);
 }
 
 fn softplusScalar(value: f32) f32 {
-    return if (value > 20.0) value else std.math.log1p(@exp(value));
+    if (value > 0) return value + std.math.log1p(@exp(-value));
+    return std.math.log1p(@exp(value));
 }
 
 fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f32) void {
@@ -1187,7 +1193,8 @@ fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f3
         const head = values[head_index * head_dim ..][0..head_dim];
         var norm_sq: f32 = 0;
         for (head) |value| norm_sq += value * value;
-        const scale = @as(f32, 1.0) / @sqrt(norm_sq + eps);
+        const norm = @sqrt(norm_sq);
+        const scale = @as(f32, 1.0) / @max(norm, eps);
         for (head) |*value| value.* *= scale;
     }
 }
