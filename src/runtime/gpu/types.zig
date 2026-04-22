@@ -38,6 +38,14 @@ pub const LinearAttnDesc = struct {
     out_proj: TensorDesc,
 };
 
+pub const MoeDesc = struct {
+    router: TensorDesc,
+    gate_exps: TensorDesc,
+    down_exps: TensorDesc,
+    up_exps: TensorDesc,
+    shared_router_gate: ?TensorDesc = null,
+};
+
 pub const LayerDesc = struct {
     attn_norm: TensorDesc,
     attn_q: ?TensorDesc = null,
@@ -56,6 +64,7 @@ pub const LayerDesc = struct {
     post_attention_norm: ?TensorDesc = null,
     post_ffw_norm: ?TensorDesc = null,
     linear_attn: ?LinearAttnDesc = null,
+    moe: ?MoeDesc = null,
 };
 
 pub const ModelDesc = struct {
@@ -81,6 +90,13 @@ pub const ModelDesc = struct {
     final_logit_softcapping: ?f32 = null,
     global_attention_interval: usize = 0,
     use_gelu_ffn: bool = false,
+    expert_count: usize = 0,
+    expert_used_count: usize = 0,
+    expert_feed_forward_length: usize = 0,
+    expert_shared_feed_forward_length: usize = 0,
+    expert_weights_scale: f32 = 1.0,
+    expert_weights_norm: bool = true,
+    expert_gating_func: u32 = 0,
     embedding_scale: f32 = 1.0,
     rms_norm_weight_offset: f32 = 0.0,
     vocab_size: usize,

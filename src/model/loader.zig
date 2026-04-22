@@ -1216,15 +1216,17 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
-            const use_gpu_layer = if (self.gpu_session) |*gpu_session|
-                layer.moe == null and gpu_session.canRunAttentionBlock(adaptLayerDesc(layer))
-            else
-                false;
+            const gpu_layer_desc = adaptLayerDesc(layer);
+            const use_gpu_layer = if (self.gpu_session) |*gpu_session| blk: {
+                if (!gpu_session.canRunAttentionBlock(gpu_layer_desc)) break :blk false;
+                if (layer.moe != null and !gpu_session.canRunMoeFfnBlock(gpu_layer_desc)) break :blk false;
+                break :blk true;
+            } else false;
 
             if (use_gpu_layer) {
                 const gpu_session = &self.gpu_session.?;
                 if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
-                try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
+                try gpu_session.runAttentionBlock(gpu_layer_desc, layer_index, self.position);
                 self.gpu_hidden_is_current = true;
             } else if (is_linear_attn) {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
@@ -1287,9 +1289,10 @@ const Session = struct {
             if (use_gpu_layer) {
                 const gpu_session = &self.gpu_session.?;
                 if (layer.moe) |moe| {
-                    try self.runMoeFfnHybrid(gpu_session, layer, moe);
+                    _ = moe;
+                    try gpu_session.runMoeFfnBlock(gpu_layer_desc);
                 } else {
-                    try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+                    try gpu_session.runFfnBlock(gpu_layer_desc);
                 }
                 self.gpu_hidden_is_current = true;
             } else {
@@ -1799,6 +1802,16 @@ fn adaptLinearAttnDesc(linear_attn: LinearAttnTensors) gpu.LinearAttnDesc {
     };
 }
 
+fn adaptMoeDesc(moe: MoeFfnTensors) gpu.MoeDesc {
+    return .{
+        .router = adaptTensorDesc(moe.router),
+        .gate_exps = adaptTensorDesc(moe.gate_exps),
+        .down_exps = adaptTensorDesc(moe.down_exps),
+        .up_exps = adaptTensorDesc(moe.up_exps),
+        .shared_router_gate = if (moe.shared_router_gate) |gate| adaptTensorDesc(gate) else null,
+    };
+}
+
 fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
@@ -1818,6 +1831,7 @@ fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
         .post_attention_norm = if (layer.post_attention_norm) |n| adaptTensorDesc(n) else null,
         .post_ffw_norm = if (layer.post_ffw_norm) |n| adaptTensorDesc(n) else null,
         .linear_attn = if (layer.linear_attn) |la| adaptLinearAttnDesc(la) else null,
+        .moe = if (layer.moe) |moe| adaptMoeDesc(moe) else null,
     };
 }
 
@@ -1845,6 +1859,13 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .final_logit_softcapping = model.final_logit_softcapping,
         .global_attention_interval = model.global_attention_interval,
         .use_gelu_ffn = model.use_gelu_ffn,
+        .expert_count = model.expert_count,
+        .expert_used_count = model.expert_used_count,
+        .expert_feed_forward_length = model.expert_feed_forward_length,
+        .expert_shared_feed_forward_length = model.expert_shared_feed_forward_length,
+        .expert_weights_scale = model.expert_weights_scale,
+        .expert_weights_norm = model.expert_weights_norm,
+        .expert_gating_func = model.expert_gating_func,
         .embedding_scale = model.embedding_scale,
         .rms_norm_weight_offset = model.rms_norm_weight_offset,
         .vocab_size = model.tokenizer.tokens.len,

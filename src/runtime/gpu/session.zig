@@ -8,10 +8,19 @@ pub const DenseLookup = gpu_types.DenseLookup;
 pub const TensorDesc = gpu_types.TensorDesc;
 pub const LayerDesc = gpu_types.LayerDesc;
 pub const LinearAttnDesc = gpu_types.LinearAttnDesc;
+pub const MoeDesc = gpu_types.MoeDesc;
 pub const ModelDesc = gpu_types.ModelDesc;
 pub const ShortlistEntry = gpu_types.ShortlistEntry;
 pub const max_shortlist_len = gpu_types.max_shortlist_len;
 pub const max_draft_len = gpu_types.max_draft_len;
+
+const tensor_type_f32: u32 = 0;
+const tensor_type_f16: u32 = 1;
+const tensor_type_q8_0: u32 = 8;
+const tensor_type_q4_k: u32 = 12;
+const tensor_type_q6_k: u32 = 14;
+const tensor_type_iq3_xxs: u32 = 18;
+const tensor_type_iq4_xs: u32 = 23;
 
 pub const Session = struct {
     backend: backend_api.MatVecBackend,
@@ -272,6 +281,39 @@ pub const Session = struct {
             self.hasOptionalTensor(layer.post_attention_norm);
     }
 
+    pub fn canRunMoeFfnBlock(self: *const Session, layer: LayerDesc) bool {
+        const moe = layer.moe orelse return false;
+        if (layer.post_ffw_norm != null) return false;
+        if (self.model.expert_count == 0 or self.model.expert_used_count == 0) return false;
+        if (self.model.expert_used_count > max_shortlist_len) return false;
+        if (self.model.expert_feed_forward_length == 0) return false;
+        if (!self.hasTensor(layer.ffn_norm.offset) or
+            !self.hasTensor(layer.ffn_gate.offset) or
+            !self.hasTensor(layer.ffn_up.offset) or
+            !self.hasTensor(layer.ffn_down.offset) or
+            !self.hasTensor(moe.router.offset) or
+            !self.hasTensor(moe.gate_exps.offset) or
+            !self.hasTensor(moe.up_exps.offset) or
+            !self.hasTensor(moe.down_exps.offset) or
+            !self.hasOptionalTensor(moe.shared_router_gate))
+        {
+            return false;
+        }
+        if (!supportsProjectionTensor(layer.ffn_gate) or
+            !supportsProjectionTensor(layer.ffn_up) or
+            !supportsProjectionTensor(layer.ffn_down) or
+            !supportsProjectionTensor(moe.router))
+        {
+            return false;
+        }
+        if (moe.shared_router_gate) |gate_tensor| {
+            if (!supportsProjectionTensor(gate_tensor) or gate_tensor.rows != 1) return false;
+        }
+        return moe.gate_exps.tensor_type == tensor_type_iq3_xxs and
+            moe.up_exps.tensor_type == tensor_type_iq3_xxs and
+            moe.down_exps.tensor_type == tensor_type_iq4_xs;
+    }
+
     pub fn readHidden(self: *Session, out: []f32) !void {
         if (out.len < self.model.embedding_length) return error.InvalidTensorMetadata;
         try self.readBufferF32Committed(self.hidden, out[0..self.model.embedding_length]);
@@ -459,6 +501,106 @@ pub const Session = struct {
         }
     }
 
+    pub fn runMoeFfnBlock(self: *Session, layer: LayerDesc) !void {
+        const moe = layer.moe orelse return error.InvalidTensorMetadata;
+        if (!self.canRunMoeFfnBlock(layer)) return error.InvalidTensorMetadata;
+
+        try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
+
+        const routing_start = std.time.nanoTimestamp();
+        try self.runProjection(moe.router, self.normed, self.tmp);
+        try metal_backend.topKShortlist(
+            self.backend,
+            self.tmp,
+            self.shortlist_entries,
+            self.model.expert_count,
+            self.model.expert_used_count,
+        );
+        try metal_backend.normalizeTopKShortlist(
+            self.backend,
+            self.shortlist_entries,
+            self.model.expert_used_count,
+            self.model.expert_gating_func == 1 or self.model.expert_gating_func == 2,
+            self.model.expert_weights_norm,
+            self.model.expert_weights_scale,
+        );
+        self.recordCategoryWithShape(.output_reduce, routing_start, .{
+            .rows = 2,
+            .cols = self.model.expert_used_count,
+            .depth = self.model.expert_count,
+        });
+
+        for (0..self.model.expert_used_count) |slot_idx| {
+            try self.runDualIndexedProjectionIQ3XXS(
+                moe.gate_exps,
+                moe.up_exps,
+                self.normed,
+                self.gate,
+                self.up,
+                slot_idx,
+                self.model.expert_feed_forward_length,
+            );
+
+            const silu_start = std.time.nanoTimestamp();
+            try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.expert_feed_forward_length);
+            self.recordCategoryWithShape(.elementwise_ops, silu_start, .{
+                .rows = 1,
+                .cols = self.model.expert_feed_forward_length,
+                .depth = 2,
+            });
+
+            const weighted_down_start = std.time.nanoTimestamp();
+            try self.runIndexedProjectionAddWeighted(
+                moe.down_exps,
+                self.gate,
+                self.hidden,
+                slot_idx,
+                self.model.embedding_length,
+            );
+            self.recordCategoryWithShape(.elementwise_ops, weighted_down_start, .{
+                .rows = self.model.embedding_length,
+                .cols = moe.down_exps.cols,
+                .depth = slot_idx + 1,
+                .tensor_type = moe.down_exps.tensor_type,
+            });
+        }
+
+        try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+        try self.runProjection(layer.ffn_up, self.normed, self.up);
+
+        const shared_act_start = std.time.nanoTimestamp();
+        if (self.model.use_gelu_ffn) {
+            try metal_backend.geluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+        } else {
+            try metal_backend.siluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
+        }
+        self.recordCategoryWithShape(.elementwise_ops, shared_act_start, .{
+            .rows = 1,
+            .cols = self.model.feed_forward_length,
+            .depth = 2,
+        });
+
+        try self.runProjection(layer.ffn_down, self.gate, self.tmp);
+        if (moe.shared_router_gate) |gate_tensor| {
+            try self.runProjection(gate_tensor, self.normed, self.sampled_token);
+            const shared_gate_start = std.time.nanoTimestamp();
+            try metal_backend.sigmoidScaleAdd(
+                self.backend,
+                self.hidden,
+                self.tmp,
+                self.sampled_token,
+                self.model.embedding_length,
+            );
+            self.recordCategoryWithShape(.elementwise_ops, shared_gate_start, .{
+                .rows = 1,
+                .cols = self.model.embedding_length,
+                .depth = 1,
+            });
+        } else {
+            try metal_backend.addInPlace(self.backend, self.hidden, self.tmp, self.model.embedding_length);
+        }
+    }
+
     pub fn runOutput(self: *Session, norm: TensorDesc, tensor: TensorDesc, out: []f32) !void {
         try self.runRmsNorm(norm, self.hidden, self.normed);
         try self.runProjection(tensor, self.normed, self.tmp);
@@ -573,6 +715,18 @@ pub const Session = struct {
 
     fn hasOptionalTensor(self: *const Session, tensor: ?TensorDesc) bool {
         return if (tensor) |value| self.hasTensor(value.offset) else true;
+    }
+
+    fn supportsProjectionTensor(tensor: TensorDesc) bool {
+        return switch (tensor.tensor_type) {
+            tensor_type_f32,
+            tensor_type_f16,
+            tensor_type_q8_0,
+            tensor_type_q4_k,
+            tensor_type_q6_k,
+            => true,
+            else => false,
+        };
     }
 
     fn hasTensor(self: *const Session, offset: u64) bool {
@@ -781,6 +935,118 @@ pub const Session = struct {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
             }
         }
+    }
+
+    fn runIndexedProjection(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        slot_idx: usize,
+        rows_per_expert: usize,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+        switch (tensor.tensor_type) {
+            tensor_type_iq3_xxs => try metal_backend.indexedMatvecIQ3XXS(
+                self.backend,
+                matrix,
+                input,
+                output,
+                rows_per_expert,
+                tensor.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            ),
+            tensor_type_iq4_xs => try metal_backend.indexedMatvecIQ4XS(
+                self.backend,
+                matrix,
+                input,
+                output,
+                rows_per_expert,
+                tensor.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            ),
+            else => return error.UnsupportedTensorType,
+        }
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = rows_per_expert,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+            .extra = slot_idx,
+        });
+    }
+
+    fn runDualIndexedProjectionIQ3XXS(
+        self: *Session,
+        tensor_a: TensorDesc,
+        tensor_b: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output_a: metal_backend.BufferHandle,
+        output_b: metal_backend.BufferHandle,
+        slot_idx: usize,
+        rows_per_expert: usize,
+    ) !void {
+        if (tensor_a.tensor_type != tensor_type_iq3_xxs or tensor_b.tensor_type != tensor_type_iq3_xxs) return error.UnsupportedTensorType;
+        const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+        const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
+        try metal_backend.dualIndexedMatvecIQ3XXS(
+            self.backend,
+            matrix_a,
+            matrix_b,
+            input,
+            output_a,
+            output_b,
+            rows_per_expert,
+            tensor_a.cols,
+            self.shortlist_entries,
+            slot_idx,
+            rows_per_expert,
+        );
+        const shape = metal_profile.ShapeDesc{
+            .rows = rows_per_expert,
+            .cols = tensor_a.cols,
+            .tensor_type = tensor_a.tensor_type,
+            .extra = slot_idx,
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+        self.recordCategoryWithShape(.projections, start, shape);
+    }
+
+    fn runIndexedProjectionAddWeighted(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+        slot_idx: usize,
+        rows_per_expert: usize,
+    ) !void {
+        const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
+        switch (tensor.tensor_type) {
+            tensor_type_iq4_xs => try metal_backend.indexedMatvecIQ4XSAddWeighted(
+                self.backend,
+                matrix,
+                input,
+                output,
+                rows_per_expert,
+                tensor.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            ),
+            else => return error.UnsupportedTensorType,
+        }
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = rows_per_expert,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+            .extra = slot_idx,
+        });
     }
 
     fn runProjectionToDst(

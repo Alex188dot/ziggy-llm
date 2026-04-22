@@ -92,6 +92,62 @@ constant uint ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK = 160;
 constant uint ZIGGY_MOONQ_Q4K_SPECIAL_COLS_0 = 2048;
 constant uint ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1 = 5632;
 constant uint ZIGGY_MAX_HEAD_DIM = 256;
+constant uint ZIGGY_IQ3_XXS_VALUES_PER_BLOCK = 256;
+constant uint ZIGGY_IQ3_XXS_BYTES_PER_BLOCK = 98;
+constant uint ZIGGY_IQ4_XS_VALUES_PER_BLOCK = 256;
+constant uint ZIGGY_IQ4_XS_BYTES_PER_BLOCK = 136;
+
+constant char ZIGGY_IQ4_NL_VALUES[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+constant uint ZIGGY_IQ3_XXS_GRID[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+
+inline uchar ziggy_iq2_signs(uchar code) {
+    return code | ((((popcount(code) & 1) == 1) ? uchar(0x80) : uchar(0x00)));
+}
+
+inline float ziggy_iq_sign(uchar signs, uint bit_index) {
+    return ((signs & (uchar(1) << bit_index)) != 0) ? -1.0f : 1.0f;
+}
+
+inline uchar ziggy_grid_byte(uint grid, uint index) {
+    return uchar((grid >> (index * 8)) & 0xff);
+}
 
 kernel void store_kv_half(
     device const float *src [[buffer(0)]],
@@ -1258,6 +1314,51 @@ kernel void topk_f32(
     }
 }
 
+kernel void normalize_topk_f32(
+    device ZiggyShortlistEntry *entries [[buffer(0)]],
+    constant uint &top_k [[buffer(1)]],
+    constant bool &apply_softmax [[buffer(2)]],
+    constant bool &normalize_weights [[buffer(3)]],
+    constant float &scale [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (top_k == 0 || top_k > ZIGGY_SHORTLIST_MAX_K) return;
+    if (tid != 0) return;
+
+    float weights[ZIGGY_SHORTLIST_MAX_K];
+    float total = 0.0f;
+    float max_score = -INFINITY;
+
+    if (apply_softmax) {
+        for (uint i = 0; i < top_k; i += 1) {
+            max_score = max(max_score, entries[i].score);
+        }
+        for (uint i = 0; i < top_k; i += 1) {
+            const float weight = exp(entries[i].score - max_score);
+            weights[i] = weight;
+            total += weight;
+        }
+    } else {
+        for (uint i = 0; i < top_k; i += 1) {
+            const float value = isfinite(entries[i].score) && entries[i].score > 0.0f ? entries[i].score : 0.0f;
+            weights[i] = value;
+            total += value;
+        }
+    }
+
+    if (!(total > 0.0f) || !isfinite(total)) {
+        for (uint i = 0; i < top_k; i += 1) {
+            entries[i].score = 0.0f;
+        }
+        return;
+    }
+
+    const float inv_total = normalize_weights ? (1.0f / total) : 1.0f;
+    for (uint i = 0; i < top_k; i += 1) {
+        entries[i].score = weights[i] * inv_total * scale;
+    }
+}
+
 kernel void sample_topk_f32(
     device const float *input [[buffer(0)]],
     device uint *output_token [[buffer(1)]],
@@ -1366,6 +1467,91 @@ kernel void sample_topk_f32(
         }
     }
     output_token[0] = best_indices[top_k - 1];
+}
+
+kernel void weighted_sum_topk_f32(
+    device float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    device const ZiggyShortlistEntry *entries [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &slot_idx [[buffer(4)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    dst[index] += src[index] * entries[slot_idx].score;
+}
+
+kernel void sigmoid_scale_add_f32(
+    device float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    device const float *scalar [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    const float gate = 1.0f / (1.0f + exp(-scalar[0]));
+    dst[index] += src[index] * gate;
+}
+
+inline float ziggy_dot_iq3_xxs_block(
+    device const uchar *block,
+    device const float *input
+) {
+    const float d = read_half_le(block, 0);
+    device const uchar *qs = block + 2;
+    device const uchar *scales_and_signs = block + 66;
+    float sum = 0.0f;
+
+    for (uint ib32 = 0; ib32 < 8; ib32 += 1) {
+        const uint aux32 =
+            uint(scales_and_signs[ib32 * 4 + 0]) |
+            (uint(scales_and_signs[ib32 * 4 + 1]) << 8) |
+            (uint(scales_and_signs[ib32 * 4 + 2]) << 16) |
+            (uint(scales_and_signs[ib32 * 4 + 3]) << 24);
+        const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+        for (uint l = 0; l < 4; l += 1) {
+            const uchar signs = ziggy_iq2_signs(uchar((aux32 >> (7 * l)) & 0x7f));
+            const uint grid1 = ZIGGY_IQ3_XXS_GRID[qs[2 * l + 0]];
+            const uint grid2 = ZIGGY_IQ3_XXS_GRID[qs[2 * l + 1]];
+            for (uint j = 0; j < 4; j += 1) {
+                const float value = db * float(ziggy_grid_byte(grid1, j)) * ziggy_iq_sign(signs, j + 0);
+                sum += value * input[j + 0];
+            }
+            for (uint j = 0; j < 4; j += 1) {
+                const float value = db * float(ziggy_grid_byte(grid2, j)) * ziggy_iq_sign(signs, j + 4);
+                sum += value * input[j + 4];
+            }
+            input += 8;
+        }
+        qs += 8;
+    }
+    return sum;
+}
+
+inline float ziggy_dot_iq4_xs_block(
+    device const uchar *block,
+    device const float *input
+) {
+    const float d = read_half_le(block, 0);
+    const ushort scales_h = ushort(block[2]) | (ushort(block[3]) << 8);
+    device const uchar *scales_l = block + 4;
+    device const uchar *qs = block + 8;
+    float sum = 0.0f;
+
+    for (uint ib = 0; ib < 8; ib += 1) {
+        const uchar low = (scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f;
+        const ushort high = (scales_h >> (2 * ib)) & 0x03;
+        const float dl = d * float(int(low | uchar(high << 4)) - 32);
+        for (uint j = 0; j < 16; j += 1) {
+            sum += dl * float(ZIGGY_IQ4_NL_VALUES[qs[j] & 0x0f]) * input[j];
+        }
+        for (uint j = 0; j < 16; j += 1) {
+            sum += dl * float(ZIGGY_IQ4_NL_VALUES[qs[j] >> 4]) * input[16 + j];
+        }
+        qs += 16;
+        input += 32;
+    }
+    return sum;
 }
 
 constant uint ZIGGY_BATCH_ARGMAX_MAX_DRAFTS = 8;
@@ -1927,3 +2113,212 @@ ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL(matvec_moonq_q4k_silu_down_add_2048_f32, ZI
 ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL(matvec_moonq_q4k_silu_down_add_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
 
 #undef ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL
+
+kernel void indexed_matvec_iq3_xxs_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    device const ZiggyShortlistEntry *entries [[buffer(5)]],
+    constant uint &slot_idx [[buffer(6)]],
+    constant uint &rows_per_expert [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+
+    const uint block_count = cols / ZIGGY_IQ3_XXS_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_IQ3_XXS_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr = matrix + matrix_row * row_bytes;
+
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        local_sum += ziggy_dot_iq3_xxs_block(
+            row_ptr + block_index * ZIGGY_IQ3_XXS_BYTES_PER_BLOCK,
+            input + block_index * ZIGGY_IQ3_XXS_VALUES_PER_BLOCK
+        );
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] = sum;
+    }
+}
+
+kernel void dual_indexed_matvec_iq3_xxs_f32(
+    device const uchar *matrix_a [[buffer(0)]],
+    device const uchar *matrix_b [[buffer(1)]],
+    device const float *input [[buffer(2)]],
+    device float *output_a [[buffer(3)]],
+    device float *output_b [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &cols [[buffer(6)]],
+    device const ZiggyShortlistEntry *entries [[buffer(7)]],
+    constant uint &slot_idx [[buffer(8)]],
+    constant uint &rows_per_expert [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+
+    const uint block_count = cols / ZIGGY_IQ3_XXS_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_IQ3_XXS_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr_a = matrix_a + matrix_row * row_bytes;
+    const device uchar *row_ptr_b = matrix_b + matrix_row * row_bytes;
+
+    threadgroup float partial_sums_a[ZIGGY_MAX_ROW_SIMDGROUPS];
+    threadgroup float partial_sums_b[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum_a = 0.0f;
+    float local_sum_b = 0.0f;
+
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        const device float *block_input = input + block_index * ZIGGY_IQ3_XXS_VALUES_PER_BLOCK;
+        local_sum_a += ziggy_dot_iq3_xxs_block(
+            row_ptr_a + block_index * ZIGGY_IQ3_XXS_BYTES_PER_BLOCK,
+            block_input
+        );
+        local_sum_b += ziggy_dot_iq3_xxs_block(
+            row_ptr_b + block_index * ZIGGY_IQ3_XXS_BYTES_PER_BLOCK,
+            block_input
+        );
+    }
+
+    const float simd_sum_a = simd_sum(local_sum_a);
+    const float simd_sum_b = simd_sum(local_sum_b);
+    if (simd_lane == 0) {
+        partial_sums_a[simd_group] = simd_sum_a;
+        partial_sums_b[simd_group] = simd_sum_b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum_a = 0.0f;
+        float sum_b = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum_a += partial_sums_a[index];
+            sum_b += partial_sums_b[index];
+        }
+        output_a[row] = sum_a;
+        output_b[row] = sum_b;
+    }
+}
+
+kernel void indexed_matvec_iq4_xs_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    device const ZiggyShortlistEntry *entries [[buffer(5)]],
+    constant uint &slot_idx [[buffer(6)]],
+    constant uint &rows_per_expert [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+
+    const uint block_count = cols / ZIGGY_IQ4_XS_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_IQ4_XS_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr = matrix + matrix_row * row_bytes;
+
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        local_sum += ziggy_dot_iq4_xs_block(
+            row_ptr + block_index * ZIGGY_IQ4_XS_BYTES_PER_BLOCK,
+            input + block_index * ZIGGY_IQ4_XS_VALUES_PER_BLOCK
+        );
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] = sum;
+    }
+}
+
+kernel void indexed_matvec_iq4_xs_add_weighted_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    device const ZiggyShortlistEntry *entries [[buffer(5)]],
+    constant uint &slot_idx [[buffer(6)]],
+    constant uint &rows_per_expert [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+
+    const uint block_count = cols / ZIGGY_IQ4_XS_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_IQ4_XS_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr = matrix + matrix_row * row_bytes;
+
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        local_sum += ziggy_dot_iq4_xs_block(
+            row_ptr + block_index * ZIGGY_IQ4_XS_BYTES_PER_BLOCK,
+            input + block_index * ZIGGY_IQ4_XS_VALUES_PER_BLOCK
+        );
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] += sum * entries[slot_idx].score;
+    }
+}
