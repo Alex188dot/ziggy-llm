@@ -154,9 +154,69 @@ To keep the implementation modular and under file-size limits, split by responsi
 
 ### Current Assumptions
 
-- explicit Metal support is still deferred; the Qwen 3.5 MoE family runtime currently forces the CPU path
+- the native Metal path for `qwen35moe` is guarded rather than full-offload:
+  - MoE FFN stays on CPU
+  - Metal is used only for the attention/output path of the selected transformer layers
+  - `--gpu-layers auto` is conservative by design and currently means the first `8` attention layers
 - when expert gating metadata is absent, the implementation defaults to softmax gating with normalized top-k weights
 - shared-expert routing is applied through `ffn_gate_inp_shexp.weight` when present
+
+### Guarded Native Metal Commands
+
+These are native ziggy-llm commands. They do not use `llama.cpp` offload.
+
+Recommended guarded chat command:
+
+```bash
+./zig-out/bin/ziggy-llm chat \
+  --model /Users/alessioleodori/HelloWorld/zig_/models/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+  --backend metal \
+  --gpu-layers auto \
+  --temperature 0 \
+  --seed 42
+```
+
+Exact meaning for `qwen35moe`:
+
+- `--gpu-layers auto`: offload the first `8` attention layers to Metal, keep all MoE FFN on CPU
+- `--gpu-layers 8`: same as the current guarded auto policy
+- `--gpu-layers all`: offload attention for all transformer layers, but still keep MoE FFN on CPU
+
+Recommended one-shot run command:
+
+```bash
+./zig-out/bin/ziggy-llm run \
+  --model /Users/alessioleodori/HelloWorld/zig_/models/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+  --prompt "hi" \
+  --backend metal \
+  --gpu-layers auto \
+  --temperature 0 \
+  --seed 42
+```
+
+More conservative command if the system is still unstable:
+
+```bash
+./zig-out/bin/ziggy-llm chat \
+  --model /Users/alessioleodori/HelloWorld/zig_/models/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+  --backend metal \
+  --gpu-layers 4 \
+  --temperature 0 \
+  --seed 42
+```
+
+Profiling command:
+
+```bash
+./zig-out/bin/ziggy-llm run \
+  --model /Users/alessioleodori/HelloWorld/zig_/models/Qwen3.5-35B-A3B-Q3_K_M.gguf \
+  --prompt "hi" \
+  --backend metal \
+  --gpu-layers auto \
+  --metal-profile \
+  --temperature 0 \
+  --seed 42
+```
 
 ### Acceptance Criteria
 

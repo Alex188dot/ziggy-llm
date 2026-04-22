@@ -25,8 +25,9 @@ fn qwen35Generate(
         .min_p = options.min_p,
         .backend = @enumFromInt(@intFromEnum(options.backend)),
         .moon_quant = options.moon_quant,
-        .metal_profile = false,
+        .metal_profile = options.metal_profile,
         .sampling_strategy = options.sampling_strategy,
+        .gpu_layers = options.gpu_layers,
     };
 
     const report = try llama_runtime.generate(allocator, model_path, prompt, gen_opts);

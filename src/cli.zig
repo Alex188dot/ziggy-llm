@@ -32,6 +32,7 @@ pub const Config = struct {
     moon_quant: runtime.MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: runtime.SamplingStrategy = .auto,
+    gpu_layers: runtime.GpuLayers = .auto,
     dump_tensors: bool = false,
 };
 
@@ -50,6 +51,7 @@ pub const ParseError = error{
     InvalidBackend,
     InvalidMoonQuant,
     InvalidSamplingStrategy,
+    InvalidGpuLayers,
 };
 
 pub fn parseArgs(args: []const []const u8) ParseError!Config {
@@ -175,6 +177,12 @@ pub fn parseArgs(args: []const []const u8) ParseError!Config {
             config.sampling_strategy = runtime.SamplingStrategy.parse(args[i]) orelse return error.InvalidSamplingStrategy;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--gpu-layers")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config.gpu_layers = runtime.GpuLayers.parse(args[i]) orelse return error.InvalidGpuLayers;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.command = .help;
             return config;
@@ -235,6 +243,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\      --moon-quant <m>  Q4_K Metal packing mode: enabled or disabled (default: {s})
         \\      --metal-profile   Print startup and decode Metal timing details plus dominant shape data
         \\      --sampling-path   Sampling path: auto, gpu-greedy, gpu-topk-sample, gpu-shortlist, cpu-full-logits (default: {s})
+        \\      --gpu-layers <v>  Metal offload policy: auto, all, or a positive layer count (default: auto)
         \\      --port <port>     Port for server mode (default: {d})
         \\
         \\Build:
@@ -285,7 +294,7 @@ test "version flag parsing works" {
 }
 
 test "runtime flags parse correctly" {
-    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist" });
+    const config = try parseArgs(&.{ "ziggy-llm", "bench", "-m", "demo.gguf", "-p", "hi", "--max-tokens", "4", "--context-length", "16384", "--bench-runs", "3", "--seed", "9", "--temperature", "0.5", "--repeat-penalty", "1.1", "--top-k", "40", "--top-p", "0.9", "--min-p", "0.05", "--backend", "metal", "--moon-quant", "disabled", "--metal-profile", "--sampling-path", "gpu-shortlist", "--gpu-layers", "8" });
     try std.testing.expectEqual(@as(usize, 4), config.max_tokens);
     try std.testing.expectEqual(@as(usize, 16384), config.context_length);
     try std.testing.expectEqual(@as(usize, 3), config.bench_runs);
@@ -299,4 +308,5 @@ test "runtime flags parse correctly" {
     try std.testing.expectEqual(runtime.MoonQuantMode.disabled, config.moon_quant);
     try std.testing.expect(config.metal_profile);
     try std.testing.expectEqual(runtime.SamplingStrategy.gpu_shortlist, config.sampling_strategy);
+    try std.testing.expectEqualDeep(runtime.GpuLayers{ .count = 8 }, config.gpu_layers);
 }

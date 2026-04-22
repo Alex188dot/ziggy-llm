@@ -1199,8 +1199,13 @@ const Session = struct {
 
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
+            const use_gpu_layer = if (self.gpu_session) |*gpu_session|
+                gpu_session.canRunAttentionBlock(adaptLayerDesc(layer))
+            else
+                false;
 
-            if (self.gpu_session) |*gpu_session| {
+            if (use_gpu_layer) {
+                const gpu_session = &self.gpu_session.?;
                 if (layer_index == 0) try gpu_session.beginToken(self.hidden);
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
             } else if (is_linear_attn) {
@@ -1262,7 +1267,8 @@ const Session = struct {
                 if (layer.post_attention_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
             }
 
-            if (self.gpu_session) |*gpu_session| {
+            if (use_gpu_layer) {
+                const gpu_session = &self.gpu_session.?;
                 if (layer.moe) |moe| {
                     try self.runMoeFfnHybrid(gpu_session, layer, moe);
                 } else {

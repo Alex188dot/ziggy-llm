@@ -172,6 +172,7 @@ fn mergeOptions(config: cli.Config, payload: anytype) runtime.GenerationOptions 
         .backend = config.backend,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
+        .gpu_layers = config.gpu_layers,
     };
 }
 

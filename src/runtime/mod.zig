@@ -27,6 +27,7 @@ pub const BackendPreference = types.BackendPreference;
 pub const BackendUsed = types.BackendUsed;
 pub const MoonQuantMode = types.MoonQuantMode;
 pub const SamplingStrategy = types.SamplingStrategy;
+pub const GpuLayers = types.GpuLayers;
 pub const EffectiveSamplingPath = types.EffectiveSamplingPath;
 pub const ReadbackMode = types.ReadbackMode;
 pub const GenerationOptions = types.GenerationOptions;
@@ -78,6 +79,7 @@ pub fn generate(
             .moon_quant = options.moon_quant,
             .metal_profile = options.metal_profile,
             .sampling_strategy = options.sampling_strategy,
+            .gpu_layers = options.gpu_layers,
         };
 
         const family_report = try runtime.generate(allocator, model_path, prompt, family_options);

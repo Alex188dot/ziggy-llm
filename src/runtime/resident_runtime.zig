@@ -5,7 +5,6 @@ const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
 const llama_metal = @import("gpu/metal/tensor_store.zig");
 const metal_backend = @import("metal_backend.zig");
-const qwen35_metal_fallback = @import("qwen35_metal_fallback.zig");
 const types = @import("types.zig");
 
 pub const ResidentRuntime = struct {
@@ -48,12 +47,12 @@ pub const ResidentRuntime = struct {
     }
 
     pub fn chatTemplateStyle(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference, context_length_limit: usize) !gguf.ChatTemplateStyle {
-        try self.ensureLoaded(model_path, backend, context_length_limit, false);
+        try self.ensureLoaded(model_path, backend, context_length_limit, .enabled, .auto, false);
         return self.loaded.?.chat_template_style;
     }
 
     pub fn chatTemplateNeedsThinkingPrefix(self: *ResidentRuntime, model_path: []const u8, backend: types.BackendPreference, context_length_limit: usize) !bool {
-        try self.ensureLoaded(model_path, backend, context_length_limit, false);
+        try self.ensureLoaded(model_path, backend, context_length_limit, .enabled, .auto, false);
         return self.loaded.?.chat_template_needs_thinking_prefix;
     }
 
@@ -75,22 +74,10 @@ pub const ResidentRuntime = struct {
         stream_callback: ?llama_cpu.StreamCallback,
     ) !types.GenerationReport {
         self.unloadIfExpired();
-        try self.ensureLoaded(model_path, options.backend, options.context_length, options.metal_profile);
+
+        try self.ensureLoaded(model_path, options.backend, options.context_length, options.moon_quant, options.gpu_layers, options.metal_profile);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
-
-        if (try qwen35_metal_fallback.maybeGenerate(
-            self.allocator,
-            &loaded.model,
-            loaded.execution.backend != null and loaded.execution.backend.?.label == .metal,
-            model_path,
-            prompt,
-            options,
-            stream_ctx,
-            stream_callback,
-        )) |fallback_report| {
-            return try self.finalizeReport(loaded, fallback_report, options);
-        }
 
         const lookup = if (loaded.execution.dense_tensors) |*dense_tensors|
             llama_cpu.DenseTensorLookup{
@@ -166,14 +153,18 @@ pub const ResidentRuntime = struct {
     }
 
     pub fn promptTokenCount(self: *ResidentRuntime, model_path: []const u8, prompt: []const u8, backend: types.BackendPreference) !usize {
-        try self.ensureLoaded(model_path, backend, types.default_context_length, false);
+        try self.ensureLoaded(model_path, backend, types.default_context_length, .enabled, .auto, false);
         const loaded = &self.loaded.?;
         return llama_cpu.countPromptTokens(self.allocator, &loaded.model, prompt);
     }
 
-    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, context_length_limit: usize, startup_profile_enabled: bool) !void {
+    fn ensureLoaded(self: *ResidentRuntime, model_path: []const u8, backend_pref: types.BackendPreference, context_length_limit: usize, moon_quant_mode: types.MoonQuantMode, gpu_layers: types.GpuLayers, startup_profile_enabled: bool) !void {
         if (self.loaded) |loaded| {
-            if (std.mem.eql(u8, loaded.model_path, model_path) and loaded.backend_pref == backend_pref and loaded.context_length_limit == context_length_limit) return;
+            if (std.mem.eql(u8, loaded.model_path, model_path) and
+                loaded.backend_pref == backend_pref and
+                loaded.context_length_limit == context_length_limit and
+                loaded.moon_quant_mode == moon_quant_mode and
+                std.meta.eql(loaded.gpu_layers, gpu_layers)) return;
             self.unload();
         }
 
@@ -182,7 +173,7 @@ pub const ResidentRuntime = struct {
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 
-        var execution = try selectExecution(self.allocator, &model, backend_pref, startup_profile_enabled);
+        var execution = try selectExecution(self.allocator, &model, backend_pref, moon_quant_mode, gpu_layers, startup_profile_enabled);
         errdefer execution.deinit(self.allocator);
 
         const owned_model_path = try self.allocator.dupe(u8, model_path);
@@ -216,6 +207,8 @@ pub const ResidentRuntime = struct {
             .model_path = owned_model_path,
             .backend_pref = backend_pref,
             .context_length_limit = context_length_limit,
+            .moon_quant_mode = moon_quant_mode,
+            .gpu_layers = gpu_layers,
             .chat_template_style = chat_template_style,
             .chat_template_needs_thinking_prefix = chat_template_needs_thinking_prefix,
             .model = model,
@@ -286,6 +279,8 @@ const LoadedModel = struct {
     model_path: []u8,
     backend_pref: types.BackendPreference,
     context_length_limit: usize,
+    moon_quant_mode: types.MoonQuantMode,
+    gpu_layers: types.GpuLayers,
     chat_template_style: gguf.ChatTemplateStyle,
     chat_template_needs_thinking_prefix: bool,
     model: llama_cpu.Model,
@@ -322,12 +317,14 @@ fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
     preference: types.BackendPreference,
+    moon_quant_mode: types.MoonQuantMode,
+    gpu_layers: types.GpuLayers,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, .enabled, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, .enabled, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled),
+        .auto => createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -338,13 +335,15 @@ fn createMetalExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
     moon_quant_mode: types.MoonQuantMode,
+    gpu_layers: types.GpuLayers,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
+    const device_info = metal_backend.getDeviceInfo() catch null;
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    try dense_tensors.populate(model, gpu_layers, device_info, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
     const backend_init_begin = std.time.nanoTimestamp();

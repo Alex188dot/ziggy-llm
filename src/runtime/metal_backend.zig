@@ -31,6 +31,12 @@ pub const CommitStats = struct {
     gpu_timestamps_valid: bool = false,
 };
 
+pub const DeviceInfo = struct {
+    recommended_max_working_set_size: u64 = 0,
+    has_unified_memory: bool = false,
+    low_power: bool = false,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -176,6 +182,30 @@ pub fn canInitialize(allocator: std.mem.Allocator) !bool {
     };
     metal.deinit(allocator);
     return true;
+}
+
+pub fn getDeviceInfo() !DeviceInfo {
+    if (!build_enabled_value) return error.MetalDisabled;
+
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    var raw_context: ?*c.ZiggyMetalContext = null;
+    var raw_info: c.ZiggyMetalDeviceInfo = std.mem.zeroes(c.ZiggyMetalDeviceInfo);
+    const status = c.ziggy_metal_create_context(
+        shader_source.ptr,
+        shader_source.len,
+        &raw_context,
+        &raw_info,
+        &error_buf,
+        error_buf.len,
+    );
+    try mapStatus(status, &error_buf);
+    defer c.ziggy_metal_destroy_context(raw_context.?);
+
+    return .{
+        .recommended_max_working_set_size = raw_info.recommended_max_working_set_size,
+        .has_unified_memory = raw_info.has_unified_memory,
+        .low_power = raw_info.low_power,
+    };
 }
 
 pub fn create(allocator: std.mem.Allocator) !backend_api.MatVecBackend {

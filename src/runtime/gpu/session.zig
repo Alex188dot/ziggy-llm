@@ -245,6 +245,34 @@ pub const Session = struct {
         try metal_backend.beginSequence(self.backend);
     }
 
+    pub fn canRunAttentionBlock(self: *const Session, layer: LayerDesc) bool {
+        if (!self.hasTensor(layer.attn_norm.offset)) return false;
+        if (layer.linear_attn) |la| {
+            return self.hasTensor(la.in_proj_qkv.offset) and
+                self.hasTensor(la.in_proj_z.offset) and
+                self.hasTensor(la.in_proj_b.offset) and
+                self.hasTensor(la.in_proj_a.offset) and
+                self.hasTensor(la.conv1d.offset) and
+                self.hasTensor(la.dt_bias.offset) and
+                self.hasTensor(la.A_log.offset) and
+                self.hasTensor(la.norm_weight.offset) and
+                self.hasTensor(la.out_proj.offset);
+        }
+        const attn_q = layer.attn_q orelse return false;
+        const attn_k = layer.attn_k orelse return false;
+        const attn_v = layer.attn_v orelse return false;
+        return self.hasTensor(attn_q.offset) and
+            self.hasOptionalTensor(layer.attn_q_bias) and
+            self.hasOptionalTensor(layer.attn_q_norm) and
+            self.hasTensor(attn_k.offset) and
+            self.hasOptionalTensor(layer.attn_k_bias) and
+            self.hasOptionalTensor(layer.attn_k_norm) and
+            self.hasTensor(attn_v.offset) and
+            self.hasOptionalTensor(layer.attn_v_bias) and
+            self.hasOptionalTensor(layer.attn_output) and
+            self.hasOptionalTensor(layer.post_attention_norm);
+    }
+
     pub fn readHidden(self: *Session, out: []f32) !void {
         if (out.len < self.model.embedding_length) return error.InvalidTensorMetadata;
         try metal_backend.readBufferF32(self.hidden, out[0..self.model.embedding_length]);
@@ -542,6 +570,16 @@ pub const Session = struct {
         if (self.model.sliding_window == 0) return false;
         if (self.model.global_attention_interval == 0) return true;
         return ((layer_index + 1) % self.model.global_attention_interval) != 0;
+    }
+
+    fn hasOptionalTensor(self: *const Session, tensor: ?TensorDesc) bool {
+        return if (tensor) |value| self.hasTensor(value.offset) else true;
+    }
+
+    fn hasTensor(self: *const Session, offset: u64) bool {
+        return self.dense_lookup.getDense(offset) != null or
+            self.dense_lookup.getRaw(offset) != null or
+            self.dense_lookup.getMoonQuant(offset) != null;
     }
 
     fn applyRoPEBuffer(

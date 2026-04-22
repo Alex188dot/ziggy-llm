@@ -68,6 +68,7 @@ pub const FamilyGenerateOptions = struct {
     moon_quant: types.MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: types.SamplingStrategy = .auto,
+    gpu_layers: types.GpuLayers = .auto,
 };
 
 pub const FamilyReport = struct {
