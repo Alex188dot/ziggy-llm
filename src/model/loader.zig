@@ -860,6 +860,7 @@ pub const ReusableSession = struct {
         self.session.position = 0;
         self.session.pending_greedy_token = null;
         self.session.pending_shortlist_len = 0;
+        self.session.gpu_hidden_is_current = false;
         @memset(self.session.k_cache, 0);
         @memset(self.session.v_cache, 0);
         @memset(self.session.linear_conv_state, 0);
@@ -903,6 +904,7 @@ const Session = struct {
     linear_conv_tmp: []f32,
     moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
+    gpu_hidden_is_current: bool = false,
     position: usize = 0,
 
     fn init(
@@ -969,12 +971,10 @@ const Session = struct {
         @memset(session.linear_conv_state, 0);
         @memset(session.linear_recurrent_state, 0);
 
-        if (backend == null) {
-            const cpu_count = std.Thread.getCpuCount() catch 1;
-            const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
-            if (helper_count > 0) {
-                session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
-            }
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
+        if (helper_count > 0) {
+            session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
         }
         return session;
     }
@@ -1042,6 +1042,7 @@ const Session = struct {
             return self.pending_shortlist[0..0];
         }
         try self.runTokenCore(token_id);
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const shortlist = try gpu_session.runOutputShortlist(
             adaptTensorDesc(self.model.output_norm),
@@ -1061,6 +1062,7 @@ const Session = struct {
             return argmax(self.logits);
         }
         try self.runTokenCore(token_id);
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputSampleTopK(
             adaptTensorDesc(self.model.output_norm),
@@ -1081,6 +1083,14 @@ const Session = struct {
             return argmax(self.logits);
         }
         try self.runTokenCore(token_id);
+        if (!self.gpu_hidden_is_current) {
+            try self.computeOutputCpu();
+            const next_token = argmax(self.logits);
+            self.pending_greedy_token = next_token;
+            self.finishToken(token_id);
+            return next_token;
+        }
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
         self.pending_greedy_token = next_token;
@@ -1184,11 +1194,13 @@ const Session = struct {
         self.pending_greedy_token = null;
         self.pending_shortlist_len = 0;
         if (self.gpu_session) |*gpu_session| {
-            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+            if (self.gpu_hidden_is_current) {
+                try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+            } else {
+                try self.computeOutputCpu();
+            }
         } else {
-            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-            try self.recordCalibration(self.model.output, .output, self.normed);
-            try self.matVec(self.logits, self.model.output, self.normed);
+            try self.computeOutputCpu();
         }
         if (self.model.final_logit_softcapping) |cap| applySoftcapInPlace(self.logits, cap);
 
@@ -1200,18 +1212,20 @@ const Session = struct {
         if (self.position >= self.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
         scaleInPlace(self.hidden, self.model.embedding_scale);
+        self.gpu_hidden_is_current = false;
 
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
             const use_gpu_layer = if (self.gpu_session) |*gpu_session|
-                gpu_session.canRunAttentionBlock(adaptLayerDesc(layer))
+                layer.moe == null and gpu_session.canRunAttentionBlock(adaptLayerDesc(layer))
             else
                 false;
 
             if (use_gpu_layer) {
                 const gpu_session = &self.gpu_session.?;
-                if (layer_index == 0) try gpu_session.beginToken(self.hidden);
+                if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
                 try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
+                self.gpu_hidden_is_current = true;
             } else if (is_linear_attn) {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 try self.computeLinearAttention(layer_index, layer.linear_attn.?);
@@ -1277,6 +1291,7 @@ const Session = struct {
                 } else {
                     try gpu_session.runFfnBlock(adaptLayerDesc(layer));
                 }
+                self.gpu_hidden_is_current = true;
             } else {
                 addInPlace(self.hidden, self.attn_tmp);
 
@@ -1301,9 +1316,21 @@ const Session = struct {
                     if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
                 }
                 addInPlace(self.hidden, self.attn_tmp);
+                self.gpu_hidden_is_current = false;
             }
-
         }
+    }
+
+    fn syncGpuHiddenForOutput(self: *Session) !void {
+        if (self.gpu_session == null or self.gpu_hidden_is_current) return;
+        try self.gpu_session.?.writeHidden(self.hidden);
+        self.gpu_hidden_is_current = true;
+    }
+
+    fn computeOutputCpu(self: *Session) !void {
+        try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
+        try self.recordCalibration(self.model.output, .output, self.normed);
+        try self.matVec(self.logits, self.model.output, self.normed);
     }
 
     fn finishToken(self: *Session, token_id: u32) void {
@@ -1568,6 +1595,24 @@ const Session = struct {
 
         const bytes = try tensorBytes(self.model, tensor);
         const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        const work = out.len * row_len;
+
+        if (self.matvec_workers) |workers| {
+            if (out.len >= parallel_matvec_min_rows and work >= parallel_matvec_min_work) {
+                workers.run(.{
+                    .out = out,
+                    .bytes = bytes,
+                    .row_size = row_size,
+                    .row_len = row_len,
+                    .tensor_type = tensor.tensor_type,
+                    .input = input,
+                    .row_count = out.len,
+                    .row_offset = row_offset,
+                });
+                return;
+            }
+        }
+
         for (0..out.len) |index| {
             const row_index = row_offset + index;
             const row = bytes[row_index * row_size ..][0..row_size];
@@ -1822,6 +1867,7 @@ const MatVecTask = struct {
     tensor_type: TensorType,
     input: []const f32,
     row_count: usize,
+    row_offset: usize = 0,
 };
 
 const RowRange = struct {
@@ -1907,7 +1953,8 @@ fn workerRowRange(worker_index: usize, participant_count: usize, row_count: usiz
 fn runMatVecTask(task: MatVecTask, worker_index: usize, participant_count: usize) void {
     const range = workerRowRange(worker_index, participant_count, task.row_count);
     for (range.start..range.end) |row_index| {
-        const row = task.bytes[row_index * task.row_size ..][0..task.row_size];
+        const tensor_row_index = task.row_offset + row_index;
+        const row = task.bytes[tensor_row_index * task.row_size ..][0..task.row_size];
         task.out[row_index] = dotRowAssumeValid(task.tensor_type, row, task.row_len, task.input);
     }
 }

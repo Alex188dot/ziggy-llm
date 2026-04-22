@@ -48,7 +48,7 @@ pub const DenseTensorStore = struct {
         try self.addTensor(model, model.output, moon_quant_mode, profiler);
         try self.addTensor(model, model.output_norm, moon_quant_mode, profiler);
         for (model.layers, 0..) |layer, layer_index| {
-            if (!policy.offloadsAttention(layer_index)) continue;
+            if (layer.moe != null or !policy.offloadsAttention(layer_index)) continue;
             try self.addTensor(model, layer.attn_norm, moon_quant_mode, profiler);
             if (layer.attn_q) |q| try self.addTensor(model, q, moon_quant_mode, profiler);
             if (layer.attn_q_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
@@ -432,7 +432,7 @@ test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
 
     var packed_store = DenseTensorStore.init(std.testing.allocator);
     defer packed_store.deinit();
-    try packed_store.populate(&model, .enabled, null);
+    try packed_store.populate(&model, .all, null, .enabled, null);
     try std.testing.expect(packed_store.getRawByOffset(model.output.offset) != null);
     try std.testing.expect(packed_store.getMoonQuantBytesByOffset(model.output.offset) != null);
     const packed_plan = packed_store.prewarmPlan();
@@ -441,7 +441,7 @@ test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
 
     var generic_store = DenseTensorStore.init(std.testing.allocator);
     defer generic_store.deinit();
-    try generic_store.populate(&model, .disabled, null);
+    try generic_store.populate(&model, .all, null, .disabled, null);
     try std.testing.expect(generic_store.getRawByOffset(model.output.offset) != null);
     try std.testing.expect(generic_store.getMoonQuantBytesByOffset(model.output.offset) == null);
     const generic_plan = generic_store.prewarmPlan();
@@ -468,7 +468,7 @@ test "dense tensor store keeps initial qwen moe quant targets raw for Metal prep
 
         var store = DenseTensorStore.init(std.testing.allocator);
         defer store.deinit();
-        try store.populate(&model, .disabled, null);
+        try store.populate(&model, .all, null, .disabled, null);
 
         try std.testing.expectEqual(true, DenseTensorStore.storesRawQuant(tensor_type));
         try std.testing.expect(store.getRawByOffset(model.output.offset) != null);
