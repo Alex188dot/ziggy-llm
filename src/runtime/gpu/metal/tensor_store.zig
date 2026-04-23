@@ -5,6 +5,7 @@ const types = @import("../../types.zig");
 const llama = @import("../../../model/loader.zig");
 const moon_quant = @import("../../../moon_quant.zig");
 const llama_fixture = @import("../../llama_fixture.zig");
+const offload_policy = @import("offload_policy.zig");
 
 pub const DenseTensorStore = struct {
     allocator: std.mem.Allocator,
@@ -38,12 +39,16 @@ pub const DenseTensorStore = struct {
     pub fn populate(
         self: *DenseTensorStore,
         model: *const llama.Model,
+        gpu_layers: types.GpuLayers,
+        device_info: ?metal_backend.DeviceInfo,
         moon_quant_mode: types.MoonQuantMode,
         profiler: ?*StartupProfiler,
     ) !void {
+        const policy = offload_policy.OffloadPolicy.forModel(model, gpu_layers, device_info);
         try self.addTensor(model, model.output, moon_quant_mode, profiler);
         try self.addTensor(model, model.output_norm, moon_quant_mode, profiler);
-        for (model.layers) |layer| {
+        for (model.layers, 0..) |layer, layer_index| {
+            if (!policy.offloadsAttention(layer_index)) continue;
             try self.addTensor(model, layer.attn_norm, moon_quant_mode, profiler);
             if (layer.attn_q) |q| try self.addTensor(model, q, moon_quant_mode, profiler);
             if (layer.attn_q_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
@@ -54,12 +59,14 @@ pub const DenseTensorStore = struct {
             if (layer.attn_v) |v| try self.addTensor(model, v, moon_quant_mode, profiler);
             if (layer.attn_v_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
             if (layer.attn_output) |o| try self.addTensor(model, o, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.ffn_norm, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.ffn_down, moon_quant_mode, profiler);
-            try self.addTensor(model, layer.ffn_up, moon_quant_mode, profiler);
             if (layer.post_attention_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
-            if (layer.post_ffw_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
+            if (layer.moe == null or policy.offloadsMoeFfn(layer.moe != null)) {
+                try self.addTensor(model, layer.ffn_norm, moon_quant_mode, profiler);
+                try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
+                try self.addTensor(model, layer.ffn_down, moon_quant_mode, profiler);
+                try self.addTensor(model, layer.ffn_up, moon_quant_mode, profiler);
+                if (layer.post_ffw_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
+            }
             if (layer.linear_attn) |la| {
                 try self.addTensor(model, la.in_proj_qkv, moon_quant_mode, profiler);
                 try self.addTensor(model, la.in_proj_z, moon_quant_mode, profiler);
@@ -145,6 +152,13 @@ pub const DenseTensorStore = struct {
         return plan;
     }
 
+    pub fn storesRawQuant(tensor_type: llama.TensorType) bool {
+        return switch (tensor_type) {
+            .q3_k, .q4_k, .q6_k, .q8_0, .iq3_xxs, .iq4_xs => true,
+            else => false,
+        };
+    }
+
     fn addTensor(
         self: *DenseTensorStore,
         model: *const llama.Model,
@@ -161,7 +175,7 @@ pub const DenseTensorStore = struct {
             .tensor_type = tensor.tensor_type,
         });
 
-        if (tensor.tensor_type == .q4_k or tensor.tensor_type == .q6_k or tensor.tensor_type == .q8_0) {
+        if (storesRawQuant(tensor.tensor_type)) {
             const prepare_start = std.time.nanoTimestamp();
             const tensor_bytes = try llama.tensorBytes(model, tensor);
             try self.raw_tensors.put(tensor.offset, tensor_bytes);
@@ -418,7 +432,7 @@ test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
 
     var packed_store = DenseTensorStore.init(std.testing.allocator);
     defer packed_store.deinit();
-    try packed_store.populate(&model, .enabled, null);
+    try packed_store.populate(&model, .all, null, .enabled, null);
     try std.testing.expect(packed_store.getRawByOffset(model.output.offset) != null);
     try std.testing.expect(packed_store.getMoonQuantBytesByOffset(model.output.offset) != null);
     const packed_plan = packed_store.prewarmPlan();
@@ -427,10 +441,40 @@ test "dense tensor store packs q4_k tensors only when MoonQuant is enabled" {
 
     var generic_store = DenseTensorStore.init(std.testing.allocator);
     defer generic_store.deinit();
-    try generic_store.populate(&model, .disabled, null);
+    try generic_store.populate(&model, .all, null, .disabled, null);
     try std.testing.expect(generic_store.getRawByOffset(model.output.offset) != null);
     try std.testing.expect(generic_store.getMoonQuantBytesByOffset(model.output.offset) == null);
     const generic_plan = generic_store.prewarmPlan();
     try std.testing.expect(generic_plan.raw_count > 0);
     try std.testing.expectEqual(@as(usize, 0), generic_plan.skipped_shadowed_raw_count);
+}
+
+test "dense tensor store keeps initial qwen moe quant targets raw for Metal preparation" {
+    const quant_types = [_]llama.TensorType{ .q3_k, .iq3_xxs, .iq4_xs };
+
+    for (quant_types) |tensor_type| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const fixture = try llama_fixture.makeLlamaBenchmarkFixture(std.testing.allocator, tensor_type);
+        defer std.testing.allocator.free(fixture);
+        try llama_fixture.writeFixtureFile(tmp.dir, "llama-quant.gguf", fixture);
+
+        const path = try tmp.dir.realpathAlloc(std.testing.allocator, "llama-quant.gguf");
+        defer std.testing.allocator.free(path);
+
+        var model = try llama.loadModel(std.testing.allocator, path);
+        defer model.deinit(std.testing.allocator);
+
+        var store = DenseTensorStore.init(std.testing.allocator);
+        defer store.deinit();
+        try store.populate(&model, .all, null, .disabled, null);
+
+        try std.testing.expectEqual(true, DenseTensorStore.storesRawQuant(tensor_type));
+        try std.testing.expect(store.getRawByOffset(model.output.offset) != null);
+        try std.testing.expect(store.getByOffset(model.output.offset) == null);
+
+        const plan = store.prewarmPlan();
+        try std.testing.expect(plan.raw_count > 0);
+    }
 }

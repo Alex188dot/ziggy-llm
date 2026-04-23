@@ -12,6 +12,7 @@ pub const BackendPreference = mod.BackendPreference;
 pub const BackendUsed = mod.BackendUsed;
 pub const MoonQuantMode = mod.MoonQuantMode;
 pub const SamplingStrategy = mod.SamplingStrategy;
+pub const GpuLayers = mod.GpuLayers;
 pub const EffectiveSamplingPath = mod.EffectiveSamplingPath;
 pub const ReadbackMode = mod.ReadbackMode;
 pub const GenerationOptions = mod.GenerationOptions;

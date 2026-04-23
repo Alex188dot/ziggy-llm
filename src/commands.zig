@@ -39,6 +39,7 @@ fn runModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.Co
         .moon_quant = config.moon_quant,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
+        .gpu_layers = config.gpu_layers,
     });
 }
 
@@ -59,6 +60,7 @@ fn benchModel(writer: *std.Io.Writer, allocator: std.mem.Allocator, config: cli.
         .moon_quant = config.moon_quant,
         .metal_profile = config.metal_profile,
         .sampling_strategy = config.sampling_strategy,
+        .gpu_layers = config.gpu_layers,
     }, config.bench_runs);
 }
 

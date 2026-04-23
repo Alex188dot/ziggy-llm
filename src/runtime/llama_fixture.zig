@@ -4,10 +4,16 @@ const llama_cpu = @import("../model/loader.zig");
 const rope_metaspace = "\xE2\x96\x81";
 const q4_k_block_values = 256;
 const q4_k_block_bytes = 144;
+const q3_k_block_values = 256;
+const q3_k_block_bytes = 110;
 const q8_0_block_values = 32;
 const q8_0_block_bytes = 34;
 const q6_k_block_values = 256;
 const q6_k_block_bytes = 210;
+const iq3_xxs_block_values = 256;
+const iq3_xxs_block_bytes = 98;
+const iq4_xs_block_values = 256;
+const iq4_xs_block_bytes = 136;
 
 const vocab = [_][]const u8{
     "<unk>",               "<s>",                 "</s>",
@@ -61,14 +67,26 @@ pub fn makeLlamaModelFixtureWithOptions(allocator: std.mem.Allocator, options: F
     const embed = options.embedding_length;
     const ff = options.feed_forward_length;
     if (embed == 0 or ff == 0) return error.InvalidTensorMetadata;
+    if ((options.projection_type == .q3_k or options.output_type == .q3_k) and embed % q3_k_block_values != 0) {
+        return error.InvalidTensorMetadata;
+    }
     if ((options.projection_type == .q4_k or options.output_type == .q4_k) and embed % q4_k_block_values != 0) {
         return error.InvalidTensorMetadata;
     }
     if ((options.projection_type == .q6_k or options.output_type == .q6_k) and embed % q6_k_block_values != 0) {
         return error.InvalidTensorMetadata;
     }
+    if ((options.projection_type == .iq3_xxs or options.output_type == .iq3_xxs) and embed % iq3_xxs_block_values != 0) {
+        return error.InvalidTensorMetadata;
+    }
+    if ((options.projection_type == .iq4_xs or options.output_type == .iq4_xs) and embed % iq4_xs_block_values != 0) {
+        return error.InvalidTensorMetadata;
+    }
+    if (options.projection_type == .q3_k and ff % q3_k_block_values != 0) return error.InvalidTensorMetadata;
     if (options.projection_type == .q4_k and ff % q4_k_block_values != 0) return error.InvalidTensorMetadata;
     if (options.projection_type == .q6_k and ff % q6_k_block_values != 0) return error.InvalidTensorMetadata;
+    if (options.projection_type == .iq3_xxs and ff % iq3_xxs_block_values != 0) return error.InvalidTensorMetadata;
+    if (options.projection_type == .iq4_xs and ff % iq4_xs_block_values != 0) return error.InvalidTensorMetadata;
 
     const tensor_names = [_][]const u8{
         "token_embd.weight",
@@ -240,10 +258,13 @@ fn writeTensorData(list: *std.ArrayList(u8), tensor_type: llama_cpu.TensorType, 
         .f32 => writeTensorDataF32(list, values),
         .f16 => try writeTensorDataF16(list, values),
         .q8_0 => try writeTensorDataQ8_0(list, values, row_len),
+        .q3_k => try writeTensorDataQ3K(list, values, row_len),
         .q4_k => try writeTensorDataQ4K(list, values, row_len),
         .q6_k => try writeTensorDataQ6K(list, values, row_len),
+        .iq3_xxs => try writeTensorDataIQ3XXS(list, values, row_len),
+        .iq4_xs => try writeTensorDataIQ4XS(list, values, row_len),
         .q5_k => return error.UnsupportedTensorType,
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     }
@@ -273,6 +294,17 @@ fn writeTensorDataQ4K(list: *std.ArrayList(u8), values: []const f32, row_len: us
     }
 }
 
+fn writeTensorDataQ3K(list: *std.ArrayList(u8), values: []const f32, row_len: usize) !void {
+    if (row_len == 0 or row_len % q3_k_block_values != 0 or values.len % row_len != 0) return error.InvalidTensorMetadata;
+    const row_count = values.len / row_len;
+    for (0..row_count) |_| {
+        var block_index: usize = 0;
+        while (block_index < row_len) : (block_index += q3_k_block_values) {
+            appendZeroBlock(list, q3_k_block_bytes) catch unreachable;
+        }
+    }
+}
+
 fn writeTensorDataQ6K(list: *std.ArrayList(u8), values: []const f32, row_len: usize) !void {
     if (row_len == 0 or row_len % q6_k_block_values != 0 or values.len % row_len != 0) return error.InvalidTensorMetadata;
     const row_count = values.len / row_len;
@@ -281,6 +313,28 @@ fn writeTensorDataQ6K(list: *std.ArrayList(u8), values: []const f32, row_len: us
         var block_index: usize = 0;
         while (block_index < row_len) : (block_index += q6_k_block_values) {
             appendQ6KBlock(list, row[block_index .. block_index + q6_k_block_values]) catch unreachable;
+        }
+    }
+}
+
+fn writeTensorDataIQ3XXS(list: *std.ArrayList(u8), values: []const f32, row_len: usize) !void {
+    if (row_len == 0 or row_len % iq3_xxs_block_values != 0 or values.len % row_len != 0) return error.InvalidTensorMetadata;
+    const row_count = values.len / row_len;
+    for (0..row_count) |_| {
+        var block_index: usize = 0;
+        while (block_index < row_len) : (block_index += iq3_xxs_block_values) {
+            appendZeroBlock(list, iq3_xxs_block_bytes) catch unreachable;
+        }
+    }
+}
+
+fn writeTensorDataIQ4XS(list: *std.ArrayList(u8), values: []const f32, row_len: usize) !void {
+    if (row_len == 0 or row_len % iq4_xs_block_values != 0 or values.len % row_len != 0) return error.InvalidTensorMetadata;
+    const row_count = values.len / row_len;
+    for (0..row_count) |_| {
+        var block_index: usize = 0;
+        while (block_index < row_len) : (block_index += iq4_xs_block_values) {
+            appendZeroBlock(list, iq4_xs_block_bytes) catch unreachable;
         }
     }
 }
@@ -342,6 +396,11 @@ fn appendQ6KBlock(list: *std.ArrayList(u8), values: []const f32) !void {
         setQ6KNibble(&block, index, low_nibble);
     }
 
+    list.appendSliceAssumeCapacity(&block);
+}
+
+fn appendZeroBlock(list: *std.ArrayList(u8), comptime byte_len: usize) !void {
+    const block = [_]u8{0} ** byte_len;
     list.appendSliceAssumeCapacity(&block);
 }
 

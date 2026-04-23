@@ -350,6 +350,14 @@ enum llm_arch {
 
 **Key insight**: Qwen3.5 (dense) maps to `LLM_ARCH_QWEN35` with architecture name `"qwen35"`. Qwen3.5 MoE maps to `LLM_ARCH_QWEN35MOE` with name `"qwen35moe"`.
 
+### Current Status
+
+- `qwen35moe` is routed into the Qwen 3.5 family path in ziggy-llm
+- Qwen 3.5 MoE loads and runs on CPU
+- initial mixed-quant support covers `Q3_K`, `IQ3_XXS`, and `IQ4_XS`
+- Metal tensor preparation preserves those quantized tensors in raw form
+- end-to-end Qwen 3.5 MoE generation remains CPU-only for now
+
 ---
 
 ### 2. VOCABULARY PRETYPE
@@ -748,4 +756,3 @@ For Qwen3.5 2B model (rough estimates):
 - llama.cpp repo: https://github.com/ggml-org/llama.cpp
 - Qwen3.5 HF page: https://huggingface.co/Qwen/Qwen3.5-2B
 - Related architectures for cross-reference: Granite Hybrid, Kimi Linear, Mamba2
-

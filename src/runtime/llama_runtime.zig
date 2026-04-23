@@ -29,7 +29,7 @@ pub fn generate(
     const model_load_begin = std.time.nanoTimestamp();
     var model = try llama_cpu.loadModel(allocator, model_path);
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
-    var execution = try selectExecution(allocator, &model, options.backend, options.moon_quant, options.metal_profile);
+    var execution = try selectExecution(allocator, &model, options, options.metal_profile);
     defer execution.deinit(allocator);
 
     const lookup = if (execution.dense_tensors) |*dense_tensors|
@@ -87,14 +87,13 @@ pub fn generate(
 fn selectExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
-    preference: types.BackendPreference,
-    moon_quant_mode: types.MoonQuantMode,
+    options: types.GenerationOptions,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
-    return switch (preference) {
+    return switch (options.backend) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, moon_quant_mode, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, moon_quant_mode, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, options, startup_profile_enabled),
+        .auto => createMetalExecution(allocator, model, options, startup_profile_enabled) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -104,14 +103,18 @@ fn selectExecution(
 fn createMetalExecution(
     allocator: std.mem.Allocator,
     model: *const llama_cpu.Model,
-    moon_quant_mode: types.MoonQuantMode,
+    options: types.GenerationOptions,
     startup_profile_enabled: bool,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
     var startup_profiler = llama_metal.StartupProfiler{ .enabled = startup_profile_enabled };
+    const device_info = if (options.backend == .metal or options.backend == .auto)
+        metal_backend.getDeviceInfo() catch null
+    else
+        null;
     const tensor_prepare_begin = std.time.nanoTimestamp();
-    try dense_tensors.populate(model, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
+    try dense_tensors.populate(model, options.gpu_layers, device_info, options.moon_quant, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
     const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);

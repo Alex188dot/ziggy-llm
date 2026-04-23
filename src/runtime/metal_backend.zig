@@ -31,6 +31,12 @@ pub const CommitStats = struct {
     gpu_timestamps_valid: bool = false,
 };
 
+pub const DeviceInfo = struct {
+    recommended_max_working_set_size: u64 = 0,
+    has_unified_memory: bool = false,
+    low_power: bool = false,
+};
+
 const State = if (build_enabled_value) struct {
     allocator: std.mem.Allocator,
     context: *c.ZiggyMetalContext,
@@ -176,6 +182,30 @@ pub fn canInitialize(allocator: std.mem.Allocator) !bool {
     };
     metal.deinit(allocator);
     return true;
+}
+
+pub fn getDeviceInfo() !DeviceInfo {
+    if (!build_enabled_value) return error.MetalDisabled;
+
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    var raw_context: ?*c.ZiggyMetalContext = null;
+    var raw_info: c.ZiggyMetalDeviceInfo = std.mem.zeroes(c.ZiggyMetalDeviceInfo);
+    const status = c.ziggy_metal_create_context(
+        shader_source.ptr,
+        shader_source.len,
+        &raw_context,
+        &raw_info,
+        &error_buf,
+        error_buf.len,
+    );
+    try mapStatus(status, &error_buf);
+    defer c.ziggy_metal_destroy_context(raw_context.?);
+
+    return .{
+        .recommended_max_working_set_size = raw_info.recommended_max_working_set_size,
+        .has_unified_memory = raw_info.has_unified_memory,
+        .low_power = raw_info.low_power,
+    };
 }
 
 pub fn create(allocator: std.mem.Allocator) !backend_api.MatVecBackend {
@@ -1136,6 +1166,76 @@ pub fn sampleTopK(
     ), &error_buf);
 }
 
+pub fn normalizeTopKShortlist(
+    backend: backend_api.MatVecBackend,
+    entries: BufferHandle,
+    top_k: usize,
+    apply_softmax: bool,
+    normalize_weights: bool,
+    scale: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (top_k == 0 or top_k > 64) return error.InvalidTensorMetadata;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_normalize_topk_f32(
+        state.context,
+        entries.raw,
+        @intCast(top_k),
+        apply_softmax,
+        normalize_weights,
+        scale,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn weightedSumTopK(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    src: BufferHandle,
+    entries: BufferHandle,
+    count: usize,
+    slot_idx: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (dst.byte_len < count * @sizeOf(f32) or src.byte_len < count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_weighted_sum_topk_f32(
+        state.context,
+        dst.raw,
+        src.raw,
+        entries.raw,
+        @intCast(count),
+        @intCast(slot_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn sigmoidScaleAdd(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    src: BufferHandle,
+    scalar: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (dst.byte_len < count * @sizeOf(f32) or src.byte_len < count * @sizeOf(f32) or scalar.byte_len < @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_sigmoid_scale_add_f32(
+        state.context,
+        dst.raw,
+        src.raw,
+        scalar.raw,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;
@@ -1313,6 +1413,135 @@ pub fn batchMatvecQ4K(
         @intCast(rows),
         @intCast(cols),
         @intCast(batch_idx),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn indexedMatvecIQ3XXS(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    entries: BufferHandle,
+    slot_idx: usize,
+    rows_per_expert: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_indexed_matvec_iq3_xxs_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        entries.raw,
+        @intCast(slot_idx),
+        @intCast(rows_per_expert),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn dualIndexedMatvecIQ3XXS(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+    entries: BufferHandle,
+    slot_idx: usize,
+    rows_per_expert: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output_a.byte_len < rows * @sizeOf(f32) or output_b.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_a_buffer = try state.rawBuffer(matrix_a_bytes);
+    const matrix_b_buffer = try state.rawBuffer(matrix_b_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_dual_indexed_matvec_iq3_xxs_f32(
+        state.context,
+        matrix_a_buffer.raw,
+        matrix_b_buffer.raw,
+        input.raw,
+        output_a.raw,
+        output_b.raw,
+        @intCast(rows),
+        @intCast(cols),
+        entries.raw,
+        @intCast(slot_idx),
+        @intCast(rows_per_expert),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn indexedMatvecIQ4XS(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    entries: BufferHandle,
+    slot_idx: usize,
+    rows_per_expert: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_indexed_matvec_iq4_xs_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        entries.raw,
+        @intCast(slot_idx),
+        @intCast(rows_per_expert),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn indexedMatvecIQ4XSAddWeighted(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    rows: usize,
+    cols: usize,
+    entries: BufferHandle,
+    slot_idx: usize,
+    rows_per_expert: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_indexed_matvec_iq4_xs_add_weighted_f32(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        @intCast(rows),
+        @intCast(cols),
+        entries.raw,
+        @intCast(slot_idx),
+        @intCast(rows_per_expert),
         &error_buf,
         error_buf.len,
     ), &error_buf);

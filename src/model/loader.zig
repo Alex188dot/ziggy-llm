@@ -4,8 +4,10 @@ const backend_api = @import("../runtime/backend.zig");
 const gpu = @import("../runtime/gpu/session.zig");
 const metal_profile = @import("../runtime/metal_profile.zig");
 const moon_quant_calibration = @import("../moon_quant_calibration.zig");
+const qwen35_linear_common = @import("../runtime/qwen35_linear_common.zig");
 const runtime_types = @import("../runtime/types.zig");
 const sampling = @import("../sampling.zig");
+const quant_extra = @import("quant_extra.zig");
 
 pub const GenerateError = error{
     InvalidMagic,
@@ -85,7 +87,6 @@ const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
 const max_matvec_helper_threads: usize = 3;
-
 pub const LayerType = enum {
     full_attention,
     linear_attention,
@@ -237,6 +238,7 @@ pub const LayerRefs = struct {
     post_attention_norm: ?TensorRef = null,
     post_ffw_norm: ?TensorRef = null,
     linear_attn: ?LinearAttnTensors = null,
+    moe: ?MoeFfnTensors = null,
 };
 
 pub const LinearAttnTensors = struct {
@@ -251,6 +253,14 @@ pub const LinearAttnTensors = struct {
     out_proj: TensorRef,
 };
 
+pub const MoeFfnTensors = struct {
+    router: TensorRef,
+    gate_exps: TensorRef,
+    down_exps: TensorRef,
+    up_exps: TensorRef,
+    shared_router_gate: ?TensorRef = null,
+};
+
 const Metadata = struct {
     architecture: ?[]u8 = null,
     alignment: u32 = default_alignment,
@@ -259,6 +269,13 @@ const Metadata = struct {
     embedding_length: ?u32 = null,
     block_count: ?u32 = null,
     feed_forward_length: ?u32 = null,
+    expert_count: ?u32 = null,
+    expert_used_count: ?u32 = null,
+    expert_feed_forward_length: ?u32 = null,
+    expert_shared_feed_forward_length: ?u32 = null,
+    expert_weights_scale: ?f32 = null,
+    expert_weights_norm: ?bool = null,
+    expert_gating_func: ?u32 = null,
     rope_dimension_count: ?u32 = null,
     rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: ?u32 = null,
@@ -278,6 +295,7 @@ const Metadata = struct {
     linear_key_head_dim: ?u32 = null,
     linear_value_head_dim: ?u32 = null,
     linear_conv_kernel_dim: ?u32 = null,
+    full_attention_interval: ?u32 = null,
     layer_types: std.ArrayList([]u8) = .empty,
     tokenizer_model: ?[]u8 = null,
     tokenizer_pre: ?[]u8 = null,
@@ -715,6 +733,13 @@ pub const Model = struct {
     embedding_length: usize,
     block_count: usize,
     feed_forward_length: usize,
+    expert_count: usize = 0,
+    expert_used_count: usize = 0,
+    expert_feed_forward_length: usize = 0,
+    expert_shared_feed_forward_length: usize = 0,
+    expert_weights_scale: f32 = 1.0,
+    expert_weights_norm: bool = true,
+    expert_gating_func: u32 = 1,
     rope_dimension_count: usize,
     rope_dimension_sections: [4]u32 = .{ 0, 0, 0, 0 },
     head_count: usize,
@@ -742,6 +767,7 @@ pub const Model = struct {
     output_norm: TensorRef,
     layers: []LayerRefs,
     is_qwen35_text: bool = false,
+    is_qwen35_moe: bool = false,
     partial_rotary_factor: f32 = 1.0,
     linear_num_key_heads: u32 = 16,
     linear_num_value_heads: u32 = 16,
@@ -767,6 +793,13 @@ pub const Model = struct {
             allocator.free(layer.ffn_gate.name);
             allocator.free(layer.ffn_down.name);
             allocator.free(layer.ffn_up.name);
+            if (layer.moe) |moe| {
+                allocator.free(moe.router.name);
+                allocator.free(moe.gate_exps.name);
+                allocator.free(moe.down_exps.name);
+                allocator.free(moe.up_exps.name);
+                if (moe.shared_router_gate) |gate| allocator.free(gate.name);
+            }
             if (layer.post_attention_norm) |n| allocator.free(n.name);
             if (layer.post_ffw_norm) |n| allocator.free(n.name);
             if (layer.linear_attn) |la| {
@@ -826,6 +859,12 @@ pub const ReusableSession = struct {
     pub fn reset(self: *ReusableSession) void {
         self.session.position = 0;
         self.session.pending_greedy_token = null;
+        self.session.pending_shortlist_len = 0;
+        self.session.gpu_hidden_is_current = false;
+        @memset(self.session.k_cache, 0);
+        @memset(self.session.v_cache, 0);
+        @memset(self.session.linear_conv_state, 0);
+        @memset(self.session.linear_recurrent_state, 0);
     }
 };
 
@@ -845,6 +884,9 @@ const Session = struct {
     attn_tmp: []f32,
     gate: []f32,
     up: []f32,
+    router_logits: []f32,
+    moe_selected_experts: []u32,
+    moe_selected_weights: []f32,
     logits: []f32,
     pending_greedy_token: ?u32 = null,
     pending_shortlist: [gpu.max_shortlist_len]gpu.ShortlistEntry = undefined,
@@ -862,6 +904,7 @@ const Session = struct {
     linear_conv_tmp: []f32,
     moon_quant_calibrator: ?*moon_quant_calibration.Calibrator = null,
     matvec_workers: ?*MatVecWorkers = null,
+    gpu_hidden_is_current: bool = false,
     position: usize = 0,
 
     fn init(
@@ -881,6 +924,8 @@ const Session = struct {
         const linear_z_dim = linear_num_v_heads * linear_value_dim_per_head;
         const conv_state_per_layer = linear_qkv_dim * (model.linear_conv_kernel_dim - 1);
         const recurrent_state_per_layer = linear_num_v_heads * model.linear_key_head_dim * model.linear_value_head_dim;
+        const gate_capacity = @max(model.feed_forward_length, model.q_projection_size);
+        const up_capacity = @max(model.feed_forward_length, model.q_projection_size * 2);
 
         var session = Session{
             .model = model,
@@ -895,8 +940,11 @@ const Session = struct {
             .v = try allocator.alloc(f32, model.kv_projection_size),
             .attn_out = try allocator.alloc(f32, model.q_projection_size),
             .attn_tmp = try allocator.alloc(f32, model.embedding_length),
-            .gate = try allocator.alloc(f32, model.feed_forward_length),
-            .up = try allocator.alloc(f32, model.feed_forward_length),
+            .gate = try allocator.alloc(f32, gate_capacity),
+            .up = try allocator.alloc(f32, up_capacity),
+            .router_logits = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_count)),
+            .moe_selected_experts = try allocator.alloc(u32, @max(@as(usize, 1), model.expert_used_count)),
+            .moe_selected_weights = try allocator.alloc(f32, @max(@as(usize, 1), model.expert_used_count)),
             .logits = try allocator.alloc(f32, model.tokenizer.tokens.len),
             .scores = try allocator.alloc(f32, context_length),
             .k_cache = try allocator.alloc(f32, model.block_count * context_length * model.kv_dimension),
@@ -923,12 +971,10 @@ const Session = struct {
         @memset(session.linear_conv_state, 0);
         @memset(session.linear_recurrent_state, 0);
 
-        if (backend == null) {
-            const cpu_count = std.Thread.getCpuCount() catch 1;
-            const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
-            if (helper_count > 0) {
-                session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
-            }
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const helper_count = @min(max_matvec_helper_threads, cpu_count -| 1);
+        if (helper_count > 0) {
+            session.matvec_workers = try MatVecWorkers.init(allocator, helper_count);
         }
         return session;
     }
@@ -949,6 +995,9 @@ const Session = struct {
         allocator.free(self.attn_tmp);
         allocator.free(self.gate);
         allocator.free(self.up);
+        allocator.free(self.router_logits);
+        allocator.free(self.moe_selected_experts);
+        allocator.free(self.moe_selected_weights);
         allocator.free(self.logits);
         allocator.free(self.scores);
         allocator.free(self.k_cache);
@@ -993,6 +1042,7 @@ const Session = struct {
             return self.pending_shortlist[0..0];
         }
         try self.runTokenCore(token_id);
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const shortlist = try gpu_session.runOutputShortlist(
             adaptTensorDesc(self.model.output_norm),
@@ -1012,6 +1062,7 @@ const Session = struct {
             return argmax(self.logits);
         }
         try self.runTokenCore(token_id);
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputSampleTopK(
             adaptTensorDesc(self.model.output_norm),
@@ -1032,6 +1083,14 @@ const Session = struct {
             return argmax(self.logits);
         }
         try self.runTokenCore(token_id);
+        if (!self.gpu_hidden_is_current) {
+            try self.computeOutputCpu();
+            const next_token = argmax(self.logits);
+            self.pending_greedy_token = next_token;
+            self.finishToken(token_id);
+            return next_token;
+        }
+        try self.syncGpuHiddenForOutput();
         const gpu_session = &self.gpu_session.?;
         const next_token = try gpu_session.runOutputArgmax(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output));
         self.pending_greedy_token = next_token;
@@ -1135,11 +1194,13 @@ const Session = struct {
         self.pending_greedy_token = null;
         self.pending_shortlist_len = 0;
         if (self.gpu_session) |*gpu_session| {
-            try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+            if (self.gpu_hidden_is_current) {
+                try gpu_session.runOutput(adaptTensorDesc(self.model.output_norm), adaptTensorDesc(self.model.output), self.logits);
+            } else {
+                try self.computeOutputCpu();
+            }
         } else {
-            try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
-            try self.recordCalibration(self.model.output, .output, self.normed);
-            try self.matVec(self.logits, self.model.output, self.normed);
+            try self.computeOutputCpu();
         }
         if (self.model.final_logit_softcapping) |cap| applySoftcapInPlace(self.logits, cap);
 
@@ -1151,17 +1212,25 @@ const Session = struct {
         if (self.position >= self.context_length) return error.ContextOverflow;
         try embeddingLookup(self.hidden, self.model, self.model.token_embd, token_id);
         scaleInPlace(self.hidden, self.model.embedding_scale);
+        self.gpu_hidden_is_current = false;
 
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
+            const gpu_layer_desc = adaptLayerDesc(layer);
+            const use_gpu_layer = if (self.gpu_session) |*gpu_session| blk: {
+                if (!gpu_session.canRunAttentionBlock(gpu_layer_desc)) break :blk false;
+                if (layer.moe != null and !gpu_session.canRunMoeFfnBlock(gpu_layer_desc)) break :blk false;
+                break :blk true;
+            } else false;
 
-            if (self.gpu_session) |*gpu_session| {
-                if (layer_index == 0) try gpu_session.beginToken(self.hidden);
-                try gpu_session.runAttentionBlock(adaptLayerDesc(layer), layer_index, self.position);
+            if (use_gpu_layer) {
+                const gpu_session = &self.gpu_session.?;
+                if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
+                try gpu_session.runAttentionBlock(gpu_layer_desc, layer_index, self.position);
+                self.gpu_hidden_is_current = true;
             } else if (is_linear_attn) {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 try self.computeLinearAttention(layer_index, layer.linear_attn.?);
-                addInPlace(self.hidden, self.attn_tmp);
             } else {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 var q_gate: ?[]f32 = null;
@@ -1201,8 +1270,8 @@ const Session = struct {
                 if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
 
                 const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
-                applyRoPE(self.q, self.model.head_count, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
-                applyRoPE(self.k, self.model.head_count_kv, rotary_dim, self.model.key_head_dimension, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+                applyRoPE(self.q, self.model.head_count, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+                applyRoPE(self.k, self.model.head_count_kv, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
                 self.storeKv(layer_index);
                 self.computeAttention(layer_index);
                 if (q_gate) |gate_values| {
@@ -1217,30 +1286,54 @@ const Session = struct {
                 if (layer.post_attention_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
             }
 
-            if (self.gpu_session) |*gpu_session| {
-                try gpu_session.runFfnBlock(adaptLayerDesc(layer));
+            if (use_gpu_layer) {
+                const gpu_session = &self.gpu_session.?;
+                if (layer.moe) |moe| {
+                    _ = moe;
+                    try gpu_session.runMoeFfnBlock(gpu_layer_desc);
+                } else {
+                    try gpu_session.runFfnBlock(gpu_layer_desc);
+                }
+                self.gpu_hidden_is_current = true;
             } else {
                 addInPlace(self.hidden, self.attn_tmp);
 
                 try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
-                try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
-                try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
-                try self.matVec(self.gate, layer.ffn_gate, self.normed);
-                try self.matVec(self.up, layer.ffn_up, self.normed);
-                if (self.model.use_gelu_ffn) {
-                    geluInPlace(self.gate);
+                if (layer.moe) |moe| {
+                    try self.computeMoeFfn(layer, moe);
                 } else {
-                    siluInPlace(self.gate);
+                    try self.recordCalibration(layer.ffn_gate, .ffn_gate, self.normed);
+                    try self.recordCalibration(layer.ffn_up, .ffn_up, self.normed);
+                    try self.matVec(self.gate, layer.ffn_gate, self.normed);
+                    try self.matVec(self.up, layer.ffn_up, self.normed);
+                    if (self.model.use_gelu_ffn) {
+                        geluInPlace(self.gate);
+                    } else {
+                        siluInPlace(self.gate);
+                    }
+                    for (self.gate, self.up) |*gate, up| {
+                        gate.* *= up;
+                    }
+                    try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
+                    try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
+                    if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
                 }
-                for (self.gate, self.up) |*gate, up| {
-                    gate.* *= up;
-                }
-                try self.recordCalibration(layer.ffn_down, .ffn_down, self.gate);
-                try self.matVec(self.attn_tmp, layer.ffn_down, self.gate);
-                if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
                 addInPlace(self.hidden, self.attn_tmp);
+                self.gpu_hidden_is_current = false;
             }
         }
+    }
+
+    fn syncGpuHiddenForOutput(self: *Session) !void {
+        if (self.gpu_session == null or self.gpu_hidden_is_current) return;
+        try self.gpu_session.?.writeHidden(self.hidden);
+        self.gpu_hidden_is_current = true;
+    }
+
+    fn computeOutputCpu(self: *Session) !void {
+        try rmsNorm(self.normed, self.hidden, self.model, self.model.output_norm);
+        try self.recordCalibration(self.model.output, .output, self.normed);
+        try self.matVec(self.logits, self.model.output, self.normed);
     }
 
     fn finishToken(self: *Session, token_id: u32) void {
@@ -1347,9 +1440,8 @@ const Session = struct {
         try self.matVec(self.linear_a[0..num_value_heads], linear_attn.in_proj_a, self.normed);
         try self.matVec(self.linear_b[0..num_value_heads], linear_attn.in_proj_b, self.normed);
 
-        if (key_head_dim != value_head_dim) return error.InvalidTensorMetadata;
         const dt_bias_bytes = try tensorBytes(model, linear_attn.dt_bias);
-        const a_log_bytes = try tensorBytes(model, linear_attn.A_log);
+        const ssm_a_bytes = try tensorBytes(model, linear_attn.A_log);
 
         for (0..num_value_heads) |h| {
             const dt_bias_val = switch (linear_attn.dt_bias.tensor_type) {
@@ -1357,15 +1449,15 @@ const Session = struct {
                 .f16 => readF16AsF32(dt_bias_bytes[h * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
-            const a_log_val = switch (linear_attn.A_log.tensor_type) {
-                .f32 => readF32(a_log_bytes[h * 4 ..][0..4]),
-                .f16 => readF16AsF32(a_log_bytes[h * 2 ..][0..2]),
+            const ssm_a_val = switch (linear_attn.A_log.tensor_type) {
+                .f32 => readF32(ssm_a_bytes[h * 4 ..][0..4]),
+                .f16 => readF16AsF32(ssm_a_bytes[h * 2 ..][0..2]),
                 else => return error.UnsupportedTensorType,
             };
             const alpha_pre = self.linear_a[h] + dt_bias_val;
             const beta_pre = self.linear_b[h];
             const softplus_val = softplusScalar(alpha_pre);
-            self.linear_g[h] = a_log_val * softplus_val;
+            self.linear_g[h] = ssm_a_val * softplus_val;
             self.linear_b[h] = sigmoidScalar(beta_pre);
         }
 
@@ -1399,7 +1491,6 @@ const Session = struct {
             acc += self.linear_qkv[channel] * current_weight;
             conv_out[channel] = siluScalar(acc);
         }
-
         if (kernel_dim > 1) {
             var state_idx: usize = 0;
             while (state_idx + qkv_dim < conv_state_per_layer) : (state_idx += qkv_dim) {
@@ -1420,12 +1511,13 @@ const Session = struct {
         const delta_out = self.linear_qkv[0..v_dim];
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
         for (0..num_value_heads) |head| {
-            const recurrent_offset = recurrent_state_base + head * value_head_dim * value_head_dim;
-            const q_head = q_conv[head * key_head_dim ..][0..key_head_dim];
-            const k_head = k_conv[head * key_head_dim ..][0..key_head_dim];
+            const qk_head = try qwen35_linear_common.qkHeadIndex(head, num_key_heads, num_value_heads);
+            const recurrent_offset = recurrent_state_base + head * key_head_dim * value_head_dim;
+            const q_head = q_conv[qk_head * key_head_dim ..][0..key_head_dim];
+            const k_head = k_conv[qk_head * key_head_dim ..][0..key_head_dim];
             const v_head = v_conv[head * value_head_dim ..][0..value_head_dim];
             const out_head = delta_out[head * value_head_dim ..][0..value_head_dim];
-            const state = self.linear_recurrent_state[recurrent_offset..][0 .. value_head_dim * value_head_dim];
+            const state = self.linear_recurrent_state[recurrent_offset..][0 .. key_head_dim * value_head_dim];
             const decay = @exp(self.linear_g[head]);
             const beta = self.linear_b[head];
 
@@ -1433,24 +1525,23 @@ const Session = struct {
 
             for (0..value_head_dim) |col| {
                 var sk: f32 = 0;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     sk += state[row * value_head_dim + col] * k_head[row];
                 }
                 const delta = (v_head[col] - sk) * beta;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     state[row * value_head_dim + col] += k_head[row] * delta;
                 }
             }
 
             for (0..value_head_dim) |col| {
                 var acc: f32 = 0;
-                for (0..value_head_dim) |row| {
+                for (0..key_head_dim) |row| {
                     acc += state[row * value_head_dim + col] * (q_head[row] * scale);
                 }
                 out_head[col] = acc;
             }
         }
-
         try self.rmsNormPerHeadWithOffset(self.linear_conv_tmp[0..v_dim], delta_out, linear_attn.norm_weight, num_value_heads, value_head_dim, 0.0);
         for (0..v_dim) |idx| {
             self.linear_z[idx] = self.linear_conv_tmp[idx] * siluScalar(self.linear_z[idx]);
@@ -1465,10 +1556,12 @@ const Session = struct {
         if (row_len != input.len or row_count != out.len) return error.InvalidTensorMetadata;
 
         if (self.backend) |backend| {
-            const dense_tensors = self.dense_tensors orelse return error.InvalidTensorMetadata;
-            const matrix = dense_tensors.get(tensor) orelse return error.InvalidTensorMetadata;
-            try backend.matVec(out, matrix, input, row_count, row_len);
-            return;
+            if (self.dense_tensors) |dense_tensors| {
+                if (dense_tensors.get(tensor)) |matrix| {
+                    try backend.matVec(out, matrix, input, row_count, row_len);
+                    return;
+                }
+            }
         }
 
         const bytes = try tensorBytes(self.model, tensor);
@@ -1495,6 +1588,129 @@ const Session = struct {
             const row = bytes[row_index * row_size ..][0..row_size];
             out[row_index] = dotRowAssumeValid(tensor.tensor_type, row, row_len, input);
         }
+    }
+
+    fn matVecRows(self: *Session, out: []f32, tensor: TensorRef, input: []const f32, row_offset: usize) !void {
+        const row_len = try tensor.rowLen();
+        const total_rows = try tensor.rowCount();
+        if (row_len != input.len) return error.InvalidTensorMetadata;
+        if (row_offset + out.len > total_rows) return error.InvalidTensorMetadata;
+
+        const bytes = try tensorBytes(self.model, tensor);
+        const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        const work = out.len * row_len;
+
+        if (self.matvec_workers) |workers| {
+            if (out.len >= parallel_matvec_min_rows and work >= parallel_matvec_min_work) {
+                workers.run(.{
+                    .out = out,
+                    .bytes = bytes,
+                    .row_size = row_size,
+                    .row_len = row_len,
+                    .tensor_type = tensor.tensor_type,
+                    .input = input,
+                    .row_count = out.len,
+                    .row_offset = row_offset,
+                });
+                return;
+            }
+        }
+
+        for (0..out.len) |index| {
+            const row_index = row_offset + index;
+            const row = bytes[row_index * row_size ..][0..row_size];
+            out[index] = try dotRow(tensor.tensor_type, row, row_len, input);
+        }
+    }
+
+    fn dotSingleRowTensor(self: *Session, tensor: TensorRef, input: []const f32) !f32 {
+        const row_len = try tensor.rowLen();
+        const row_count = try tensor.rowCount();
+        if (row_count != 1 or row_len != input.len) return error.InvalidTensorMetadata;
+
+        const bytes = try tensorBytes(self.model, tensor);
+        const row_size = try tensorRowByteSize(tensor.tensor_type, row_len);
+        return dotRow(tensor.tensor_type, bytes[0..row_size], row_len, input);
+    }
+
+    fn computeSharedFfn(self: *Session, layer: LayerRefs, scale: f32) !void {
+        const hidden_len = try layer.ffn_gate.rowCount();
+        if (hidden_len != try layer.ffn_up.rowCount()) return error.InvalidTensorMetadata;
+        if (hidden_len > self.gate.len or hidden_len > self.up.len) return error.InvalidTensorMetadata;
+
+        const gate_buf = self.gate[0..hidden_len];
+        const up_buf = self.up[0..hidden_len];
+        try self.matVec(gate_buf, layer.ffn_gate, self.normed);
+        try self.matVec(up_buf, layer.ffn_up, self.normed);
+        if (self.model.use_gelu_ffn) {
+            geluInPlace(gate_buf);
+        } else {
+            siluInPlace(gate_buf);
+        }
+        for (gate_buf, up_buf) |*gate, up| gate.* *= up;
+
+        try self.matVec(self.up[0..self.model.embedding_length], layer.ffn_down, gate_buf);
+        addScaledInPlace(self.attn_tmp, self.up[0..self.model.embedding_length], scale);
+    }
+
+    fn computeExpertFfn(self: *Session, moe: MoeFfnTensors, expert_index: usize, scale: f32) !void {
+        const expert_ff_len = self.model.expert_feed_forward_length;
+        if (expert_ff_len == 0) return error.InvalidMetadataValue;
+        if (expert_ff_len > self.gate.len or expert_ff_len > self.up.len) return error.InvalidTensorMetadata;
+
+        const gate_offset = expert_index * expert_ff_len;
+        const down_offset = expert_index * self.model.embedding_length;
+        const gate_buf = self.gate[0..expert_ff_len];
+        const up_buf = self.up[0..expert_ff_len];
+
+        try self.matVecRows(gate_buf, moe.gate_exps, self.normed, gate_offset);
+        try self.matVecRows(up_buf, moe.up_exps, self.normed, gate_offset);
+        siluInPlace(gate_buf);
+        for (gate_buf, up_buf) |*gate, up| gate.* *= up;
+
+        try self.matVecRows(self.up[0..self.model.embedding_length], moe.down_exps, gate_buf, down_offset);
+        addScaledInPlace(self.attn_tmp, self.up[0..self.model.embedding_length], scale);
+    }
+
+    fn computeMoeFfn(self: *Session, layer: LayerRefs, moe: MoeFfnTensors) !void {
+        if (self.model.expert_count == 0 or self.model.expert_used_count == 0) return error.InvalidMetadataValue;
+
+        const router_logits = self.router_logits[0..self.model.expert_count];
+        try self.matVec(router_logits, moe.router, self.normed);
+        switch (self.model.expert_gating_func) {
+            0 => {},
+            1, 2 => softmaxInPlace(router_logits),
+            else => return error.InvalidMetadataValue,
+        }
+
+        const selected_experts = self.moe_selected_experts[0..self.model.expert_used_count];
+        const selected_weights = self.moe_selected_weights[0..self.model.expert_used_count];
+        selectTopK(router_logits, selected_experts, selected_weights);
+        if (self.model.expert_weights_norm) normalizePositiveWeights(selected_weights);
+        if (self.model.expert_weights_scale != 1.0) {
+            scaleInPlace(selected_weights, self.model.expert_weights_scale);
+        }
+
+        @memset(self.attn_tmp, 0);
+        for (selected_experts, selected_weights) |expert_index, weight| {
+            try self.computeExpertFfn(moe, expert_index, weight);
+        }
+
+        const shared_scale = if (moe.shared_router_gate) |gate_tensor|
+            sigmoidScalar(try self.dotSingleRowTensor(gate_tensor, self.normed))
+        else
+            1.0;
+        try self.computeSharedFfn(layer, shared_scale);
+
+        if (layer.post_ffw_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
+    }
+
+    fn runMoeFfnHybrid(self: *Session, gpu_session: *gpu.Session, layer: LayerRefs, moe: MoeFfnTensors) !void {
+        try gpu_session.readHidden(self.hidden);
+        try rmsNorm(self.normed, self.hidden, self.model, layer.ffn_norm);
+        try self.computeMoeFfn(layer, moe);
+        addInPlace(self.hidden, self.attn_tmp);
+        try gpu_session.writeHidden(self.hidden);
     }
 
     fn addBiasCpu(self: *Session, out: []f32, bias_tensor: TensorRef) !void {
@@ -1586,6 +1802,16 @@ fn adaptLinearAttnDesc(linear_attn: LinearAttnTensors) gpu.LinearAttnDesc {
     };
 }
 
+fn adaptMoeDesc(moe: MoeFfnTensors) gpu.MoeDesc {
+    return .{
+        .router = adaptTensorDesc(moe.router),
+        .gate_exps = adaptTensorDesc(moe.gate_exps),
+        .down_exps = adaptTensorDesc(moe.down_exps),
+        .up_exps = adaptTensorDesc(moe.up_exps),
+        .shared_router_gate = if (moe.shared_router_gate) |gate| adaptTensorDesc(gate) else null,
+    };
+}
+
 fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
     return .{
         .attn_norm = adaptTensorDesc(layer.attn_norm),
@@ -1605,6 +1831,7 @@ fn adaptLayerDesc(layer: LayerRefs) gpu.LayerDesc {
         .post_attention_norm = if (layer.post_attention_norm) |n| adaptTensorDesc(n) else null,
         .post_ffw_norm = if (layer.post_ffw_norm) |n| adaptTensorDesc(n) else null,
         .linear_attn = if (layer.linear_attn) |la| adaptLinearAttnDesc(la) else null,
+        .moe = if (layer.moe) |moe| adaptMoeDesc(moe) else null,
     };
 }
 
@@ -1632,6 +1859,13 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .final_logit_softcapping = model.final_logit_softcapping,
         .global_attention_interval = model.global_attention_interval,
         .use_gelu_ffn = model.use_gelu_ffn,
+        .expert_count = model.expert_count,
+        .expert_used_count = model.expert_used_count,
+        .expert_feed_forward_length = model.expert_feed_forward_length,
+        .expert_shared_feed_forward_length = model.expert_shared_feed_forward_length,
+        .expert_weights_scale = model.expert_weights_scale,
+        .expert_weights_norm = model.expert_weights_norm,
+        .expert_gating_func = model.expert_gating_func,
         .embedding_scale = model.embedding_scale,
         .rms_norm_weight_offset = model.rms_norm_weight_offset,
         .vocab_size = model.tokenizer.tokens.len,
@@ -1654,6 +1888,7 @@ const MatVecTask = struct {
     tensor_type: TensorType,
     input: []const f32,
     row_count: usize,
+    row_offset: usize = 0,
 };
 
 const RowRange = struct {
@@ -1739,7 +1974,8 @@ fn workerRowRange(worker_index: usize, participant_count: usize, row_count: usiz
 fn runMatVecTask(task: MatVecTask, worker_index: usize, participant_count: usize) void {
     const range = workerRowRange(worker_index, participant_count, task.row_count);
     for (range.start..range.end) |row_index| {
-        const row = task.bytes[row_index * task.row_size ..][0..task.row_size];
+        const tensor_row_index = task.row_offset + row_index;
+        const row = task.bytes[tensor_row_index * task.row_size ..][0..task.row_size];
         task.out[row_index] = dotRowAssumeValid(task.tensor_type, row, task.row_len, task.input);
     }
 }
@@ -2289,10 +2525,15 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const is_qwen = std.mem.startsWith(u8, architecture, "qwen");
     const is_llama = std.mem.eql(u8, architecture, "llama") or std.mem.startsWith(u8, architecture, "llama");
     const is_qwen35_text = std.mem.eql(u8, architecture, "qwen3_5_text") or std.mem.eql(u8, architecture, "qwen35");
+    const is_qwen35_moe = std.mem.eql(u8, architecture, "qwen35moe");
+    const is_qwen35_like = is_qwen35_text or is_qwen35_moe;
     const is_gemma = std.mem.eql(u8, architecture, "gemma") or std.mem.eql(u8, architecture, "gemma2") or std.mem.eql(u8, architecture, "gemma3");
-    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_text and !is_gemma) return error.UnsupportedArchitecture;
-    const rope_style: RopeStyle = if (is_qwen35_text)
-        .imrope
+    if (!is_llama and !is_qwen and !is_mistral and !is_qwen35_like and !is_gemma) return error.UnsupportedArchitecture;
+    // For text-only inference, Qwen3.5's imrope is mathematically equivalent to neox
+    // because all position components (t, h, w) are set to the same text position.
+    // Using neox allows the GPU RoPE kernel to handle it without CPU roundtrips.
+    const rope_style: RopeStyle = if (is_qwen35_like)
+        .neox
     else if (is_qwen or is_mistral or is_gemma)
         .neox
     else
@@ -2319,7 +2560,19 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const block_count = metadata.block_count orelse return error.MissingRequiredMetadata;
     const embedding_length = metadata.embedding_length orelse return error.MissingRequiredMetadata;
     const context_length = metadata.context_length orelse return error.MissingRequiredMetadata;
-    const feed_forward_length = metadata.feed_forward_length orelse return error.MissingRequiredMetadata;
+    const expert_count = metadata.expert_count orelse 0;
+    const expert_used_count = metadata.expert_used_count orelse 0;
+    const expert_feed_forward_length = metadata.expert_feed_forward_length orelse 0;
+    const expert_shared_feed_forward_length = metadata.expert_shared_feed_forward_length orelse 0;
+    const expert_weights_scale = metadata.expert_weights_scale orelse 1.0;
+    const expert_weights_norm = metadata.expert_weights_norm orelse is_qwen35_moe;
+    const expert_gating_func = metadata.expert_gating_func orelse (if (is_qwen35_moe) @as(u32, 1) else @as(u32, 0));
+    const feed_forward_length = metadata.feed_forward_length orelse blk: {
+        if (!is_qwen35_moe) return error.MissingRequiredMetadata;
+        const derived = @max(expert_feed_forward_length, expert_shared_feed_forward_length);
+        if (derived == 0) return error.MissingRequiredMetadata;
+        break :blk derived;
+    };
     const head_count = metadata.head_count orelse return error.MissingRequiredMetadata;
     const head_count_kv = metadata.head_count_kv orelse return error.MissingRequiredMetadata;
 
@@ -2352,7 +2605,9 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const linear_value_head_dim = metadata.linear_value_head_dim orelse 128;
     const linear_conv_kernel_dim = metadata.linear_conv_kernel_dim orelse 4;
     const sliding_window = metadata.sliding_window orelse 0;
-    const global_attention_interval: usize = if (std.mem.eql(u8, architecture, "gemma2"))
+    const global_attention_interval: usize = if (metadata.full_attention_interval) |interval|
+        interval
+    else if (std.mem.eql(u8, architecture, "gemma2"))
         2
     else if (std.mem.eql(u8, architecture, "gemma3"))
         6
@@ -2381,8 +2636,10 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
     const layers = try allocator.alloc(LayerRefs, block_count);
     errdefer allocator.free(layers);
     for (0..block_count) |index| {
-        const is_qwen35_linear = is_qwen35_dense and hasLayerTensor(&tensors, index, "attn_qkv.weight");
-        const ffn_norm = if (is_qwen35_dense and !hasLayerTensor(&tensors, index, "ffn_norm.weight"))
+        const is_qwen35_linear = is_qwen35_like and hasLayerTensor(&tensors, index, "attn_qkv.weight");
+        const has_moe = is_qwen35_moe and hasLayerTensor(&tensors, index, "ffn_gate_inp.weight");
+        const uses_post_attention_as_ffn_norm = is_qwen35_like and !hasLayerTensor(&tensors, index, "ffn_norm.weight");
+        const ffn_norm = if (uses_post_attention_as_ffn_norm)
             try takeLayerTensor(allocator, &tensors, index, "post_attention_norm.weight")
         else
             try takeLayerTensor(allocator, &tensors, index, "ffn_norm.weight");
@@ -2398,10 +2655,19 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
             .attn_v_bias = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_v.bias"),
             .attn_output = if (is_qwen35_linear) null else try takeOptionalLayerTensor(allocator, &tensors, index, "attn_output.weight"),
             .ffn_norm = ffn_norm,
-            .ffn_gate = try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
-            .ffn_down = try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
-            .ffn_up = try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
-            .post_attention_norm = if (is_qwen35_dense) null else try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
+            .ffn_gate = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_gate_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_gate.weight"),
+            .ffn_down = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_down_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_down.weight"),
+            .ffn_up = if (has_moe)
+                try takeLayerTensor(allocator, &tensors, index, "ffn_up_shexp.weight")
+            else
+                try takeLayerTensor(allocator, &tensors, index, "ffn_up.weight"),
+            .post_attention_norm = if (is_qwen35_dense or uses_post_attention_as_ffn_norm) null else try takeOptionalLayerTensor(allocator, &tensors, index, "post_attention_norm.weight"),
             .post_ffw_norm = try takeOptionalLayerTensor(allocator, &tensors, index, "post_ffw_norm.weight"),
             .linear_attn = if (is_qwen35_linear) .{
                 .in_proj_qkv = try takeLayerTensor(allocator, &tensors, index, "attn_qkv.weight"),
@@ -2413,6 +2679,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
                 .A_log = try takeLayerTensor(allocator, &tensors, index, "ssm_a"),
                 .norm_weight = try takeLayerTensor(allocator, &tensors, index, "ssm_norm.weight"),
                 .out_proj = try takeLayerTensor(allocator, &tensors, index, "ssm_out.weight"),
+            } else null,
+            .moe = if (has_moe) .{
+                .router = try takeLayerTensor(allocator, &tensors, index, "ffn_gate_inp.weight"),
+                .gate_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_gate_exps.weight"),
+                .down_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_down_exps.weight"),
+                .up_exps = try takeLayerTensor(allocator, &tensors, index, "ffn_up_exps.weight"),
+                .shared_router_gate = try takeOptionalLayerTensor(allocator, &tensors, index, "ffn_gate_inp_shexp.weight"),
             } else null,
         };
     }
@@ -2430,6 +2703,13 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .embedding_length = embedding_length,
         .block_count = block_count,
         .feed_forward_length = feed_forward_length,
+        .expert_count = expert_count,
+        .expert_used_count = expert_used_count,
+        .expert_feed_forward_length = expert_feed_forward_length,
+        .expert_shared_feed_forward_length = expert_shared_feed_forward_length,
+        .expert_weights_scale = expert_weights_scale,
+        .expert_weights_norm = expert_weights_norm,
+        .expert_gating_func = expert_gating_func,
         .rope_dimension_count = rope_dimension_count,
         .rope_dimension_sections = metadata.rope_dimension_sections,
         .head_count = head_count,
@@ -2457,6 +2737,7 @@ pub fn loadModel(allocator: std.mem.Allocator, model_path: []const u8) !Model {
         .output_norm = output_norm,
         .layers = layers,
         .is_qwen35_text = is_qwen35_text,
+        .is_qwen35_moe = is_qwen35_moe,
         .partial_rotary_factor = partial_rotary_factor,
         .linear_num_key_heads = linear_num_key_heads,
         .linear_num_value_heads = linear_num_value_heads,
@@ -2473,14 +2754,14 @@ pub fn countPromptTokens(allocator: std.mem.Allocator, model: *const Model, prom
     return model.tokenizer.encodeInto(allocator, prompt, token_buf);
 }
 
+pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
+    return model.tokenizer.encodeInto(allocator, prompt, out);
+}
+
 fn isSupportedTokenizerModel(tokenizer_model: []const u8) bool {
     return std.mem.eql(u8, tokenizer_model, "llama") or
         std.mem.eql(u8, tokenizer_model, "gpt2") or
         std.mem.startsWith(u8, tokenizer_model, "qwen");
-}
-
-pub fn encodePromptInto(allocator: std.mem.Allocator, model: *const Model, prompt: []const u8, out: []u32) !usize {
-    return model.tokenizer.encodeInto(allocator, prompt, out);
 }
 
 fn buildTokenizer(allocator: std.mem.Allocator, metadata: *Metadata) !Tokenizer {
@@ -2742,6 +3023,34 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
         metadata.feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
+    if (std.mem.endsWith(u8, key, ".expert_count")) {
+        metadata.expert_count = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_used_count")) {
+        metadata.expert_used_count = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_feed_forward_length")) {
+        metadata.expert_feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_shared_feed_forward_length")) {
+        metadata.expert_shared_feed_forward_length = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_weights_scale")) {
+        metadata.expert_weights_scale = try readExpectedFloat(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_weights_norm")) {
+        metadata.expert_weights_norm = try readExpectedBool(parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".expert_gating_func")) {
+        metadata.expert_gating_func = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
     if (std.mem.endsWith(u8, key, ".rope.dimension_count")) {
         metadata.rope_dimension_count = try readExpectedUnsigned(u32, parser, value_type);
         return;
@@ -2834,6 +3143,10 @@ fn parseMetadataEntry(allocator: std.mem.Allocator, parser: *Parser, metadata: *
     }
     if (std.mem.endsWith(u8, key, ".ssm.conv_kernel")) {
         metadata.linear_conv_kernel_dim = try readExpectedUnsigned(u32, parser, value_type);
+        return;
+    }
+    if (std.mem.endsWith(u8, key, ".full_attention_interval")) {
+        metadata.full_attention_interval = try readExpectedUnsigned(u32, parser, value_type);
         return;
     }
     if (std.mem.eql(u8, key, "layer_types")) {
@@ -3025,7 +3338,15 @@ pub fn tensorRowByteSize(tensor_type: TensorType, row_len: usize) !usize {
             if (row_len % 256 != 0) return error.InvalidTensorMetadata;
             break :blk try std.math.mul(usize, row_len / 256, 256);
         },
-        .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 98);
+        },
+        .iq4_xs => blk: {
+            if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+            break :blk try std.math.mul(usize, row_len / 256, 136);
+        },
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
@@ -3089,26 +3410,55 @@ pub fn dequantizeRow(out: []f32, tensor_type: TensorType, row: []const u8, row_l
             }
         },
         .q8_0 => try dequantizeRowQ8_0(out, row, row_len),
+        .q3_k => try quant_extra.dequantizeRowQ3K(out, row, row_len),
         .q4_k => try dequantizeRowQ4K(out, row, row_len),
         .q6_k => try dequantizeRowQ6K(out, row, row_len),
         .q5_k => try dequantizeRowQ5K(out, row, row_len),
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => try quant_extra.dequantizeRowIQ3XXS(out, row, row_len),
+        .iq4_xs => try quant_extra.dequantizeRowIQ4XS(out, row, row_len),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     }
 }
 
 fn dequantizeRowQ5K(out: []f32, row: []const u8, row_len: usize) !void {
-    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    if (row_len % 256 != 0 or row.len != (row_len / 256) * 176) return error.InvalidTensorMetadata;
     var out_offset: usize = 0;
     var block_index: usize = 0;
     while (block_index < row.len) : (block_index += 176) {
         const block = row[block_index .. block_index + 176];
         const d = readF16AsF32(block[0..2]);
-        for (0..32) |index| {
-            out[out_offset + index] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index]))));
+        const dmin = readF16AsF32(block[2..4]);
+        const scales = block[4..16];
+        const qh: []const u8 = block[16..48];
+        var qs: []const u8 = block[48..176];
+        var scale_index: usize = 0;
+        var low_mask: u8 = 1;
+        var high_mask: u8 = 2;
+
+        var group: usize = 0;
+        while (group < 4) : (group += 1) {
+            const sm0 = getScaleMinK4(scale_index + 0, scales);
+            const sm1 = getScaleMinK4(scale_index + 1, scales);
+            const d1 = d * @as(f32, @floatFromInt(sm0.scale));
+            const m1 = dmin * @as(f32, @floatFromInt(sm0.min));
+            const d2 = d * @as(f32, @floatFromInt(sm1.scale));
+            const m2 = dmin * @as(f32, @floatFromInt(sm1.min));
+
+            for (0..32) |l| {
+                const q0 = @as(u32, qs[l] & 0x0F) + (if ((qh[l] & low_mask) != 0) @as(u32, 16) else 0);
+                const q1 = @as(u32, qs[l] >> 4) + (if ((qh[l] & high_mask) != 0) @as(u32, 16) else 0);
+                out[out_offset + l] = d1 * @as(f32, @floatFromInt(q0)) - m1;
+                out[out_offset + 32 + l] = d2 * @as(f32, @floatFromInt(q1)) - m2;
+            }
+
+            out_offset += 64;
+            qs = qs[32..];
+            scale_index += 2;
+            low_mask <<= 2;
+            high_mask <<= 2;
         }
-        out_offset += 32;
     }
 }
 
@@ -3117,27 +3467,68 @@ fn dotRow(tensor_type: TensorType, row: []const u8, row_len: usize, input: []con
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
         .q8_0 => try dotQ8_0Row(row, row_len, input),
+        .q3_k => try quant_extra.dotQ3KRow(row, row_len, input),
         .q4_k => try dotQ4KRow(row, row_len, input),
         .q6_k => try dotQ6KRow(row, row_len, input),
         .q5_k => try dotQ5KRow(row, row_len, input),
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => return error.UnsupportedTensorType,
+        .iq3_xxs => try quant_extra.dotIQ3XXSRow(row, row_len, input),
+        .iq4_xs => try quant_extra.dotIQ4XSRow(row, row_len, input),
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => return error.UnsupportedTensorType,
         .i8, .i16, .i32, .i64, .f64, .bf16 => return error.UnsupportedTensorType,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => return error.UnsupportedTensorType,
     };
 }
 
 fn dotQ5KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
-    if (row_len % 256 != 0) return error.InvalidTensorMetadata;
+    if (row_len % 256 != 0 or row.len != (row_len / 256) * 176) return error.InvalidTensorMetadata;
     var sum: f32 = 0;
     var input_offset: usize = 0;
     var block_index: usize = 0;
     while (block_index < row.len) : (block_index += 176) {
         const block = row[block_index .. block_index + 176];
         const d = readF16AsF32(block[0..2]);
-        for (0..32) |index| {
-            sum = @mulAdd(f32, d * @as(f32, @floatFromInt(@as(i8, @bitCast(block[2 + index])))), input[input_offset + index], sum);
+        const dmin = readF16AsF32(block[2..4]);
+        const scales = block[4..16];
+        const qh: []const u8 = block[16..48];
+        var qs: []const u8 = block[48..176];
+        var scale_index: usize = 0;
+        var low_mask: u8 = 1;
+        var high_mask: u8 = 2;
+
+        var group: usize = 0;
+        while (group < 4) : (group += 1) {
+            const sm0 = getScaleMinK4(scale_index + 0, scales);
+            const sm1 = getScaleMinK4(scale_index + 1, scales);
+            const d1 = d * @as(f32, @floatFromInt(sm0.scale));
+            const m1 = dmin * @as(f32, @floatFromInt(sm0.min));
+            const d2 = d * @as(f32, @floatFromInt(sm1.scale));
+            const m2 = dmin * @as(f32, @floatFromInt(sm1.min));
+
+            var low_q_dot: f32 = 0;
+            var low_input_sum: f32 = 0;
+            var high_q_dot: f32 = 0;
+            var high_input_sum: f32 = 0;
+
+            for (0..32) |l| {
+                const q0 = @as(u32, qs[l] & 0x0F) + (if ((qh[l] & low_mask) != 0) @as(u32, 16) else 0);
+                const q1 = @as(u32, qs[l] >> 4) + (if ((qh[l] & high_mask) != 0) @as(u32, 16) else 0);
+                low_q_dot = @mulAdd(f32, @as(f32, @floatFromInt(q0)), input[input_offset + l], low_q_dot);
+                low_input_sum += input[input_offset + l];
+                high_q_dot = @mulAdd(f32, @as(f32, @floatFromInt(q1)), input[input_offset + 32 + l], high_q_dot);
+                high_input_sum += input[input_offset + 32 + l];
+            }
+
+            sum = @mulAdd(f32, d1, low_q_dot, sum);
+            sum = @mulAdd(f32, -m1, low_input_sum, sum);
+            sum = @mulAdd(f32, d2, high_q_dot, sum);
+            sum = @mulAdd(f32, -m2, high_input_sum, sum);
+
+            input_offset += 64;
+            qs = qs[32..];
+            scale_index += 2;
+            low_mask <<= 2;
+            high_mask <<= 2;
         }
-        input_offset += 32;
     }
     return sum;
 }
@@ -3147,10 +3538,13 @@ fn dotRowAssumeValid(tensor_type: TensorType, row: []const u8, row_len: usize, i
         .f32 => dotF32Row(row, input),
         .f16 => dotF16Row(row, input),
         .q8_0 => dotQ8_0Row(row, row_len, input) catch unreachable,
+        .q3_k => quant_extra.dotQ3KRow(row, row_len, input) catch unreachable,
         .q4_k => dotQ4KRow(row, row_len, input) catch unreachable,
         .q6_k => dotQ6KRow(row, row_len, input) catch unreachable,
         .q5_k => dotQ5KRow(row, row_len, input) catch unreachable,
-        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q3_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => unreachable,
+        .iq3_xxs => quant_extra.dotIQ3XXSRow(row, row_len, input) catch unreachable,
+        .iq4_xs => quant_extra.dotIQ4XSRow(row, row_len, input) catch unreachable,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_1, .q2_k, .q8_k, .iq2_xxs, .iq2_xs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq1_m => unreachable,
         .i8, .i16, .i32, .i64, .f64, .bf16 => unreachable,
         .tq1_0, .tq2_0, .mxfp4, .nvfp4 => unreachable,
     };
@@ -3502,6 +3896,63 @@ fn addInPlace(dst: []f32, src: []const f32) void {
     }
 }
 
+fn addScaledInPlace(dst: []f32, src: []const f32, scale: f32) void {
+    if (scale == 1.0) {
+        addInPlace(dst, src);
+        return;
+    }
+
+    var i: usize = 0;
+    const scale_vec: F32x = @splat(scale);
+    while (i + simd_lane_count <= dst.len) : (i += simd_lane_count) {
+        const dst_vec = loadInputVec(dst, i);
+        const src_vec = loadInputVec(src, i);
+        @as(*[simd_lane_count]f32, @ptrCast(dst[i..])).* = @mulAdd(F32x, src_vec, scale_vec, dst_vec);
+    }
+    while (i < dst.len) : (i += 1) {
+        dst[i] += src[i] * scale;
+    }
+}
+
+fn selectTopK(probs: []const f32, out_indices: []u32, out_weights: []f32) void {
+    @memset(out_indices, 0);
+    @memset(out_weights, negative_infinity);
+
+    for (probs, 0..) |prob, index| {
+        var insert_at = out_weights.len;
+        for (out_weights, 0..) |current, slot| {
+            if (prob > current) {
+                insert_at = slot;
+                break;
+            }
+        }
+        if (insert_at == out_weights.len) continue;
+
+        var shift = out_weights.len - 1;
+        while (shift > insert_at) : (shift -= 1) {
+            out_weights[shift] = out_weights[shift - 1];
+            out_indices[shift] = out_indices[shift - 1];
+        }
+        out_weights[insert_at] = prob;
+        out_indices[insert_at] = @intCast(index);
+    }
+}
+
+fn normalizePositiveWeights(weights: []f32) void {
+    var sum: f32 = 0;
+    for (weights) |weight| {
+        if (std.math.isFinite(weight) and weight > 0) sum += weight;
+    }
+    if (sum <= 0) {
+        @memset(weights, 0);
+        return;
+    }
+    const inv_sum = 1.0 / sum;
+    for (weights) |*weight| {
+        weight.* = if (std.math.isFinite(weight.*) and weight.* > 0) weight.* * inv_sum else 0;
+    }
+}
+
 fn scaleInPlace(values: []f32, scale: f32) void {
     if (scale == 1.0) return;
 
@@ -3533,11 +3984,17 @@ fn siluScalar(value: f32) f32 {
 }
 
 fn sigmoidScalar(value: f32) f32 {
-    return 1 / (1 + @exp(-value));
+    if (value >= 0) {
+        const exp_neg = @exp(-value);
+        return 1 / (1 + exp_neg);
+    }
+    const exp_pos = @exp(value);
+    return exp_pos / (1 + exp_pos);
 }
 
 fn softplusScalar(value: f32) f32 {
-    return if (value > 20.0) value else std.math.log1p(@exp(value));
+    if (value > 0) return value + std.math.log1p(@exp(-value));
+    return std.math.log1p(@exp(value));
 }
 
 fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f32) void {
@@ -3545,7 +4002,8 @@ fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f3
         const head = values[head_index * head_dim ..][0..head_dim];
         var norm_sq: f32 = 0;
         for (head) |value| norm_sq += value * value;
-        const scale = @as(f32, 1.0) / @sqrt(norm_sq + eps);
+        const norm = @sqrt(norm_sq);
+        const scale = @as(f32, 1.0) / @max(norm, eps);
         for (head) |*value| value.* *= scale;
     }
 }
@@ -4100,4 +4558,27 @@ test "readU32Array rejects negative signed values" {
     defer out.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.InvalidMetadataValue, readU32Array(std.testing.allocator, &parser, .array, &out));
+}
+
+test "q5_k dequantize and dot keep the high-bit buffer fixed across 64-value groups" {
+    var row = [_]u8{0} ** 176;
+    std.mem.writeInt(u16, row[0..2], @bitCast(@as(f16, 1.0)), .little);
+    row[0 + 4] = 1;
+    row[1 + 4] = 1;
+    row[2 + 4] = 1;
+    row[3 + 4] = 1;
+    row[8] = 1;
+    row[9] = 1;
+    row[10] = 1;
+    row[11] = 1;
+    @memset(row[16..48], 0xFF);
+
+    var dense = [_]f32{0} ** 256;
+    try dequantizeRowQ5K(&dense, &row, 256);
+    for (dense) |value| {
+        try std.testing.expectEqual(@as(f32, 16.0), value);
+    }
+
+    const ones = [_]f32{1.0} ** 256;
+    try std.testing.expectEqual(@as(f32, 4096.0), try dotQ5KRow(&row, 256, &ones));
 }

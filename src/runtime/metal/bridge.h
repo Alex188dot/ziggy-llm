@@ -463,6 +463,17 @@ int ziggy_metal_topk_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_normalize_topk_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *entries,
+    uint32_t top_k,
+    bool apply_softmax,
+    bool normalize_weights,
+    float scale,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_sample_topk_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
@@ -471,6 +482,27 @@ int ziggy_metal_sample_topk_f32(
     uint32_t top_k,
     float temperature,
     float random_uniform,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_weighted_sum_topk_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *src,
+    const ZiggyMetalBuffer *entries,
+    uint32_t count,
+    uint32_t slot_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_sigmoid_scale_add_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *src,
+    const ZiggyMetalBuffer *scalar,
+    uint32_t count,
     char *error_message,
     size_t error_message_len
 );
@@ -550,6 +582,64 @@ int ziggy_metal_batch_matvec_q4k_f32(
     uint32_t rows,
     uint32_t cols,
     uint32_t batch_idx,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_indexed_matvec_iq3_xxs_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    const ZiggyMetalBuffer *entries,
+    uint32_t slot_idx,
+    uint32_t rows_per_expert,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_dual_indexed_matvec_iq3_xxs_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix_a,
+    const ZiggyMetalBuffer *matrix_b,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output_a,
+    ZiggyMetalBuffer *output_b,
+    uint32_t rows,
+    uint32_t cols,
+    const ZiggyMetalBuffer *entries,
+    uint32_t slot_idx,
+    uint32_t rows_per_expert,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_indexed_matvec_iq4_xs_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    const ZiggyMetalBuffer *entries,
+    uint32_t slot_idx,
+    uint32_t rows_per_expert,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_indexed_matvec_iq4_xs_add_weighted_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *output,
+    uint32_t rows,
+    uint32_t cols,
+    const ZiggyMetalBuffer *entries,
+    uint32_t slot_idx,
+    uint32_t rows_per_expert,
     char *error_message,
     size_t error_message_len
 );

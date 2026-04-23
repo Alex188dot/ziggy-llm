@@ -114,6 +114,28 @@ pub const SamplingStrategy = enum {
     }
 };
 
+pub const GpuLayers = union(enum) {
+    auto,
+    all,
+    count: usize,
+
+    pub fn parse(value: []const u8) ?GpuLayers {
+        if (std.mem.eql(u8, value, "auto")) return .auto;
+        if (std.mem.eql(u8, value, "all")) return .all;
+        const count = std.fmt.parseUnsigned(usize, value, 10) catch return null;
+        if (count == 0) return null;
+        return .{ .count = count };
+    }
+
+    pub fn format(self: GpuLayers, buf: []u8) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .all => "all",
+            .count => |count| std.fmt.bufPrint(buf, "{d}", .{count}) catch "invalid",
+        };
+    }
+};
+
 pub const EffectiveSamplingPath = enum {
     cpu_logits,
     gpu_greedy_argmax,
@@ -159,6 +181,7 @@ pub const GenerationOptions = struct {
     moon_quant: MoonQuantMode = .enabled,
     metal_profile: bool = false,
     sampling_strategy: SamplingStrategy = .auto,
+    gpu_layers: GpuLayers = .auto,
 };
 
 pub const StartupBreakdown = struct {
@@ -242,6 +265,14 @@ test "sampling strategy parser accepts benchmark path values" {
     try std.testing.expectEqual(SamplingStrategy.gpu_shortlist, SamplingStrategy.parse("gpu-shortlist").?);
     try std.testing.expectEqual(SamplingStrategy.cpu_full_logits, SamplingStrategy.parse("cpu-full-logits").?);
     try std.testing.expect(SamplingStrategy.parse("bogus") == null);
+}
+
+test "gpu layer parser accepts auto all and positive counts" {
+    try std.testing.expectEqualDeep(GpuLayers.auto, GpuLayers.parse("auto").?);
+    try std.testing.expectEqualDeep(GpuLayers.all, GpuLayers.parse("all").?);
+    try std.testing.expectEqualDeep(GpuLayers{ .count = 8 }, GpuLayers.parse("8").?);
+    try std.testing.expect(GpuLayers.parse("0") == null);
+    try std.testing.expect(GpuLayers.parse("bogus") == null);
 }
 
 test "resolveSamplingPath keeps cpu backend on cpu logits and leaves gpu shortlist opt-in" {
