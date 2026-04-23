@@ -1493,6 +1493,34 @@ kernel void sigmoid_scale_add_f32(
     dst[index] += src[index] * gate;
 }
 
+kernel void unpack_q_gate_f32(
+    device const float *packed [[buffer(0)]],
+    device float *q [[buffer(1)]],
+    device float *gate [[buffer(2)]],
+    constant uint &head_count [[buffer(3)]],
+    constant uint &head_dim [[buffer(4)]],
+    uint index [[thread_position_in_grid]]
+) {
+    const uint total = head_count * head_dim;
+    if (index >= total) return;
+    const uint head = index / head_dim;
+    const uint dim = index % head_dim;
+    const uint packed_base = head * head_dim * 2;
+    q[index] = packed[packed_base + dim];
+    gate[index] = packed[packed_base + head_dim + dim];
+}
+
+kernel void sigmoid_mul_in_place_f32(
+    device float *dst [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    const float g = 1.0f / (1.0f + exp(-gate[index]));
+    dst[index] *= g;
+}
+
 inline float ziggy_dot_iq3_xxs_block(
     device const uchar *block,
     device const float *input

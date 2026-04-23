@@ -345,21 +345,19 @@ pub const Session = struct {
         }
         try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
         const attn_q = layer.attn_q.?;
-        var q_gate: ?[]const f32 = null;
+        var has_q_gate = false;
         if (attn_q.rows == self.model.q_projection_size * 2) {
             try self.runProjection(attn_q, self.normed, self.up);
             if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.up);
-            try self.readBufferF32Committed(self.up, self.host_q_packed[0..attn_q.rows]);
-
-            var head_index: usize = 0;
-            while (head_index < self.model.head_count) : (head_index += 1) {
-                const packed_base = head_index * self.model.key_head_dimension * 2;
-                const q_base = head_index * self.model.key_head_dimension;
-                @memcpy(self.host_q_values[q_base..][0..self.model.key_head_dimension], self.host_q_packed[packed_base..][0..self.model.key_head_dimension]);
-                @memcpy(self.host_gate_values[q_base..][0..self.model.key_head_dimension], self.host_q_packed[packed_base + self.model.key_head_dimension ..][0..self.model.key_head_dimension]);
-            }
-            try metal_backend.writeBufferF32(self.q, self.host_q_values);
-            q_gate = self.host_gate_values;
+            try metal_backend.unpackQGate(
+                self.backend,
+                self.up,
+                self.q,
+                self.gate,
+                self.model.head_count,
+                self.model.key_head_dimension,
+            );
+            has_q_gate = true;
         } else {
             try self.runProjection(attn_q, self.normed, self.q);
             if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
@@ -444,12 +442,13 @@ pub const Session = struct {
             .depth = position + 1,
             .extra = self.model.head_count_kv,
         });
-        if (q_gate) |gate_values| {
-            try self.readBufferF32Committed(self.attn, self.host_attn_values);
-            for (self.host_attn_values, gate_values) |*attn_value, gate_value| {
-                attn_value.* *= sigmoidScalar(gate_value);
-            }
-            try metal_backend.writeBufferF32(self.attn, self.host_attn_values);
+        if (has_q_gate) {
+            try metal_backend.sigmoidMulInPlace(
+                self.backend,
+                self.attn,
+                self.gate,
+                self.model.q_projection_size,
+            );
         }
         if (layer.post_attention_norm) |n| {
             try self.runProjection(layer.attn_output.?, self.attn, self.tmp);

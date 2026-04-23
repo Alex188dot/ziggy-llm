@@ -1248,6 +1248,51 @@ pub fn sigmoidScaleAdd(
     ), &error_buf);
 }
 
+pub fn unpackQGate(
+    backend: backend_api.MatVecBackend,
+    packed_buf: BufferHandle,
+    q: BufferHandle,
+    gate: BufferHandle,
+    head_count: usize,
+    head_dim: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const total = head_count * head_dim;
+    if (packed_buf.byte_len < total * 2 * @sizeOf(f32) or q.byte_len < total * @sizeOf(f32) or gate.byte_len < total * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_unpack_q_gate_f32(
+        state.context,
+        packed_buf.raw,
+        q.raw,
+        gate.raw,
+        @intCast(head_count),
+        @intCast(head_dim),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn sigmoidMulInPlace(
+    backend: backend_api.MatVecBackend,
+    dst: BufferHandle,
+    gate: BufferHandle,
+    count: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (dst.byte_len < count * @sizeOf(f32) or gate.byte_len < count * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_sigmoid_mul_in_place_f32(
+        state.context,
+        dst.raw,
+        gate.raw,
+        @intCast(count),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn readShortlistEntries(buffer: BufferHandle, out: []ShortlistEntry) !void {
     if (!build_enabled_value) return error.MetalDisabled;
     if (out.len * @sizeOf(ShortlistEntry) > buffer.byte_len) return error.MetalBufferError;

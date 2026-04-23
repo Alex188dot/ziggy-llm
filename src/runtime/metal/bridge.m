@@ -47,6 +47,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> sampleTopKPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> weightedSumTopKPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> sigmoidScaleAddPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> unpackQGatePipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> sigmoidMulInPlacePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> batchArgmaxPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> batchMatvecAddPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> batchMatvecQ4KAddPipeline;
@@ -690,6 +692,16 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal sigmoid scale add pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> unpack_q_gate_pipeline = ziggy_pipeline(device, library, @"unpack_q_gate_f32", &pipeline_error);
+        if (unpack_q_gate_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal unpack q/gate pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> sigmoid_mul_in_place_pipeline = ziggy_pipeline(device, library, @"sigmoid_mul_in_place_f32", &pipeline_error);
+        if (sigmoid_mul_in_place_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal sigmoid mul in-place pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         id<MTLComputePipelineState> batch_argmax_pipeline = ziggy_pipeline(device, library, @"batch_argmax_f32", &pipeline_error);
         if (batch_argmax_pipeline == nil) {
@@ -802,6 +814,8 @@ int ziggy_metal_create_context(
         state.sampleTopKPipeline = sample_topk_pipeline;
         state.weightedSumTopKPipeline = weighted_sum_topk_pipeline;
         state.sigmoidScaleAddPipeline = sigmoid_scale_add_pipeline;
+        state.unpackQGatePipeline = unpack_q_gate_pipeline;
+        state.sigmoidMulInPlacePipeline = sigmoid_mul_in_place_pipeline;
         state.batchArgmaxPipeline = batch_argmax_pipeline;
         state.batchMatvecAddPipeline = batch_matvec_add_pipeline;
         state.batchMatvecQ4KAddPipeline = batch_matvec_q4k_add_pipeline;
@@ -2466,6 +2480,87 @@ int ziggy_metal_sigmoid_scale_add_f32(
                 [encoder setBuffer:src_buffer.buffer offset:0 atIndex:1];
                 [encoder setBuffer:scalar_buffer.buffer offset:0 atIndex:2];
                 [encoder setBytes:&count length:sizeof(count) atIndex:3];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_unpack_q_gate_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *packed,
+    ZiggyMetalBuffer *q,
+    ZiggyMetalBuffer *gate,
+    uint32_t head_count,
+    uint32_t head_dim,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || packed == NULL || q == NULL || gate == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal unpack q/gate request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *packed_buffer = ziggy_const_buffer(packed);
+        ZiggyMetalBufferState *q_buffer = ziggy_buffer(q);
+        ZiggyMetalBufferState *gate_buffer = ziggy_buffer(gate);
+        const size_t total = (size_t)head_count * (size_t)head_dim;
+        if (packed_buffer.length < total * 2 * sizeof(float) ||
+            q_buffer.length < total * sizeof(float) ||
+            gate_buffer.length < total * sizeof(float)) {
+            ziggy_write_error(error_message, error_message_len, @"Metal unpack q/gate exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+        return ziggy_run_compute(
+            state,
+            state.unpackQGatePipeline,
+            total,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:packed_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:q_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_sigmoid_mul_in_place_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *gate,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || dst == NULL || gate == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sigmoid mul in-place request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+        const ZiggyMetalBufferState *gate_buffer = ziggy_const_buffer(gate);
+        if (dst_buffer.length < ((size_t)count * sizeof(float)) ||
+            gate_buffer.length < ((size_t)count * sizeof(float))) {
+            ziggy_write_error(error_message, error_message_len, @"Metal sigmoid mul in-place exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+        return ziggy_run_compute(
+            state,
+            state.sigmoidMulInPlacePipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
             },
             error_message,
             error_message_len

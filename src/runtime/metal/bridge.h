@@ -507,6 +507,26 @@ int ziggy_metal_sigmoid_scale_add_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_unpack_q_gate_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *packed,
+    ZiggyMetalBuffer *q,
+    ZiggyMetalBuffer *gate,
+    uint32_t head_count,
+    uint32_t head_dim,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_sigmoid_mul_in_place_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *dst,
+    const ZiggyMetalBuffer *gate,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
 int ziggy_metal_batch_argmax_f32(
     ZiggyMetalContext *ctx,
     const ZiggyMetalBuffer *input,
