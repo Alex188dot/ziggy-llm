@@ -28,7 +28,9 @@ test "metal q4k matvec matches cpu dequantized reference" {
     defer metal_backend.destroyBuffer(output_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ4KToBuffer(backend, &matrix, input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -59,7 +61,9 @@ test "metal top-k shortlist returns descending logits with stable ties" {
     defer metal_backend.destroyBuffer(shortlist_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &logits);
+    try metal_backend.beginSequence(backend);
     try metal_backend.topKShortlist(backend, input_buffer, shortlist_buffer, logits.len, 3);
+    try metal_backend.commitSequence(backend);
 
     var entries: [3]metal_backend.ShortlistEntry = undefined;
     try metal_backend.readShortlistEntries(shortlist_buffer, &entries);
@@ -86,12 +90,16 @@ test "metal sample top-k returns one of the weighted winners" {
 
     try metal_backend.writeBufferF32(input_buffer, &logits);
 
+    try metal_backend.beginSequence(backend);
     try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.0);
+    try metal_backend.commitSequence(backend);
     var sampled_low: [1]u32 = undefined;
     try metal_backend.readBufferU32(token_buffer, &sampled_low);
     try std.testing.expectEqual(@as(u32, 0), sampled_low[0]);
 
+    try metal_backend.beginSequence(backend);
     try metal_backend.sampleTopK(backend, input_buffer, token_buffer, logits.len, 2, 1.0, 0.999);
+    try metal_backend.commitSequence(backend);
     var sampled_high: [1]u32 = undefined;
     try metal_backend.readBufferU32(token_buffer, &sampled_high);
     try std.testing.expect(sampled_high[0] == 0 or sampled_high[0] == 1);
@@ -137,7 +145,9 @@ test "metal q4k fused add matches cpu dequantized reference for dominant llama s
 
     try metal_backend.writeBufferF32(input_buffer, input);
     try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ4KAddToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -179,7 +189,9 @@ test "metal MoonQuant q4k matvec matches cpu dequantized reference" {
     defer metal_backend.destroyBuffer(output_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecMoonQuantQ4KToBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -223,7 +235,9 @@ test "metal MoonQuant q4k fused add matches cpu reference" {
 
     try metal_backend.writeBufferF32(input_buffer, &input);
     try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecMoonQuantQ4KAddToBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -276,7 +290,9 @@ test "metal MoonQuant q4k matvec writes to dst offset" {
 
     try metal_backend.writeBufferF32(input_buffer, &input);
     try metal_backend.writeBufferF32(output_buffer, &actual);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(backend, packed_matrix.bytes, input_buffer, output_buffer, 2 * @sizeOf(f32), rows, cols);
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(output_buffer, &actual);
 
     for (expected, actual) |want, got| {
@@ -321,7 +337,9 @@ test "metal q6k matvec matches cpu dequantized reference" {
     defer metal_backend.destroyBuffer(output_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ6KToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -381,7 +399,9 @@ test "metal q6k matvec writes to dst offset" {
 
     try metal_backend.writeBufferF32(input_buffer, &input);
     try metal_backend.writeBufferF32(output_buffer, &actual);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ6KToDstBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, @sizeOf(f32), rows, cols);
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(output_buffer, &actual);
 
     for (expected, actual) |want, got| {
@@ -429,7 +449,9 @@ test "metal q6k fused add matches cpu dequantized reference for dominant llama s
 
     try metal_backend.writeBufferF32(input_buffer, input);
     try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ6KAddToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -498,7 +520,9 @@ test "metal q6k fused argmax matches cpu dequantized reference for output projec
 
     try metal_backend.writeBufferF32(input_buffer, input);
     try metal_backend.writeBufferU32(packed_buffer, &.{ 0, std.math.maxInt(u32) });
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ6KArgmaxToBuffer(backend, matrix, input_buffer, packed_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var argmax_state: [2]u32 = .{ 0, 0 };
     try metal_backend.readBufferU32(packed_buffer, &argmax_state);
@@ -542,7 +566,9 @@ test "metal q8_0 matvec matches cpu dequantized reference" {
     defer metal_backend.destroyBuffer(output_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ8_0ToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -595,7 +621,9 @@ test "metal q8_0 fused add matches cpu dequantized reference" {
 
     try metal_backend.writeBufferF32(input_buffer, &input);
     try metal_backend.writeBufferF32(output_buffer, &base);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecQ8_0AddToBuffer(backend, matrix[0 .. rows * row_size], input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
 
     var actual: [rows]f32 = undefined;
     try metal_backend.readBufferF32(output_buffer, &actual);
@@ -680,7 +708,9 @@ test "metal dense fused add matches cpu reference for dominant llama shape" {
 
     try metal_backend.writeBufferF32(input_buffer, input);
     try metal_backend.writeBufferF32(output_buffer, &actual);
+    try metal_backend.beginSequence(backend);
     try metal_backend.runMatVecAddToBuffer(backend, matrix, input_buffer, output_buffer, rows, cols);
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(output_buffer, &actual);
 
     for (0..rows) |row| {
@@ -741,6 +771,7 @@ test "metal fused attention matches cpu reference" {
     try metal_backend.writeBufferF32(q_buffer, &q);
     try metal_backend.writeBufferF16(k_buffer, &k_cache);
     try metal_backend.writeBufferF16(v_buffer, &v_cache);
+    try metal_backend.beginSequence(backend);
     try metal_backend.attentionFused(
         backend,
         q_buffer,
@@ -758,6 +789,7 @@ test "metal fused attention matches cpu reference" {
         scale,
         null,
     );
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(output_buffer, &actual);
 
     for (0..actual.len) |index| {
@@ -796,6 +828,7 @@ test "metal rope-to-dst writes rotated kv slice directly" {
 
     try metal_backend.writeBufferF32(src_buffer, &src);
     try metal_backend.writeBufferF32(dst_buffer, &actual);
+    try metal_backend.beginSequence(backend);
     try metal_backend.applyRoPEToDst(
         backend,
         src_buffer,
@@ -808,6 +841,7 @@ test "metal rope-to-dst writes rotated kv slice directly" {
         freq_base,
         0,
     );
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(dst_buffer, &actual);
 
     for (expected, actual) |want, got| {
@@ -851,6 +885,7 @@ test "metal rope at offset rotates kv slice in place" {
     defer metal_backend.destroyBuffer(buffer);
 
     try metal_backend.writeBufferF32(buffer, &actual);
+    try metal_backend.beginSequence(backend);
     try metal_backend.applyRoPEAtOffset(
         backend,
         buffer,
@@ -862,6 +897,7 @@ test "metal rope at offset rotates kv slice in place" {
         freq_base,
         0,
     );
+    try metal_backend.commitSequence(backend);
     try metal_backend.readBufferF32(buffer, &actual);
 
     for (expected, actual) |want, got| {
@@ -884,7 +920,9 @@ test "metal argmax returns best token index" {
     defer metal_backend.destroyBuffer(token_buffer);
 
     try metal_backend.writeBufferF32(input_buffer, &input);
+    try metal_backend.beginSequence(backend);
     try metal_backend.argmax(backend, input_buffer, token_buffer, input.len);
+    try metal_backend.commitSequence(backend);
 
     var token: [1]u32 = .{0};
     try metal_backend.readBufferU32(token_buffer, &token);

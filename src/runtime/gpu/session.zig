@@ -743,6 +743,7 @@ pub const Session = struct {
 
     fn flushSequenceForHostAccess(self: *Session) !void {
         try metal_backend.commitSequence(self.backend);
+        try metal_backend.beginSequence(self.backend);
     }
 
     fn readBufferF32Committed(self: *Session, buffer: metal_backend.BufferHandle, out: []f32) !void {

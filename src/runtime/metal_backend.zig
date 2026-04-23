@@ -104,6 +104,12 @@ const State = if (build_enabled_value) struct {
 
         try writeBuffer(input_buffer.raw, input[0..cols]);
         var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+        try mapStatus(c.ziggy_metal_begin_sequence(
+            self.context,
+            &error_buf,
+            error_buf.len,
+        ), &error_buf);
+        error_buf = std.mem.zeroes([err_buf_len]u8);
         try mapStatus(c.ziggy_metal_run_matvec_f32(
             self.context,
             matrix_buffer.raw,
@@ -111,6 +117,12 @@ const State = if (build_enabled_value) struct {
             output_buffer.raw,
             @intCast(rows),
             @intCast(cols),
+            &error_buf,
+            error_buf.len,
+        ), &error_buf);
+        error_buf = std.mem.zeroes([err_buf_len]u8);
+        try mapStatus(c.ziggy_metal_commit_sequence(
+            self.context,
             &error_buf,
             error_buf.len,
         ), &error_buf);
