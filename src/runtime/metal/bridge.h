@@ -644,4 +644,41 @@ int ziggy_metal_indexed_matvec_iq4_xs_add_weighted_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_linear_conv1d_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *qkv,
+    ZiggyMetalBuffer *conv_state,
+    const ZiggyMetalBuffer *conv_weights,
+    ZiggyMetalBuffer *conv_out,
+    uint32_t layer_index,
+    uint32_t block_count,
+    uint32_t kernel_dim,
+    uint32_t qkv_dim,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_linear_recurrent_norm_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *conv_out,
+    ZiggyMetalBuffer *recurrent_state,
+    const ZiggyMetalBuffer *z,
+    const ZiggyMetalBuffer *a,
+    const ZiggyMetalBuffer *b,
+    const ZiggyMetalBuffer *dt_bias,
+    const ZiggyMetalBuffer *A_log,
+    const ZiggyMetalBuffer *norm_weights,
+    ZiggyMetalBuffer *out,
+    uint32_t layer_index,
+    uint32_t num_key_heads,
+    uint32_t num_value_heads,
+    uint32_t key_head_dim,
+    uint32_t value_head_dim,
+    uint32_t qkv_dim,
+    float rms_norm_eps,
+    float scale,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif

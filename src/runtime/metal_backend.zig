@@ -252,6 +252,12 @@ pub fn createByteScratchBuffer(backend: backend_api.MatVecBackend, byte_len: usi
     };
 }
 
+pub fn getOrCreateBufferForF32(backend: backend_api.MatVecBackend, values: []const f32) !BufferHandle {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    return state.matrixBuffer(values);
+}
+
 pub fn destroyBuffer(buffer: BufferHandle) void {
     if (!build_enabled_value) return;
     c.ziggy_metal_destroy_buffer(buffer.raw);
@@ -1093,6 +1099,82 @@ pub fn rmsNormPerHeadF32(
         @intCast(head_dim),
         eps,
         weight_offset,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn linearConv1dF32(
+    backend: backend_api.MatVecBackend,
+    qkv: BufferHandle,
+    conv_state: BufferHandle,
+    conv_weights: BufferHandle,
+    conv_out: BufferHandle,
+    layer_index: u32,
+    block_count: u32,
+    kernel_dim: u32,
+    qkv_dim: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_linear_conv1d_f32(
+        state.context,
+        qkv.raw,
+        conv_state.raw,
+        conv_weights.raw,
+        conv_out.raw,
+        layer_index,
+        block_count,
+        kernel_dim,
+        qkv_dim,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn linearRecurrentNormF32(
+    backend: backend_api.MatVecBackend,
+    conv_out: BufferHandle,
+    recurrent_state: BufferHandle,
+    z: BufferHandle,
+    a: BufferHandle,
+    b: BufferHandle,
+    dt_bias: BufferHandle,
+    A_log: BufferHandle,
+    norm_weights: BufferHandle,
+    out: BufferHandle,
+    layer_index: u32,
+    num_key_heads: u32,
+    num_value_heads: u32,
+    key_head_dim: u32,
+    value_head_dim: u32,
+    qkv_dim: u32,
+    rms_norm_eps: f32,
+    scale: f32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_linear_recurrent_norm_f32(
+        state.context,
+        conv_out.raw,
+        recurrent_state.raw,
+        z.raw,
+        a.raw,
+        b.raw,
+        dt_bias.raw,
+        A_log.raw,
+        norm_weights.raw,
+        out.raw,
+        layer_index,
+        num_key_heads,
+        num_value_heads,
+        key_head_dim,
+        value_head_dim,
+        qkv_dim,
+        rms_norm_eps,
+        scale,
         &error_buf,
         error_buf.len,
     ), &error_buf);

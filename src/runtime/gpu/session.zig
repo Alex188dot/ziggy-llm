@@ -1181,6 +1181,77 @@ pub const Session = struct {
         const q_dim = num_key_heads * key_head_dim;
         const v_dim = num_value_heads * value_head_dim;
         const qkv_dim = q_dim + q_dim + v_dim;
+
+        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
+        try self.runProjection(la.in_proj_qkv, self.normed, self.linear_qkv);
+        try self.runProjectionToDst(la.in_proj_z, self.normed, self.linear_z, 0);
+        try self.runProjectionToDst(la.in_proj_a, self.normed, self.linear_a, 0);
+        try self.runProjectionToDst(la.in_proj_b, self.normed, self.linear_b, 0);
+
+        if (model.is_qwen35_text) {
+            // GPU-only path for Qwen3.5 dense: zero CPU readbacks
+            const conv_weights = self.dense_lookup.getDense(la.conv1d.offset) orelse return error.InvalidTensorMetadata;
+            const dt_bias_weights = self.dense_lookup.getDense(la.dt_bias.offset) orelse return error.InvalidTensorMetadata;
+            const a_log_weights = self.dense_lookup.getDense(la.A_log.offset) orelse return error.InvalidTensorMetadata;
+            const norm_weights = self.dense_lookup.getDense(la.norm_weight.offset) orelse return error.InvalidTensorMetadata;
+
+            const conv_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, conv_weights);
+            const dt_bias_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, dt_bias_weights);
+            const a_log_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, a_log_weights);
+            const norm_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, norm_weights);
+
+            const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
+
+            const conv_start = std.time.nanoTimestamp();
+            try metal_backend.linearConv1dF32(
+                self.backend,
+                self.linear_qkv,
+                self.linear_conv_state,
+                conv_buffer,
+                self.linear_conv_tmp,
+                @intCast(layer_index),
+                @intCast(model.block_count),
+                @intCast(kernel_dim),
+                @intCast(qkv_dim),
+            );
+            self.recordCategoryWithShape(.elementwise_ops, conv_start, .{
+                .rows = 1,
+                .cols = qkv_dim,
+                .depth = kernel_dim,
+            });
+
+            const recurrent_start = std.time.nanoTimestamp();
+            try metal_backend.linearRecurrentNormF32(
+                self.backend,
+                self.linear_conv_tmp,
+                self.linear_recurrent_state,
+                self.linear_z,
+                self.linear_a,
+                self.linear_b,
+                dt_bias_buffer,
+                a_log_buffer,
+                norm_buffer,
+                self.linear_qkv,
+                @intCast(layer_index),
+                @intCast(num_key_heads),
+                @intCast(num_value_heads),
+                @intCast(key_head_dim),
+                @intCast(value_head_dim),
+                @intCast(qkv_dim),
+                model.rms_norm_eps,
+                scale,
+            );
+            self.recordCategoryWithShape(.elementwise_ops, recurrent_start, .{
+                .rows = num_value_heads,
+                .cols = value_head_dim,
+                .depth = key_head_dim,
+            });
+
+            try self.runProjectionAdd(la.out_proj, self.linear_qkv, self.hidden);
+            return;
+        }
+
+        // CPU fallback path for MoE and other models
         const conv_state_per_layer = qkv_dim * (kernel_dim - 1);
         const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
         const conv_state_base = layer_index * conv_state_per_layer;
@@ -1193,21 +1264,13 @@ pub const Session = struct {
         const beta = self.host_linear_b[0..num_value_heads];
         const gate = self.host_linear_g[0..num_value_heads];
         const conv_out = self.host_linear_conv_tmp[0..qkv_dim];
-        try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
 
-        // Run all linear projections on GPU, then batch the readback into one commit.
-        try self.runProjection(la.in_proj_qkv, self.normed, self.linear_qkv);
-        try self.runProjectionToDst(la.in_proj_z, self.normed, self.linear_z, 0);
-        try self.runProjectionToDst(la.in_proj_a, self.normed, self.linear_a, 0);
-        try self.runProjectionToDst(la.in_proj_b, self.normed, self.linear_b, 0);
         try self.flushSequenceForHostAccess();
         try metal_backend.readBufferF32(self.linear_qkv, qkv);
         try metal_backend.readBufferF32(self.linear_z, z);
         try metal_backend.readBufferF32(self.linear_a, alpha);
         try metal_backend.readBufferF32(self.linear_b, beta);
 
-        // Pre-cache small per-head weights and conv1d weights to avoid
-        // 1M+ readTensorValue calls per token.
         if (num_value_heads > 128) return error.InvalidTensorMetadata;
         var dt_bias_vals: [128]f32 = undefined;
         var a_log_vals: [128]f32 = undefined;
@@ -1305,7 +1368,6 @@ pub const Session = struct {
             }
         }
 
-        // Apply RMSNorm per head + silu gate on CPU, then write directly to GPU.
         const norm_weights = self.dense_lookup.getDense(la.norm_weight.offset) orelse return error.InvalidTensorMetadata;
         if (norm_weights.len < value_head_dim) return error.InvalidTensorMetadata;
         for (0..num_value_heads) |head| {
