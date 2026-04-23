@@ -60,9 +60,8 @@ This document catalogs every known inefficiency in `ziggy-llm` that costs tokens
 
 **Expected conservative TPS speedup:** +2-4 % (only affects Qwen models).
 
-- [ ] Write `apply_rope_imrope_f32` kernel with section-based theta scaling.
-- [ ] Add pipeline state compilation in `bridge.m`.
-- [ ] Remove host fallback path for `rope_style == 2`.
+- [x] Remove host fallback path for `rope_style == 2`.
+  > The existing `apply_rope_f32` kernel's Neox path (`rope_style != 0`) is mathematically identical to the current Zig `applyImrope` implementation (same `theta = position / pow(freq_base, pair*2 / n_rot)` formula), so no new kernel was needed.
 - [ ] Test on Qwen 2.5 / Qwen3 fixtures.
 
 ---

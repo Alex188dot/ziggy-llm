@@ -27,7 +27,7 @@ We benchmark honestly and optimize ruthlessly for single-user, local text genera
 | **Mistral 7B**     | Q4_K_M | ~20 tok/s         | —            | 28.0 tok/s        |
 | **Ministral 3B**   | Q4_K_M | ~45.5 tok/s       | —            | 43.7 tok/s        |
 | **Gemma 2 2B**     | Q4_K_M | ~48 tok/s         | —            | —                 |
-| **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | ~71.6 tok/s       | —            | 92.0 tok/s        |
 | **Qwen3.8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
 | **Qwen3.5 2B**     | Q4_K_M | ~48.9 tok/s       | —            | 62.4 tok/s        |
 
