@@ -103,6 +103,7 @@ pub const ModelDesc = struct {
     rms_norm_eps: f32,
     token_embd_offset: u64,
     rope_style: u32,
+    is_qwen35_text: bool = false,
     linear_num_key_heads: u32 = 16,
     linear_num_value_heads: u32 = 16,
     linear_key_head_dim: u32 = 128,

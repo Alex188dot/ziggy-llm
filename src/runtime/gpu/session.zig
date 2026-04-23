@@ -468,7 +468,7 @@ pub const Session = struct {
         const tensor = layer.ffn_down;
         var handled_fused = false;
 
-        if (tensor.tensor_type == 12 and layer.post_ffw_norm == null and !self.model.use_gelu_ffn) {
+        if (tensor.tensor_type == 12 and layer.post_ffw_norm == null and !self.model.use_gelu_ffn and !self.model.is_qwen35_text) {
             if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                 const start = std.time.nanoTimestamp();
                 try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
@@ -1228,10 +1228,10 @@ pub const Session = struct {
             var acc: f32 = 0;
             for (0..kernel_dim - 1) |kernel_idx| {
                 const state_offset = kernel_idx * qkv_dim + channel;
-                const weight_index = channel * kernel_dim + kernel_idx;
+                const weight_index = channel + kernel_idx * qkv_dim;
                 acc += conv_state[state_offset] * conv1d_vals[weight_index];
             }
-            const current_weight_index = channel * kernel_dim + (kernel_dim - 1);
+            const current_weight_index = channel + (kernel_dim - 1) * qkv_dim;
             acc += qkv[channel] * conv1d_vals[current_weight_index];
             conv_out[channel] = siluScalar(acc);
         }

@@ -1223,6 +1223,10 @@ const Session = struct {
                 break :blk true;
             } else false;
 
+            if (!use_gpu_layer) {
+                try self.syncGpuHiddenForCpu();
+            }
+
             if (use_gpu_layer) {
                 const gpu_session = &self.gpu_session.?;
                 if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
@@ -1232,58 +1236,7 @@ const Session = struct {
                 try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
                 try self.computeLinearAttention(layer_index, layer.linear_attn.?);
             } else {
-                try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
-                var q_gate: ?[]f32 = null;
-                if (layer.attn_q) |q| {
-                    try self.recordCalibration(q, .attn_q, self.normed);
-                    const q_rows = try q.rowCount();
-                    if (q_rows == self.q.len * 2) {
-                        const packed_q = self.up[0..q_rows];
-                        try self.matVec(packed_q, q, self.normed);
-
-                        var head_index: usize = 0;
-                        while (head_index < self.model.head_count) : (head_index += 1) {
-                            const packed_base = head_index * self.model.key_head_dimension * 2;
-                            const q_base = head_index * self.model.key_head_dimension;
-                            @memcpy(self.q[q_base..][0..self.model.key_head_dimension], packed_q[packed_base..][0..self.model.key_head_dimension]);
-                            @memcpy(self.gate[q_base..][0..self.model.key_head_dimension], packed_q[packed_base + self.model.key_head_dimension ..][0..self.model.key_head_dimension]);
-                        }
-                        q_gate = self.gate[0..self.q.len];
-                    } else {
-                        try self.matVec(self.q, q, self.normed);
-                    }
-                }
-                if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
-                if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.key_head_dimension);
-
-                if (layer.attn_k) |k| {
-                    try self.recordCalibration(k, .attn_k, self.normed);
-                    try self.matVec(self.k, k, self.normed);
-                }
-                if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
-                if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.key_head_dimension);
-
-                if (layer.attn_v) |v| {
-                    try self.recordCalibration(v, .attn_v, self.normed);
-                    try self.matVec(self.v, v, self.normed);
-                }
-                if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
-
-                const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
-                applyRoPE(self.q, self.model.head_count, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
-                applyRoPE(self.k, self.model.head_count_kv, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
-                self.storeKv(layer_index);
-                self.computeAttention(layer_index);
-                if (q_gate) |gate_values| {
-                    for (self.attn_out, gate_values) |*attn, gate_value| {
-                        attn.* *= sigmoidScalar(gate_value);
-                    }
-                }
-                if (layer.attn_output) |o| {
-                    try self.recordCalibration(o, .attn_output, self.attn_out);
-                    try self.matVec(self.attn_tmp, o, self.attn_out);
-                }
-                if (layer.post_attention_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
+                try self.runCpuAttentionBlock(layer, layer_index);
             }
 
             if (use_gpu_layer) {
@@ -1324,10 +1277,71 @@ const Session = struct {
         }
     }
 
+    fn runCpuAttentionBlock(self: *Session, layer: LayerRefs, layer_index: usize) !void {
+        try rmsNorm(self.normed, self.hidden, self.model, layer.attn_norm);
+        var q_gate: ?[]f32 = null;
+        if (layer.attn_q) |q| {
+            try self.recordCalibration(q, .attn_q, self.normed);
+            const q_rows = try q.rowCount();
+            if (q_rows == self.q.len * 2) {
+                const packed_q = self.up[0..q_rows];
+                try self.matVec(packed_q, q, self.normed);
+
+                var head_index: usize = 0;
+                while (head_index < self.model.head_count) : (head_index += 1) {
+                    const packed_base = head_index * self.model.key_head_dimension * 2;
+                    const q_base = head_index * self.model.key_head_dimension;
+                    @memcpy(self.q[q_base..][0..self.model.key_head_dimension], packed_q[packed_base..][0..self.model.key_head_dimension]);
+                    @memcpy(self.gate[q_base..][0..self.model.key_head_dimension], packed_q[packed_base + self.model.key_head_dimension ..][0..self.model.key_head_dimension]);
+                }
+                q_gate = self.gate[0..self.q.len];
+            } else {
+                try self.matVec(self.q, q, self.normed);
+            }
+        }
+        if (layer.attn_q_bias) |b| try self.addBiasCpu(self.q, b);
+        if (layer.attn_q_norm) |n| try self.rmsNormPerHead(self.q, self.q, n, self.model.head_count, self.model.key_head_dimension);
+
+        if (layer.attn_k) |k| {
+            try self.recordCalibration(k, .attn_k, self.normed);
+            try self.matVec(self.k, k, self.normed);
+        }
+        if (layer.attn_k_bias) |b| try self.addBiasCpu(self.k, b);
+        if (layer.attn_k_norm) |n| try self.rmsNormPerHead(self.k, self.k, n, self.model.head_count_kv, self.model.key_head_dimension);
+
+        if (layer.attn_v) |v| {
+            try self.recordCalibration(v, .attn_v, self.normed);
+            try self.matVec(self.v, v, self.normed);
+        }
+        if (layer.attn_v_bias) |b| try self.addBiasCpu(self.v, b);
+
+        const rotary_dim = @as(usize, @intFromFloat(@as(f32, @floatFromInt(self.model.rope_dimension_count)) * self.model.partial_rotary_factor));
+        applyRoPE(self.q, self.model.head_count, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+        applyRoPE(self.k, self.model.head_count_kv, self.model.key_head_dimension, rotary_dim, self.position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
+        self.storeKv(layer_index);
+        self.computeAttention(layer_index);
+        if (q_gate) |gate_values| {
+            for (self.attn_out, gate_values) |*attn, gate_value| {
+                attn.* *= sigmoidScalar(gate_value);
+            }
+        }
+        if (layer.attn_output) |o| {
+            try self.recordCalibration(o, .attn_output, self.attn_out);
+            try self.matVec(self.attn_tmp, o, self.attn_out);
+        }
+        if (layer.post_attention_norm) |n| try rmsNorm(self.attn_tmp, self.attn_tmp, self.model, n);
+    }
+
     fn syncGpuHiddenForOutput(self: *Session) !void {
         if (self.gpu_session == null or self.gpu_hidden_is_current) return;
         try self.gpu_session.?.writeHidden(self.hidden);
         self.gpu_hidden_is_current = true;
+    }
+
+    fn syncGpuHiddenForCpu(self: *Session) !void {
+        if (self.gpu_session == null or !self.gpu_hidden_is_current) return;
+        try self.gpu_session.?.readHidden(self.hidden);
+        self.gpu_hidden_is_current = false;
     }
 
     fn computeOutputCpu(self: *Session) !void {
@@ -1872,6 +1886,7 @@ fn adaptModelDesc(model: *const Model, context_length: usize) gpu.ModelDesc {
         .rms_norm_eps = model.rms_norm_eps,
         .token_embd_offset = model.token_embd.offset,
         .rope_style = @intFromEnum(model.rope_style),
+        .is_qwen35_text = model.is_qwen35_text,
         .linear_num_key_heads = model.linear_num_key_heads,
         .linear_num_value_heads = model.linear_num_value_heads,
         .linear_key_head_dim = model.linear_key_head_dim,
