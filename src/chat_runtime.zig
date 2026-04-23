@@ -238,7 +238,7 @@ const StreamState = struct {
 
 fn shouldStartQwen3InsideThink(model_path: []const u8, prompt: []const u8) bool {
     if (!std.mem.endsWith(u8, prompt, "<think>\n")) return false;
-    return isQwen3ModelPath(model_path) and !isQwen35ModelPath(model_path);
+    return isQwen3ModelPath(model_path) or isQwen35ModelPath(model_path);
 }
 
 fn isQwen3ModelPath(model_path: []const u8) bool {

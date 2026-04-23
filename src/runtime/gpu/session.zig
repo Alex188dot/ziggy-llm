@@ -1224,16 +1224,17 @@ pub const Session = struct {
         }
 
         @memset(conv_out, 0);
-        for (0..qkv_dim) |channel| {
-            var acc: f32 = 0;
-            for (0..kernel_dim - 1) |kernel_idx| {
-                const state_offset = kernel_idx * qkv_dim + channel;
-                const weight_index = channel + kernel_idx * qkv_dim;
-                acc += conv_state[state_offset] * conv1d_vals[weight_index];
+        for (0..kernel_dim - 1) |kernel_idx| {
+            const state_offset = kernel_idx * qkv_dim;
+            const weight_offset = kernel_idx * qkv_dim;
+            for (0..qkv_dim) |channel| {
+                conv_out[channel] += conv_state[state_offset + channel] * conv1d_vals[weight_offset + channel];
             }
-            const current_weight_index = channel + (kernel_dim - 1) * qkv_dim;
-            acc += qkv[channel] * conv1d_vals[current_weight_index];
-            conv_out[channel] = siluScalar(acc);
+        }
+        const final_weight_offset = (kernel_dim - 1) * qkv_dim;
+        for (0..qkv_dim) |channel| {
+            conv_out[channel] += qkv[channel] * conv1d_vals[final_weight_offset + channel];
+            conv_out[channel] = siluScalar(conv_out[channel]);
         }
         if (kernel_dim > 1) {
             var state_idx: usize = 0;
@@ -1253,6 +1254,7 @@ pub const Session = struct {
 
         const delta_out = self.host_q_values[0..v_dim];
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
+        if (value_head_dim > 256) return error.InvalidTensorMetadata;
         for (0..num_value_heads) |head| {
             const recurrent_offset = head * key_head_dim * value_head_dim;
             const qk_head = try qwen35_linear_common.qkHeadIndex(head, num_key_heads, num_value_heads);
@@ -1265,23 +1267,41 @@ pub const Session = struct {
 
             for (0..state.len) |idx| state[idx] *= decay;
 
-            for (0..value_head_dim) |col| {
-                var sk: f32 = 0;
-                for (0..key_head_dim) |row| {
-                    sk += state[row * value_head_dim + col] * k_head[row];
-                }
-                const delta = (v_head[col] - sk) * beta[head];
-                for (0..key_head_dim) |row| {
-                    state[row * value_head_dim + col] += k_head[row] * delta;
+            var sk: [256]f32 = undefined;
+            var delta_arr: [256]f32 = undefined;
+            @memset(sk[0..value_head_dim], 0);
+
+            for (0..key_head_dim) |row| {
+                const k_row = k_head[row];
+                const row_offset = row * value_head_dim;
+                for (0..value_head_dim) |col| {
+                    sk[col] += state[row_offset + col] * k_row;
                 }
             }
 
             for (0..value_head_dim) |col| {
-                var acc: f32 = 0;
-                for (0..key_head_dim) |row| {
-                    acc += state[row * value_head_dim + col] * (q_head[row] * scale);
+                delta_arr[col] = (v_head[col] - sk[col]) * beta[head];
+            }
+
+            for (0..key_head_dim) |row| {
+                const k_row = k_head[row];
+                const row_offset = row * value_head_dim;
+                for (0..value_head_dim) |col| {
+                    state[row_offset + col] += k_row * delta_arr[col];
                 }
-                out_head[col] = acc;
+            }
+
+            @memset(sk[0..value_head_dim], 0);
+            for (0..key_head_dim) |row| {
+                const q_row = q_head[row] * scale;
+                const row_offset = row * value_head_dim;
+                for (0..value_head_dim) |col| {
+                    sk[col] += state[row_offset + col] * q_row;
+                }
+            }
+
+            for (0..value_head_dim) |col| {
+                out_head[col] = sk[col];
             }
         }
 
@@ -1301,6 +1321,7 @@ pub const Session = struct {
             delta_out[idx] *= siluScalar(z[idx]);
         }
         try self.writeHostSlice(self.linear_z, delta_out);
+        try metal_backend.beginSequence(self.backend);
         try self.runProjectionAdd(la.out_proj, self.linear_z, self.hidden);
     }
 
