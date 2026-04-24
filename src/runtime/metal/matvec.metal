@@ -2972,3 +2972,29 @@ kernel void linear_recurrent_norm_f32(
     float z_val = z[v_base + col];
     out[v_base + col] = tg_out[col] * tg_norm_scale * norm_weights[col] * ziggy_silu(z_val);
 }
+
+kernel void split_packed_q_f32(
+    device const float *packed [[buffer(0)]],
+    device float *q [[buffer(1)]],
+    device float *q_gate [[buffer(2)]],
+    constant uint &head_count [[buffer(3)]],
+    constant uint &head_dim [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= head_count * head_dim) return;
+    const uint head = idx / head_dim;
+    const uint col = idx % head_dim;
+    const uint packed_base = head * head_dim * 2;
+    q[idx] = packed[packed_base + col];
+    q_gate[idx] = packed[packed_base + head_dim + col];
+}
+
+kernel void sigmoid_mul_gate_f32(
+    device float *output [[buffer(0)]],
+    device const float *q_gate [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    output[idx] *= ziggy_sigmoid(q_gate[idx]);
+}

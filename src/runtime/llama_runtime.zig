@@ -1,4 +1,5 @@
 const std = @import("std");
+const terminal = @import("../terminal.zig");
 const llama_cpu = @import("../model/loader.zig");
 const backend_api = @import("backend.zig");
 const llama_fixture = @import("llama_fixture.zig");
@@ -26,12 +27,26 @@ pub fn generate(
     prompt: []const u8,
     options: types.GenerationOptions,
 ) !types.GenerationReport {
+    const phases = [_][]const u8{
+        "parsing GGUF metadata...",
+        "preparing tensors...",
+        "initializing Metal...",
+        "GPU prewarm...",
+        "allocating session...",
+    };
+    var loading = terminal.LoadingBar.init(phases);
+    defer loading.clear();
+
+    loading.setPhase(0);
     const model_load_begin = std.time.nanoTimestamp();
     var model = try llama_cpu.loadModel(allocator, model_path);
     const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
-    var execution = try selectExecution(allocator, &model, options, options.metal_profile);
+
+    loading.setPhase(1);
+    var execution = try selectExecution(allocator, &model, options, options.metal_profile, &loading);
     defer execution.deinit(allocator);
 
+    loading.setPhase(4);
     const lookup = if (execution.dense_tensors) |*dense_tensors|
         llama_cpu.DenseTensorLookup{
             .ctx = dense_tensors,
@@ -89,11 +104,12 @@ fn selectExecution(
     model: *const llama_cpu.Model,
     options: types.GenerationOptions,
     startup_profile_enabled: bool,
+    loading: *terminal.LoadingBar,
 ) !ExecutionResources {
     return switch (options.backend) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, options, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, options, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, options, startup_profile_enabled, loading),
+        .auto => createMetalExecution(allocator, model, options, startup_profile_enabled, loading) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -105,6 +121,7 @@ fn createMetalExecution(
     model: *const llama_cpu.Model,
     options: types.GenerationOptions,
     startup_profile_enabled: bool,
+    loading: *terminal.LoadingBar,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
@@ -116,10 +133,14 @@ fn createMetalExecution(
     const tensor_prepare_begin = std.time.nanoTimestamp();
     try dense_tensors.populate(model, options.gpu_layers, device_info, options.moon_quant, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
+
+    loading.setPhase(2);
     const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
+
+    loading.setPhase(3);
     const metal_prewarm_begin = std.time.nanoTimestamp();
     try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
     const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());

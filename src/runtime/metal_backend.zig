@@ -1432,6 +1432,48 @@ pub fn linearRecurrentNormF32(
     ), &error_buf);
 }
 
+pub fn splitPackedQ(
+    backend: backend_api.MatVecBackend,
+    packed_buf: BufferHandle,
+    q: BufferHandle,
+    q_gate: BufferHandle,
+    head_count: u32,
+    head_dim: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_split_packed_q_f32(
+        state.context,
+        packed_buf.raw,
+        q.raw,
+        q_gate.raw,
+        head_count,
+        head_dim,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+pub fn sigmoidMulGate(
+    backend: backend_api.MatVecBackend,
+    output: BufferHandle,
+    q_gate: BufferHandle,
+    count: u32,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    const state = stateFromCtx(backend.ctx);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(c.ziggy_metal_sigmoid_mul_gate_f32(
+        state.context,
+        output.raw,
+        q_gate.raw,
+        count,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn argmax(
     backend: backend_api.MatVecBackend,
     input: BufferHandle,

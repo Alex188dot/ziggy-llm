@@ -2073,9 +2073,6 @@ pub fn generateLoadedStreaming(
     stream_callback: ?StreamCallback,
 ) !GenerateReport {
     const startup_begin = std.time.nanoTimestamp();
-    var spinner = terminal.Spinner{};
-    try spinner.start();
-    errdefer spinner.stop();
     var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
@@ -2097,7 +2094,6 @@ pub fn generateLoadedStreaming(
     const session_init_ns = deltaNs(session_init_begin, std.time.nanoTimestamp());
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
-    spinner.stop();
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
     const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
@@ -2294,15 +2290,11 @@ pub fn generateLoadedStreamingCached(
     stream_callback: ?StreamCallback,
 ) !GenerateReport {
     const startup_begin = std.time.nanoTimestamp();
-    var spinner = terminal.Spinner{};
-    try spinner.start();
-    errdefer spinner.stop();
     var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
     const random = prng.random();
     const startup_end = std.time.nanoTimestamp();
-    spinner.stop();
     const context_length = effectiveContextLength(model, options);
 
     const prompt_tokens = try allocator.alloc(u32, context_length);

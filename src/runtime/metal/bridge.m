@@ -76,6 +76,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> indexedMatvecIQ4XSAddWeightedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> linearConv1dPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> linearRecurrentNormPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> splitPackedQPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> sigmoidMulGatePipeline;
 @property(nonatomic, strong) id<MTLCommandBuffer> pendingCommandBuffer;
 @end
 
@@ -842,6 +844,16 @@ int ziggy_metal_create_context(
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal linear recurrent norm pipeline");
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
+        id<MTLComputePipelineState> split_packed_q_pipeline = ziggy_pipeline(device, library, @"split_packed_q_f32", &pipeline_error);
+        if (split_packed_q_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal split packed Q pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> sigmoid_mul_gate_pipeline = ziggy_pipeline(device, library, @"sigmoid_mul_gate_f32", &pipeline_error);
+        if (sigmoid_mul_gate_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal sigmoid mul gate pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
 
         ZiggyMetalState *state = [ZiggyMetalState new];
         state.device = device;
@@ -910,6 +922,8 @@ int ziggy_metal_create_context(
         state.indexedMatvecIQ4XSAddWeightedPipeline = indexed_matvec_iq4_xs_add_weighted_pipeline;
         state.linearConv1dPipeline = linear_conv1d_pipeline;
         state.linearRecurrentNormPipeline = linear_recurrent_norm_pipeline;
+        state.splitPackedQPipeline = split_packed_q_pipeline;
+        state.sigmoidMulGatePipeline = sigmoid_mul_gate_pipeline;
         *out_ctx = (__bridge_retained void *)state;
 
         if (out_info != NULL) {
@@ -2548,6 +2562,76 @@ int ziggy_metal_gelu_mul_f32(
             ^(id<MTLComputeCommandEncoder> encoder) {
                 [encoder setBuffer:gate_buffer.buffer offset:0 atIndex:0];
                 [encoder setBuffer:up_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&count length:sizeof(count) atIndex:2];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_split_packed_q_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *packed,
+    ZiggyMetalBuffer *q,
+    ZiggyMetalBuffer *q_gate,
+    uint32_t head_count,
+    uint32_t head_dim,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || packed == NULL || q == NULL || q_gate == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal split packed Q request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *packed_buffer = ziggy_const_buffer(packed);
+        ZiggyMetalBufferState *q_buffer = ziggy_buffer(q);
+        ZiggyMetalBufferState *q_gate_buffer = ziggy_buffer(q_gate);
+        const uint32_t count = head_count * head_dim;
+        return ziggy_run_compute(
+            state,
+            state.splitPackedQPipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:packed_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:q_buffer.buffer offset:0 atIndex:1];
+                [encoder setBuffer:q_gate_buffer.buffer offset:0 atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_sigmoid_mul_gate_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *output,
+    const ZiggyMetalBuffer *q_gate,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || output == NULL || q_gate == NULL || count == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal sigmoid mul gate request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        ZiggyMetalBufferState *output_buffer = ziggy_buffer(output);
+        const ZiggyMetalBufferState *q_gate_buffer = ziggy_const_buffer(q_gate);
+        return ziggy_run_compute(
+            state,
+            state.sigmoidMulGatePipeline,
+            count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:output_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:q_gate_buffer.buffer offset:0 atIndex:1];
                 [encoder setBytes:&count length:sizeof(count) atIndex:2];
             },
             error_message,

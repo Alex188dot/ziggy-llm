@@ -793,4 +793,24 @@ int ziggy_metal_linear_recurrent_norm_f32(
     size_t error_message_len
 );
 
+int ziggy_metal_split_packed_q_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *packed,
+    ZiggyMetalBuffer *q,
+    ZiggyMetalBuffer *q_gate,
+    uint32_t head_count,
+    uint32_t head_dim,
+    char *error_message,
+    size_t error_message_len
+);
+
+int ziggy_metal_sigmoid_mul_gate_f32(
+    ZiggyMetalContext *ctx,
+    ZiggyMetalBuffer *output,
+    const ZiggyMetalBuffer *q_gate,
+    uint32_t count,
+    char *error_message,
+    size_t error_message_len
+);
+
 #endif
