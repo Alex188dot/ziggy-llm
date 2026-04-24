@@ -469,7 +469,7 @@ pub const Session = struct {
         const tensor = layer.ffn_down;
         var handled_fused = false;
 
-        if (tensor.tensor_type == 12 and layer.post_ffw_norm == null and !self.model.use_gelu_ffn and !self.model.is_qwen35_text) {
+        if (tensor.tensor_type == 12 and layer.post_ffw_norm == null and !self.model.use_gelu_ffn) {
             if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                 const start = std.time.nanoTimestamp();
                 try metal_backend.runMatVecMoonQuantQ4KSiluDownAddToBuffer(self.backend, matrix, self.gate, self.up, self.hidden, tensor.rows, tensor.cols);
@@ -635,33 +635,13 @@ pub const Session = struct {
             .tensor_type = tensor.tensor_type,
         };
         const output_reduce_start = std.time.nanoTimestamp();
-        if (tensor.tensor_type == 14) {
-            const initial_state = [_]u32{ 0, std.math.maxInt(u32) };
-            try metal_backend.writeBufferU32(self.sampled_token_packed, &initial_state);
-            const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-            try metal_backend.runMatVecQ6KArgmaxToBuffer(
-                self.backend,
-                matrix,
-                self.normed,
-                self.sampled_token_packed,
-                tensor.rows,
-                tensor.cols,
-            );
-        } else {
-            try self.runProjection(tensor, self.normed, self.tmp);
-            try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
-        }
+        try self.runProjection(tensor, self.normed, self.tmp);
+        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
         try self.commitOutputSequence(shape);
         const host_readback_start = std.time.nanoTimestamp();
         var token: [1]u32 = .{0};
-        if (tensor.tensor_type == 14) {
-            var argmax_state: [2]u32 = .{ 0, 0 };
-            try self.readBufferU32Committed(self.sampled_token_packed, &argmax_state);
-            token[0] = argmax_state[1];
-        } else {
-            try self.readBufferU32Committed(self.sampled_token, &token);
-        }
+        try self.readBufferU32Committed(self.sampled_token, &token);
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }

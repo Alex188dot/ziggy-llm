@@ -699,38 +699,18 @@ kernel void matvec_q6k_argmax_f32(
     const uint blocks_per_row = cols / ZIGGY_Q6K_VALUES_PER_BLOCK;
     const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK;
     const device uchar *row_bytes = matrix + row * row_stride;
-    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
     threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
 
     float local_sum = 0.0f;
     for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
-        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_half = block_chunk / 32;
-        const uint l = block_chunk % 32;
+        const uint block_index = chunk_index / ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_half = block_chunk / ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF;
+        const uint l = (block_chunk % ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF) * ZIGGY_Q6K_VALUES_PER_VECTOR_CHUNK;
         const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
-        const device uchar *ql = block + block_half * 64;
-        const device uchar *qh = block + 128 + block_half * 32;
-        const device uchar *scales = block + 192 + block_half * 8;
-        const float d = read_half_le(block, 208);
-        const uint scale_index = l / 16;
-        const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
-        const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
-        const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
-        const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
-        const uchar qh_value = qh[l];
-        const uchar ql_low = ql[l];
-        const uchar ql_high = ql[l + 32];
-        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f;
-        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
-        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
-        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
         const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
-
-        local_sum += s0 * q1 * input[input_offset + 0];
-        local_sum += s2 * q2 * input[input_offset + 32];
-        local_sum += s4 * q3 * input[input_offset + 64];
-        local_sum += s6 * q4 * input[input_offset + 96];
+        local_sum += ziggy_q6k_chunk_dot(block, input, block_half, l, input_offset);
     }
 
     const float simd_sum_value = simd_sum(local_sum);
