@@ -37,13 +37,23 @@ fn resolveMoeFfnLayers(model: *const llama.Model, gpu_layers: types.GpuLayers, d
             if (di.recommended_max_working_set_size == 0) break :blk 4;
             if (!di.has_unified_memory) break :blk 4;
 
-            const total_gb = di.recommended_max_working_set_size / (1024 * 1024 * 1024);
-            if (total_gb >= 96) break :blk model.layers.len;
-            if (total_gb >= 48) break :blk @min(model.layers.len, model.layers.len * 3 / 4);
-            if (total_gb >= 24) break :blk @min(model.layers.len, model.layers.len / 2);
-            if (total_gb >= 16) break :blk @min(model.layers.len, model.layers.len / 3);
-            if (total_gb >= 12) break :blk @min(model.layers.len, model.layers.len / 4);
-            break :blk @min(model.layers.len, model.layers.len / 5);
+            const layers = model.layers.len;
+            if (layers == 0) break :blk 0;
+
+            const runtime_ctx = @min(model.context_length, 8192);
+            const kv_bytes: u64 = @intCast(model.block_count * runtime_ctx * model.kv_projection_size * @sizeOf(u16) * 2);
+            const scratch: u64 = 512 * 1024 * 1024;
+            const fixed = kv_bytes + scratch;
+            if (fixed >= di.recommended_max_working_set_size) break :blk 4;
+
+            const available = di.recommended_max_working_set_size - fixed;
+
+            const total_weight_bytes = if (model.mapped_bytes) |m| m.len else model.bytes.len;
+            const per_layer = (total_weight_bytes + layers - 1) / layers;
+            if (per_layer == 0) break :blk layers;
+
+            const weight_budget = available * 4 / 5;
+            break :blk @max(1, @min(layers, weight_budget / per_layer));
         },
         .all => model.layers.len,
         .count => |count| @min(model.layers.len, count),

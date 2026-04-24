@@ -86,7 +86,7 @@ const negative_infinity = -std.math.inf(f32);
 const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
-const max_matvec_helper_threads: usize = 3;
+const max_matvec_helper_threads: usize = 11;
 pub const LayerType = enum {
     full_attention,
     linear_attention,
