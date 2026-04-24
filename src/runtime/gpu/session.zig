@@ -892,8 +892,12 @@ pub const Session = struct {
                 }
             },
             13 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ5KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                }
             },
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1060,8 +1064,12 @@ pub const Session = struct {
                 }
             },
             13 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ5KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+                }
             },
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
@@ -1108,8 +1116,12 @@ pub const Session = struct {
                 }
             },
             13 => {
-                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
-                try metal_backend.runMatVecQ5KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+                }
             },
             14 => {
                 const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
