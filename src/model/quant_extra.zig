@@ -50,12 +50,10 @@ pub fn dequantizeRowQ3K(out: []f32, row: []const u8, row_len: usize) !void {
     while (block_index < row.len) : (block_index += q3_k_block_size) {
         const block = row[block_index .. block_index + q3_k_block_size];
         const hmask = block[0..32];
-        const qs = block[32..96];
-        const scales_raw = block[96..108];
+        var qs: []const u8 = block[32..96];
+        const scales = expandQ3KScales(block[96..108]);
         const d_all = readF16AsF32(block[108..110]);
-        const scales = expandQ3KScales(scales_raw);
 
-        var q_offset: usize = 0;
         var mask: u8 = 1;
         var scale_index: usize = 0;
         for (0..2) |_| {
@@ -64,21 +62,21 @@ pub fn dequantizeRowQ3K(out: []f32, row: []const u8, row_len: usize) !void {
                 const dl_0 = d_all * @as(f32, @floatFromInt(scales[scale_index]));
                 scale_index += 1;
                 for (0..16) |lane| {
-                    out[out_offset] = dl_0 * @as(f32, @floatFromInt(decodeQ3Value(qs[q_offset + lane], shift, hmask[lane], mask)));
+                    out[out_offset] = dl_0 * @as(f32, @floatFromInt(decodeQ3Value(qs[lane], shift, hmask[lane], mask)));
                     out_offset += 1;
                 }
 
                 const dl_1 = d_all * @as(f32, @floatFromInt(scales[scale_index]));
                 scale_index += 1;
                 for (0..16) |lane| {
-                    out[out_offset] = dl_1 * @as(f32, @floatFromInt(decodeQ3Value(qs[q_offset + 16 + lane], shift, hmask[16 + lane], mask)));
+                    out[out_offset] = dl_1 * @as(f32, @floatFromInt(decodeQ3Value(qs[16 + lane], shift, hmask[16 + lane], mask)));
                     out_offset += 1;
                 }
 
-                q_offset += 32;
                 shift += 2;
                 mask <<= 1;
             }
+            qs = qs[32..];
         }
     }
 }
@@ -92,11 +90,10 @@ pub fn dotQ3KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
     while (block_index < row.len) : (block_index += q3_k_block_size) {
         const block = row[block_index .. block_index + q3_k_block_size];
         const hmask = block[0..32];
-        const qs = block[32..96];
+        var qs: []const u8 = block[32..96];
         const scales = expandQ3KScales(block[96..108]);
         const d_all = readF16AsF32(block[108..110]);
 
-        var q_offset: usize = 0;
         var mask: u8 = 1;
         var scale_index: usize = 0;
         for (0..2) |_| {
@@ -105,21 +102,21 @@ pub fn dotQ3KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
                 const scale_0 = d_all * @as(f32, @floatFromInt(scales[scale_index]));
                 scale_index += 1;
                 for (0..16) |lane| {
-                    sum = @mulAdd(f32, scale_0 * @as(f32, @floatFromInt(decodeQ3Value(qs[q_offset + lane], shift, hmask[lane], mask))), input[input_offset], sum);
+                    sum = @mulAdd(f32, scale_0 * @as(f32, @floatFromInt(decodeQ3Value(qs[lane], shift, hmask[lane], mask))), input[input_offset], sum);
                     input_offset += 1;
                 }
 
                 const scale_1 = d_all * @as(f32, @floatFromInt(scales[scale_index]));
                 scale_index += 1;
                 for (0..16) |lane| {
-                    sum = @mulAdd(f32, scale_1 * @as(f32, @floatFromInt(decodeQ3Value(qs[q_offset + 16 + lane], shift, hmask[16 + lane], mask))), input[input_offset], sum);
+                    sum = @mulAdd(f32, scale_1 * @as(f32, @floatFromInt(decodeQ3Value(qs[16 + lane], shift, hmask[16 + lane], mask))), input[input_offset], sum);
                     input_offset += 1;
                 }
 
-                q_offset += 32;
                 shift += 2;
                 mask <<= 1;
             }
+            qs = qs[32..];
         }
     }
     return sum;
@@ -294,6 +291,53 @@ fn gridByte(grid: u32, index: usize) u8 {
 fn readF16AsF32(bytes: []const u8) f32 {
     const raw = std.mem.readInt(u16, bytes[0..2], .little);
     return @as(f32, @floatCast(@as(f16, @bitCast(raw))));
+}
+
+fn setTestQ3KValue(block: []u8, index: usize, value: i32) void {
+    const encoded = if (value >= 0) value else value + 4;
+    const half = index / 128;
+    const rem = index % 128;
+    const shift: u3 = @intCast((rem / 32) * 2);
+    const sub = (rem % 32) / 16;
+    const lane = rem % 16;
+    const q_index = half * 32 + sub * 16 + lane;
+    block[32 + q_index] |= @as(u8, @intCast(encoded)) << shift;
+    if (value >= 0) {
+        const mask: u8 = @as(u8, 1) << @as(u3, @intCast(half * 4 + rem / 32));
+        block[sub * 16 + lane] |= mask;
+    }
+}
+
+test "q3_k dequantize and dot preserve block ordering" {
+    var row = [_]u8{0} ** q3_k_block_size;
+    std.mem.writeInt(u16, row[108..110], @bitCast(@as(f16, 1.0)), .little);
+
+    for (0..qk_k) |index| {
+        const selector = index % 4;
+        const value: i32 = switch (selector) {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            else => 2,
+        };
+        setTestQ3KValue(&row, index, value);
+    }
+
+    var dense: [qk_k]f32 = undefined;
+    try dequantizeRowQ3K(&dense, &row, qk_k);
+    for (dense, 0..) |decoded, index| {
+        const selector = index % 4;
+        const value: f32 = switch (selector) {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            else => 2,
+        };
+        try std.testing.expectEqual(@as(f32, -32.0) * value, decoded);
+    }
+
+    const ones = [_]f32{1.0} ** qk_k;
+    try std.testing.expectEqual(@as(f32, -64.0) * @as(f32, @floatFromInt(qk_k / 4)), try dotQ3KRow(&row, qk_k, &ones));
 }
 
 test "q3_k zero block dequantizes to zeros" {

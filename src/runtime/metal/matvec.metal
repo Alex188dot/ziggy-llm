@@ -76,6 +76,8 @@ inline uchar get_min_k4(device const uchar *scales, uint index) {
         : ((scales[index + 4] >> 4) | ((scales[index] >> 6) << 4));
 }
 
+constant uint ZIGGY_Q3K_VALUES_PER_BLOCK = 256;
+constant uint ZIGGY_Q3K_BYTES_PER_BLOCK = 110;
 constant uint ZIGGY_Q4K_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_Q4K_BYTES_PER_BLOCK = 144;
 constant uint ZIGGY_Q4K_GROUPS_PER_BLOCK = 4;
@@ -106,6 +108,89 @@ constant uint ZIGGY_IQ3_XXS_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_IQ3_XXS_BYTES_PER_BLOCK = 98;
 constant uint ZIGGY_IQ4_XS_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_IQ4_XS_BYTES_PER_BLOCK = 136;
+
+inline float4 ziggy_load_float4(device const float *values, uint offset);
+
+inline uint ziggy_read_u32_le(device const uchar *bytes) {
+    return uint(bytes[0]) |
+        (uint(bytes[1]) << 8) |
+        (uint(bytes[2]) << 16) |
+        (uint(bytes[3]) << 24);
+}
+
+inline int ziggy_q3k_scale(uint aux0, uint aux1, uint aux2, uint aux3, uint index) {
+    uint word = aux0;
+    if (index >= 12) {
+        word = aux3;
+    } else if (index >= 8) {
+        word = aux2;
+    } else if (index >= 4) {
+        word = aux1;
+    }
+    return int((word >> ((index & 3u) * 8u)) & 0xffu) - 32;
+}
+
+inline int ziggy_q3k_value(uchar q, uint shift, uchar hmask, uchar active_mask) {
+    return int((q >> shift) & 0x03u) - (((hmask & active_mask) != 0) ? 0 : 4);
+}
+
+inline float4 ziggy_q3k_decode4(device const uchar *q, uint shift, device const uchar *hmask, uchar active_mask) {
+    return float4(
+        float(ziggy_q3k_value(q[0], shift, hmask[0], active_mask)),
+        float(ziggy_q3k_value(q[1], shift, hmask[1], active_mask)),
+        float(ziggy_q3k_value(q[2], shift, hmask[2], active_mask)),
+        float(ziggy_q3k_value(q[3], shift, hmask[3], active_mask))
+    );
+}
+
+inline float ziggy_q3k_block_dot(
+    device const uchar *block,
+    device const float *input,
+    uint input_offset
+) {
+    const device uchar *hmask = block;
+    const device uchar *q = block + 32;
+    const device uchar *scales_raw = block + 96;
+    const float d_all = read_half_le(block, 108);
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+    const uint raw0 = ziggy_read_u32_le(scales_raw + 0);
+    const uint raw1 = ziggy_read_u32_le(scales_raw + 4);
+    const uint tmp = ziggy_read_u32_le(scales_raw + 8);
+    const uint aux0 = (raw0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    const uint aux1 = (raw1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const uint aux2 = ((raw0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    const uint aux3 = ((raw1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+
+    float sum = 0.0f;
+    uchar active_mask = 1;
+    uint scale_index = 0;
+    uint local_input = input_offset;
+    for (uint half = 0; half < 2; half += 1) {
+        for (uint shift = 0; shift < 8; shift += 2) {
+            const float scale0 = d_all * float(ziggy_q3k_scale(aux0, aux1, aux2, aux3, scale_index));
+            scale_index += 1;
+            const float scale1 = d_all * float(ziggy_q3k_scale(aux0, aux1, aux2, aux3, scale_index));
+            scale_index += 1;
+
+            for (uint lane = 0; lane < 16; lane += 4) {
+                sum += scale0 * dot(
+                    ziggy_q3k_decode4(q + lane, shift, hmask + lane, active_mask),
+                    ziggy_load_float4(input, local_input + lane)
+                );
+                sum += scale1 * dot(
+                    ziggy_q3k_decode4(q + 16 + lane, shift, hmask + 16 + lane, active_mask),
+                    ziggy_load_float4(input, local_input + 16 + lane)
+                );
+            }
+
+            local_input += 32;
+            active_mask = uchar(active_mask << 1);
+        }
+        q += 32;
+    }
+    return sum;
+}
 
 inline float4 ziggy_load_float4(device const float *values, uint offset) {
     return float4(
@@ -310,6 +395,86 @@ ZIGGY_DENSE_MATVEC_ADD_KERNEL(matvec_add_2048_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_
 ZIGGY_DENSE_MATVEC_ADD_KERNEL(matvec_add_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
 
 #undef ZIGGY_DENSE_MATVEC_ADD_KERNEL
+
+kernel void matvec_q3k_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint block_count = cols / ZIGGY_Q3K_VALUES_PER_BLOCK;
+    const uint row_stride = block_count * ZIGGY_Q3K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK;
+        local_sum += ziggy_q3k_block_dot(block, input, block_index * ZIGGY_Q3K_VALUES_PER_BLOCK);
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] = sum;
+    }
+}
+
+kernel void matvec_q3k_add_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint block_count = cols / ZIGGY_Q3K_VALUES_PER_BLOCK;
+    const uint row_stride = block_count * ZIGGY_Q3K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK;
+        local_sum += ziggy_q3k_block_dot(block, input, block_index * ZIGGY_Q3K_VALUES_PER_BLOCK);
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] += sum;
+    }
+}
 
 kernel void matvec_q4k_f32(
     device const uchar *matrix [[buffer(0)]],
@@ -2309,6 +2474,155 @@ ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL(matvec_moonq_q4k_silu_down_add_2048_f32, ZI
 ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL(matvec_moonq_q4k_silu_down_add_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
 
 #undef ZIGGY_MOONQ_Q4K_SILU_DOWN_ADD_KERNEL
+
+kernel void indexed_matvec_q3_k_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    device const ZiggyShortlistEntry *entries [[buffer(5)]],
+    constant uint &slot_idx [[buffer(6)]],
+    constant uint &rows_per_expert [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+    const uint block_count = cols / ZIGGY_Q3K_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_Q3K_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr = matrix + matrix_row * row_bytes;
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        local_sum += ziggy_q3k_block_dot(
+            row_ptr + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK,
+            input,
+            block_index * ZIGGY_Q3K_VALUES_PER_BLOCK
+        );
+    }
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] = sum;
+    }
+}
+
+kernel void dual_indexed_matvec_q3_k_f32(
+    device const uchar *matrix_a [[buffer(0)]],
+    device const uchar *matrix_b [[buffer(1)]],
+    device const float *input [[buffer(2)]],
+    device float *output_a [[buffer(3)]],
+    device float *output_b [[buffer(4)]],
+    constant uint &rows [[buffer(5)]],
+    constant uint &cols [[buffer(6)]],
+    device const ZiggyShortlistEntry *entries [[buffer(7)]],
+    constant uint &slot_idx [[buffer(8)]],
+    constant uint &rows_per_expert [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+    const uint block_count = cols / ZIGGY_Q3K_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_Q3K_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const uint matrix_row = expert_index * rows_per_expert + row;
+    const device uchar *row_ptr_a = matrix_a + matrix_row * row_bytes;
+    const device uchar *row_ptr_b = matrix_b + matrix_row * row_bytes;
+    threadgroup float partial_sums_a[ZIGGY_MAX_ROW_SIMDGROUPS];
+    threadgroup float partial_sums_b[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum_a = 0.0f;
+    float local_sum_b = 0.0f;
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        const uint input_offset = block_index * ZIGGY_Q3K_VALUES_PER_BLOCK;
+        local_sum_a += ziggy_q3k_block_dot(
+            row_ptr_a + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK,
+            input,
+            input_offset
+        );
+        local_sum_b += ziggy_q3k_block_dot(
+            row_ptr_b + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK,
+            input,
+            input_offset
+        );
+    }
+    const float simd_sum_a = simd_sum(local_sum_a);
+    const float simd_sum_b = simd_sum(local_sum_b);
+    if (simd_lane == 0) {
+        partial_sums_a[simd_group] = simd_sum_a;
+        partial_sums_b[simd_group] = simd_sum_b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float sum_a = 0.0f;
+        float sum_b = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum_a += partial_sums_a[index];
+            sum_b += partial_sums_b[index];
+        }
+        output_a[row] = sum_a;
+        output_b[row] = sum_b;
+    }
+}
+
+kernel void indexed_matvec_q3_k_add_weighted_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    device const ZiggyShortlistEntry *entries [[buffer(5)]],
+    constant uint &slot_idx [[buffer(6)]],
+    constant uint &rows_per_expert [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows || cols == 0) return;
+    const uint block_count = cols / ZIGGY_Q3K_VALUES_PER_BLOCK;
+    const uint row_bytes = block_count * ZIGGY_Q3K_BYTES_PER_BLOCK;
+    const uint expert_index = entries[slot_idx].token_id;
+    const device uchar *row_ptr = matrix + (expert_index * rows_per_expert + row) * row_bytes;
+    threadgroup float partial_sums[ZIGGY_MAX_ROW_SIMDGROUPS];
+    float local_sum = 0.0f;
+    for (uint block_index = lane; block_index < block_count; block_index += threads_per_group) {
+        local_sum += ziggy_q3k_block_dot(
+            row_ptr + block_index * ZIGGY_Q3K_BYTES_PER_BLOCK,
+            input,
+            block_index * ZIGGY_Q3K_VALUES_PER_BLOCK
+        );
+    }
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] += sum * entries[slot_idx].score;
+    }
+}
 
 kernel void indexed_matvec_iq3_xxs_f32(
     device const uchar *matrix [[buffer(0)]],
