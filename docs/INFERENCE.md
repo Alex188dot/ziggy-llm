@@ -375,3 +375,10 @@ Current implementation note:
 | 2026-04-21 | Warm avg (`9` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2691.854 | 2691.854 |     47.922 |
 | 2026-04-21 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2635.272 | 2635.272 |     48.951 |
 | 2026-04-21 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax   | MacBook Pro M3 18GB | `metal` | `Qwen3.5-2B-Q4_K_M.gguf` |             7 |              129 |      0.000 |  2640.460 | 2640.460 |     48.855 |
+
+### Qwen3 1.7B Q6_K Benchmark Snapshot
+
+| Date       | Mode                                                    | Machine             | Backend | Model                    | Prompt tokens | Generated tokens | Startup ms | Prompt ms | TTFT ms | Decode TPS |
+|------------|---------------------------------------------------------|---------------------|---------|--------------------------|--------------:|-----------------:|-----------:|----------:|--------:|-----------:|
+| 2026-04-23 | Cold `bench --bench-runs 5`, `temp 0`, GPU greedy argmax | MacBook Pro M3 18GB | `metal` | `Qwen3-1.7B-Q6_K.gguf`   |             7 |              128 |    268.023 |   185.753 | 453.843 |     66.759 |
+| 2026-04-23 | Warm avg (`4` reused runs), `temp 0`, GPU greedy argmax  | MacBook Pro M3 18GB | `metal` | `Qwen3-1.7B-Q6_K.gguf`   |             7 |              128 |      0.027 |   262.689 | 262.779 |     69.033 |

@@ -83,9 +83,19 @@ constant uint ZIGGY_Q4K_PACKED_BYTES_PER_GROUP = 32;
 constant uint ZIGGY_Q4K_VALUES_PER_GROUP = 64;
 constant uint ZIGGY_Q4K_PACKED_CHUNKS_PER_GROUP = 8;
 constant uint ZIGGY_MAX_Q4K_SIMDGROUPS = 8;
+constant uint ZIGGY_Q5K_VALUES_PER_BLOCK = 256;
+constant uint ZIGGY_Q5K_BYTES_PER_BLOCK = 176;
+constant uint ZIGGY_Q5K_GROUPS_PER_BLOCK = 4;
+constant uint ZIGGY_Q5K_PACKED_BYTES_PER_GROUP = 32;
+constant uint ZIGGY_Q5K_VALUES_PER_GROUP = 64;
+constant uint ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP = 8;
+constant uint ZIGGY_MAX_Q5K_SIMDGROUPS = 8;
 constant uint ZIGGY_Q6K_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_Q6K_BYTES_PER_BLOCK = 210;
 constant uint ZIGGY_Q6K_CHUNKS_PER_BLOCK = 64;
+constant uint ZIGGY_Q6K_VALUES_PER_VECTOR_CHUNK = 4;
+constant uint ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF = 8;
+constant uint ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK = 16;
 constant uint ZIGGY_Q8_0_VALUES_PER_BLOCK = 32;
 constant uint ZIGGY_Q8_0_BYTES_PER_BLOCK = 34;
 constant uint ZIGGY_MOONQ_Q4K_BYTES_PER_BLOCK = 160;
@@ -96,6 +106,90 @@ constant uint ZIGGY_IQ3_XXS_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_IQ3_XXS_BYTES_PER_BLOCK = 98;
 constant uint ZIGGY_IQ4_XS_VALUES_PER_BLOCK = 256;
 constant uint ZIGGY_IQ4_XS_BYTES_PER_BLOCK = 136;
+
+inline float4 ziggy_load_float4(device const float *values, uint offset) {
+    return float4(
+        values[offset + 0],
+        values[offset + 1],
+        values[offset + 2],
+        values[offset + 3]
+    );
+}
+
+inline uchar4 ziggy_load_uchar4(device const uchar *values) {
+    return uchar4(values[0], values[1], values[2], values[3]);
+}
+
+inline float4 ziggy_i8x4_to_float4(uchar4 values) {
+    return float4(
+        float(as_type<char>(values[0])),
+        float(as_type<char>(values[1])),
+        float(as_type<char>(values[2])),
+        float(as_type<char>(values[3]))
+    );
+}
+
+inline float4 ziggy_q6k_decode_low_nibbles(uchar4 ql_values, uchar4 qh_values, uint qh_shift) {
+    const uint4 low = uint4(ql_values) & uint4(0x0Fu);
+    const uint4 high = ((uint4(qh_values) >> qh_shift) & uint4(0x03u)) << 4;
+    return float4(low | high) - 32.0f;
+}
+
+inline float4 ziggy_q6k_decode_high_nibbles(uchar4 ql_values, uchar4 qh_values, uint qh_shift) {
+    const uint4 low = uint4(ql_values) >> 4;
+    const uint4 high = ((uint4(qh_values) >> qh_shift) & uint4(0x03u)) << 4;
+    return float4(low | high) - 32.0f;
+}
+
+inline float ziggy_q6k_chunk_dot(
+    device const uchar *block,
+    device const float *input,
+    uint block_half,
+    uint l,
+    uint input_offset
+) {
+    const device uchar *ql = block + block_half * 64;
+    const device uchar *qh = block + 128 + block_half * 32;
+    const device uchar *scales = block + 192 + block_half * 8;
+    const float d = read_half_le(block, 208);
+    const uint scale_index = l / 16;
+    const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
+    const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
+    const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
+    const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
+    const uchar4 qh_values = ziggy_load_uchar4(qh + l);
+    const uchar4 ql_low_values = ziggy_load_uchar4(ql + l);
+    const uchar4 ql_high_values = ziggy_load_uchar4(ql + l + 32);
+
+    const float4 q0 = ziggy_q6k_decode_low_nibbles(ql_low_values, qh_values, 0) * s0;
+    const float4 q1 = ziggy_q6k_decode_low_nibbles(ql_high_values, qh_values, 2) * s2;
+    const float4 q2 = ziggy_q6k_decode_high_nibbles(ql_low_values, qh_values, 4) * s4;
+    const float4 q3 = ziggy_q6k_decode_high_nibbles(ql_high_values, qh_values, 6) * s6;
+
+    return dot(q0, ziggy_load_float4(input, input_offset + 0))
+        + dot(q1, ziggy_load_float4(input, input_offset + 32))
+        + dot(q2, ziggy_load_float4(input, input_offset + 64))
+        + dot(q3, ziggy_load_float4(input, input_offset + 96));
+}
+
+inline float ziggy_q8_0_block_dot(
+    device const uchar *block,
+    device const float *input,
+    uint input_offset
+) {
+    const float d = read_half_le(block, 0);
+    const device uchar *q = block + 2;
+    float block_sum = 0.0f;
+
+    for (uint value_index = 0; value_index < ZIGGY_Q8_0_VALUES_PER_BLOCK; value_index += 4) {
+        block_sum += dot(
+            ziggy_i8x4_to_float4(ziggy_load_uchar4(q + value_index)),
+            ziggy_load_float4(input, input_offset + value_index)
+        );
+    }
+
+    return d * block_sum;
+}
 
 constant char ZIGGY_IQ4_NL_VALUES[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10,
@@ -367,6 +461,175 @@ ZIGGY_Q4K_ADD_KERNEL(matvec_q4k_add_5632_f32, ZIGGY_MOONQ_Q4K_SPECIAL_COLS_1)
 
 #undef ZIGGY_Q4K_ADD_KERNEL
 
+kernel void matvec_q5k_f32(
+    device const uchar *matrix [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &rows [[buffer(3)]],
+    constant uint &cols [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint threads_per_simdgroup [[threads_per_simdgroup]]
+) {
+    if (row >= rows) return;
+
+    const uint blocks_per_row = cols / ZIGGY_Q5K_VALUES_PER_BLOCK;
+    const uint row_stride = blocks_per_row * ZIGGY_Q5K_BYTES_PER_BLOCK;
+    const device uchar *row_bytes = matrix + row * row_stride;
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q5K_GROUPS_PER_BLOCK * ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP;
+    threadgroup float partial_sums[ZIGGY_MAX_Q5K_SIMDGROUPS];
+
+    float local_sum = 0.0f;
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) {
+        const uint block_group_index = chunk_index / ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP;
+        const uint chunk_in_group = chunk_index % ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP;
+        const uint block_index = block_group_index / ZIGGY_Q5K_GROUPS_PER_BLOCK;
+        const uint group = block_group_index % ZIGGY_Q5K_GROUPS_PER_BLOCK;
+        const uint q_offset = chunk_in_group * 4;
+        const uint input_offset = block_index * ZIGGY_Q5K_VALUES_PER_BLOCK + group * ZIGGY_Q5K_VALUES_PER_GROUP + q_offset;
+
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q5K_BYTES_PER_BLOCK;
+        const float d = read_half_le(block, 0);
+        const float dmin = read_half_le(block, 2);
+        const device uchar *scales = block + 4;
+        const device uchar *qh = block + 16 + q_offset;
+        const device uchar *q = block + 48 + group * ZIGGY_Q5K_PACKED_BYTES_PER_GROUP + q_offset;
+
+        const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]);
+        const uchar4 qh_packed = uchar4(qh[0], qh[1], qh[2], qh[3]);
+        const uchar4 low_q_raw = packed & uchar4(0x0F);
+        const uchar4 high_q_raw = packed >> 4;
+
+        const uint low_mask_u = 1u << (group * 2);
+        const uint high_mask_u = 2u << (group * 2);
+        const uint4 qh_bits = uint4(qh_packed);
+        const uint4 low_bit_set = select(uint4(0), uint4(16), (qh_bits & uint4(low_mask_u)) != uint4(0));
+        const uint4 high_bit_set = select(uint4(0), uint4(16), (qh_bits & uint4(high_mask_u)) != uint4(0));
+        const uchar4 low_q = low_q_raw | uchar4(low_bit_set);
+        const uchar4 high_q = high_q_raw | uchar4(high_bit_set);
+
+        const float4 input_low = float4(
+            input[input_offset + 0],
+            input[input_offset + 1],
+            input[input_offset + 2],
+            input[input_offset + 3]
+        );
+        const float4 input_high = float4(
+            input[input_offset + 32 + 0],
+            input[input_offset + 32 + 1],
+            input[input_offset + 32 + 2],
+            input[input_offset + 32 + 3]
+        );
+
+        const uint scale_index = group * 2;
+        const float d1 = d * float(get_scale_k4(scales, scale_index + 0));
+        const float m1 = dmin * float(get_min_k4(scales, scale_index + 0));
+        const float d2 = d * float(get_scale_k4(scales, scale_index + 1));
+        const float m2 = dmin * float(get_min_k4(scales, scale_index + 1));
+        local_sum += dot(float4(low_q) * d1 - float4(m1), input_low);
+        local_sum += dot(float4(high_q) * d2 - float4(m2), input_high);
+    }
+
+    const float simd_sum_value = simd_sum(local_sum);
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float sum = 0.0f;
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup;
+        for (uint index = 0; index < simd_group_count; index += 1) {
+            sum += partial_sums[index];
+        }
+        output[row] = sum;
+    }
+}
+
+#define ZIGGY_Q5K_ADD_KERNEL(NAME, STATIC_COLS) \
+kernel void NAME( \
+    device const uchar *matrix [[buffer(0)]], \
+    device const float *input [[buffer(1)]], \
+    device float *output [[buffer(2)]], \
+    constant uint &rows [[buffer(3)]], \
+    constant uint &cols [[buffer(4)]], \
+    uint row [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]], \
+    uint simd_lane [[thread_index_in_simdgroup]], \
+    uint simd_group [[simdgroup_index_in_threadgroup]], \
+    uint threads_per_group [[threads_per_threadgroup]], \
+    uint threads_per_simdgroup [[threads_per_simdgroup]] \
+) { \
+    if (row >= rows) return; \
+    constexpr uint kStaticCols = STATIC_COLS; \
+    const uint effective_cols = kStaticCols == 0 ? cols : kStaticCols; \
+    if (kStaticCols != 0 && cols != kStaticCols) return; \
+    const uint blocks_per_row = effective_cols / ZIGGY_Q5K_VALUES_PER_BLOCK; \
+    const uint row_stride = blocks_per_row * ZIGGY_Q5K_BYTES_PER_BLOCK; \
+    const device uchar *row_bytes = matrix + row * row_stride; \
+    const uint packed_chunks_per_row = blocks_per_row * ZIGGY_Q5K_GROUPS_PER_BLOCK * ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP; \
+    threadgroup float partial_sums[ZIGGY_MAX_Q5K_SIMDGROUPS]; \
+    float local_sum = 0.0f; \
+    for (uint chunk_index = lane; chunk_index < packed_chunks_per_row; chunk_index += threads_per_group) { \
+        const uint block_group_index = chunk_index / ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP; \
+        const uint chunk_in_group = chunk_index % ZIGGY_Q5K_PACKED_CHUNKS_PER_GROUP; \
+        const uint block_index = block_group_index / ZIGGY_Q5K_GROUPS_PER_BLOCK; \
+        const uint group = block_group_index % ZIGGY_Q5K_GROUPS_PER_BLOCK; \
+        const uint q_offset = chunk_in_group * 4; \
+        const uint input_offset = block_index * ZIGGY_Q5K_VALUES_PER_BLOCK + group * ZIGGY_Q5K_VALUES_PER_GROUP + q_offset; \
+        const device uchar *block = row_bytes + block_index * ZIGGY_Q5K_BYTES_PER_BLOCK; \
+        const float d = read_half_le(block, 0); \
+        const float dmin = read_half_le(block, 2); \
+        const device uchar *scales = block + 4; \
+        const device uchar *qh = block + 16 + q_offset; \
+        const device uchar *q = block + 48 + group * ZIGGY_Q5K_PACKED_BYTES_PER_GROUP + q_offset; \
+        const uchar4 packed = uchar4(q[0], q[1], q[2], q[3]); \
+        const uchar4 qh_packed = uchar4(qh[0], qh[1], qh[2], qh[3]); \
+        const uchar4 low_q_raw = packed & uchar4(0x0F); \
+        const uchar4 high_q_raw = packed >> 4; \
+        const uint low_mask_u = 1u << (group * 2); \
+        const uint high_mask_u = 2u << (group * 2); \
+        const uint4 qh_bits = uint4(qh_packed); \
+        const uint4 low_bit_set = select(uint4(0), uint4(16), (qh_bits & uint4(low_mask_u)) != uint4(0)); \
+        const uint4 high_bit_set = select(uint4(0), uint4(16), (qh_bits & uint4(high_mask_u)) != uint4(0)); \
+        const uchar4 low_q = low_q_raw | uchar4(low_bit_set); \
+        const uchar4 high_q = high_q_raw | uchar4(high_bit_set); \
+        const float4 input_low = float4( \
+            input[input_offset + 0], \
+            input[input_offset + 1], \
+            input[input_offset + 2], \
+            input[input_offset + 3] \
+        ); \
+        const float4 input_high = float4( \
+            input[input_offset + 32 + 0], \
+            input[input_offset + 32 + 1], \
+            input[input_offset + 32 + 2], \
+            input[input_offset + 32 + 3] \
+        ); \
+        const uint scale_index = group * 2; \
+        const float d1 = d * float(get_scale_k4(scales, scale_index + 0)); \
+        const float m1 = dmin * float(get_min_k4(scales, scale_index + 0)); \
+        const float d2 = d * float(get_scale_k4(scales, scale_index + 1)); \
+        const float m2 = dmin * float(get_min_k4(scales, scale_index + 1)); \
+        local_sum += dot(float4(low_q) * d1 - float4(m1), input_low); \
+        local_sum += dot(float4(high_q) * d2 - float4(m2), input_high); \
+    } \
+    const float simd_sum_value = simd_sum(local_sum); \
+    if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (lane == 0) { \
+        float sum = 0.0f; \
+        const uint simd_group_count = (threads_per_group + threads_per_simdgroup - 1) / threads_per_simdgroup; \
+        for (uint index = 0; index < simd_group_count; index += 1) sum += partial_sums[index]; \
+        output[row] += sum; \
+    } \
+}
+
+ZIGGY_Q5K_ADD_KERNEL(matvec_q5k_add_f32, 0)
+
+#undef ZIGGY_Q5K_ADD_KERNEL
+
 kernel void matvec_q6k_f32(
     device const uchar *matrix [[buffer(0)]],
     device const float *input [[buffer(1)]],
@@ -385,38 +648,18 @@ kernel void matvec_q6k_f32(
     const uint blocks_per_row = cols / ZIGGY_Q6K_VALUES_PER_BLOCK;
     const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK;
     const device uchar *row_bytes = matrix + row * row_stride;
-    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
     threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
 
     float local_sum = 0.0f;
     for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
-        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_half = block_chunk / 32;
-        const uint l = block_chunk % 32;
+        const uint block_index = chunk_index / ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_half = block_chunk / ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF;
+        const uint l = (block_chunk % ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF) * ZIGGY_Q6K_VALUES_PER_VECTOR_CHUNK;
         const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
-        const device uchar *ql = block + block_half * 64;
-        const device uchar *qh = block + 128 + block_half * 32;
-        const device uchar *scales = block + 192 + block_half * 8;
-        const float d = read_half_le(block, 208);
-        const uint scale_index = l / 16;
-        const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
-        const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
-        const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
-        const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
-        const uchar qh_value = qh[l];
-        const uchar ql_low = ql[l];
-        const uchar ql_high = ql[l + 32];
-        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f;
-        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
-        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
-        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
         const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
-
-        local_sum += s0 * q1 * input[input_offset + 0];
-        local_sum += s2 * q2 * input[input_offset + 32];
-        local_sum += s4 * q3 * input[input_offset + 64];
-        local_sum += s6 * q4 * input[input_offset + 96];
+        local_sum += ziggy_q6k_chunk_dot(block, input, block_half, l, input_offset);
     }
 
     const float simd_sum_value = simd_sum(local_sum);
@@ -456,38 +699,18 @@ kernel void matvec_q6k_argmax_f32(
     const uint blocks_per_row = cols / ZIGGY_Q6K_VALUES_PER_BLOCK;
     const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK;
     const device uchar *row_bytes = matrix + row * row_stride;
-    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK;
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
     threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS];
 
     float local_sum = 0.0f;
     for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) {
-        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK;
-        const uint block_half = block_chunk / 32;
-        const uint l = block_chunk % 32;
+        const uint block_index = chunk_index / ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK;
+        const uint block_half = block_chunk / ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF;
+        const uint l = (block_chunk % ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF) * ZIGGY_Q6K_VALUES_PER_VECTOR_CHUNK;
         const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK;
-        const device uchar *ql = block + block_half * 64;
-        const device uchar *qh = block + 128 + block_half * 32;
-        const device uchar *scales = block + 192 + block_half * 8;
-        const float d = read_half_le(block, 208);
-        const uint scale_index = l / 16;
-        const float s0 = d * float(as_type<char>(scales[scale_index + 0]));
-        const float s2 = d * float(as_type<char>(scales[scale_index + 2]));
-        const float s4 = d * float(as_type<char>(scales[scale_index + 4]));
-        const float s6 = d * float(as_type<char>(scales[scale_index + 6]));
-        const uchar qh_value = qh[l];
-        const uchar ql_low = ql[l];
-        const uchar ql_high = ql[l + 32];
-        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f;
-        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f;
-        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f;
-        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f;
         const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l;
-
-        local_sum += s0 * q1 * input[input_offset + 0];
-        local_sum += s2 * q2 * input[input_offset + 32];
-        local_sum += s4 * q3 * input[input_offset + 64];
-        local_sum += s6 * q4 * input[input_offset + 96];
+        local_sum += ziggy_q6k_chunk_dot(block, input, block_half, l, input_offset);
     }
 
     const float simd_sum_value = simd_sum(local_sum);
@@ -542,12 +765,8 @@ kernel void matvec_q8_0_f32(
     float local_sum = 0.0f;
     for (uint block_index = lane; block_index < blocks_per_row; block_index += threads_per_group) {
         const device uchar *block = row_bytes + block_index * ZIGGY_Q8_0_BYTES_PER_BLOCK;
-        const float d = read_half_le(block, 0);
         const uint input_offset = block_index * ZIGGY_Q8_0_VALUES_PER_BLOCK;
-        for (uint value_index = 0; value_index < ZIGGY_Q8_0_VALUES_PER_BLOCK; value_index += 1) {
-            const float q = float(as_type<char>(block[2 + value_index]));
-            local_sum += d * q * input[input_offset + value_index];
-        }
+        local_sum += ziggy_q8_0_block_dot(block, input, input_offset);
     }
 
     const float simd_sum_value = simd_sum(local_sum);
@@ -587,12 +806,8 @@ kernel void matvec_q8_0_add_f32(
     float local_sum = 0.0f;
     for (uint block_index = lane; block_index < blocks_per_row; block_index += threads_per_group) {
         const device uchar *block = row_bytes + block_index * ZIGGY_Q8_0_BYTES_PER_BLOCK;
-        const float d = read_half_le(block, 0);
         const uint input_offset = block_index * ZIGGY_Q8_0_VALUES_PER_BLOCK;
-        for (uint value_index = 0; value_index < ZIGGY_Q8_0_VALUES_PER_BLOCK; value_index += 1) {
-            const float q = float(as_type<char>(block[2 + value_index]));
-            local_sum += d * q * input[input_offset + value_index];
-        }
+        local_sum += ziggy_q8_0_block_dot(block, input, input_offset);
     }
 
     const float simd_sum_value = simd_sum(local_sum);
@@ -630,36 +845,17 @@ kernel void NAME( \
     const uint blocks_per_row = effective_cols / ZIGGY_Q6K_VALUES_PER_BLOCK; \
     const uint row_stride = blocks_per_row * ZIGGY_Q6K_BYTES_PER_BLOCK; \
     const device uchar *row_bytes = matrix + row * row_stride; \
-    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_CHUNKS_PER_BLOCK; \
+    const uint chunks_per_row = blocks_per_row * ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK; \
     threadgroup float partial_sums[ZIGGY_MAX_Q4K_SIMDGROUPS]; \
     float local_sum = 0.0f; \
     for (uint chunk_index = lane; chunk_index < chunks_per_row; chunk_index += threads_per_group) { \
-        const uint block_index = chunk_index / ZIGGY_Q6K_CHUNKS_PER_BLOCK; \
-        const uint block_chunk = chunk_index % ZIGGY_Q6K_CHUNKS_PER_BLOCK; \
-        const uint block_half = block_chunk / 32; \
-        const uint l = block_chunk % 32; \
+        const uint block_index = chunk_index / ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK; \
+        const uint block_chunk = chunk_index % ZIGGY_Q6K_VECTOR_CHUNKS_PER_BLOCK; \
+        const uint block_half = block_chunk / ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF; \
+        const uint l = (block_chunk % ZIGGY_Q6K_VECTOR_CHUNKS_PER_HALF) * ZIGGY_Q6K_VALUES_PER_VECTOR_CHUNK; \
         const device uchar *block = row_bytes + block_index * ZIGGY_Q6K_BYTES_PER_BLOCK; \
-        const device uchar *ql = block + block_half * 64; \
-        const device uchar *qh = block + 128 + block_half * 32; \
-        const device uchar *scales = block + 192 + block_half * 8; \
-        const float d = read_half_le(block, 208); \
-        const uint scale_index = l / 16; \
-        const float s0 = d * float(as_type<char>(scales[scale_index + 0])); \
-        const float s2 = d * float(as_type<char>(scales[scale_index + 2])); \
-        const float s4 = d * float(as_type<char>(scales[scale_index + 4])); \
-        const float s6 = d * float(as_type<char>(scales[scale_index + 6])); \
-        const uchar qh_value = qh[l]; \
-        const uchar ql_low = ql[l]; \
-        const uchar ql_high = ql[l + 32]; \
-        const float q1 = float(int(ql_low & 0x0F) | (int((qh_value >> 0) & 0x03) << 4)) - 32.0f; \
-        const float q2 = float(int(ql_high & 0x0F) | (int((qh_value >> 2) & 0x03) << 4)) - 32.0f; \
-        const float q3 = float(int(ql_low >> 4) | (int((qh_value >> 4) & 0x03) << 4)) - 32.0f; \
-        const float q4 = float(int(ql_high >> 4) | (int((qh_value >> 6) & 0x03) << 4)) - 32.0f; \
         const uint input_offset = block_index * ZIGGY_Q6K_VALUES_PER_BLOCK + block_half * 128 + l; \
-        local_sum += s0 * q1 * input[input_offset + 0]; \
-        local_sum += s2 * q2 * input[input_offset + 32]; \
-        local_sum += s4 * q3 * input[input_offset + 64]; \
-        local_sum += s6 * q4 * input[input_offset + 96]; \
+        local_sum += ziggy_q6k_chunk_dot(block, input, block_half, l, input_offset); \
     } \
     const float simd_sum_value = simd_sum(local_sum); \
     if (simd_lane == 0) partial_sums[simd_group] = simd_sum_value; \
@@ -2321,4 +2517,156 @@ kernel void indexed_matvec_iq4_xs_add_weighted_f32(
         }
         output[row] += sum * entries[slot_idx].score;
     }
+}
+
+inline float ziggy_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+inline float ziggy_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+inline float ziggy_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+kernel void linear_conv1d_f32(
+    device const float *qkv [[buffer(0)]],
+    device float *conv_state [[buffer(1)]],
+    device const float *conv_weights [[buffer(2)]],
+    device float *conv_out [[buffer(3)]],
+    constant uint &layer_index [[buffer(4)]],
+    constant uint &block_count [[buffer(5)]],
+    constant uint &kernel_dim [[buffer(6)]],
+    constant uint &qkv_dim [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= qkv_dim) return;
+
+    const uint channel = tid;
+    const uint conv_state_per_layer = (kernel_dim - 1) * qkv_dim;
+    const uint state_base = layer_index * conv_state_per_layer;
+
+    float acc = 0.0f;
+    for (uint k = 0; k < kernel_dim - 1; k++) {
+        uint state_idx = state_base + k * qkv_dim + channel;
+        uint weight_idx = k * qkv_dim + channel;
+        acc += conv_state[state_idx] * conv_weights[weight_idx];
+    }
+    uint final_weight_idx = (kernel_dim - 1) * qkv_dim + channel;
+    acc += qkv[channel] * conv_weights[final_weight_idx];
+    conv_out[channel] = ziggy_silu(acc);
+
+    if (kernel_dim > 1) {
+        for (uint k = 0; k < kernel_dim - 2; k++) {
+            uint dst = state_base + k * qkv_dim + channel;
+            uint src = state_base + (k + 1) * qkv_dim + channel;
+            conv_state[dst] = conv_state[src];
+        }
+        uint last = state_base + (kernel_dim - 2) * qkv_dim + channel;
+        conv_state[last] = qkv[channel];
+    }
+}
+
+kernel void linear_recurrent_norm_f32(
+    device const float *conv_out [[buffer(0)]],
+    device float *recurrent_state [[buffer(1)]],
+    device const float *z [[buffer(2)]],
+    device const float *a [[buffer(3)]],
+    device const float *b [[buffer(4)]],
+    device const float *dt_bias [[buffer(5)]],
+    device const float *A_log [[buffer(6)]],
+    device const float *norm_weights [[buffer(7)]],
+    device float *out [[buffer(8)]],
+    constant uint &layer_index [[buffer(9)]],
+    constant uint &num_key_heads [[buffer(10)]],
+    constant uint &num_value_heads [[buffer(11)]],
+    constant uint &key_head_dim [[buffer(12)]],
+    constant uint &value_head_dim [[buffer(13)]],
+    constant uint &qkv_dim [[buffer(14)]],
+    constant float &rms_norm_eps [[buffer(15)]],
+    constant float &scale [[buffer(16)]],
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint head = tid / value_head_dim;
+    const uint col = lid;
+
+    if (head >= num_value_heads) return;
+    if (col >= value_head_dim) return;
+
+    const uint q_dim = num_key_heads * key_head_dim;
+    const uint v_dim = num_value_heads * value_head_dim;
+
+    const float a_val = a[head];
+    const float dt_bias_val = dt_bias[head];
+    const float a_log_val = A_log[head];
+    const float gate = a_log_val * ziggy_softplus(a_val + dt_bias_val);
+    const float beta = ziggy_sigmoid(b[head]);
+    const float decay = exp(gate);
+
+    const uint qk_head = head % num_key_heads;
+    const uint q_base = qk_head * key_head_dim;
+    const uint k_base = qk_head * key_head_dim;
+    const uint v_base = head * value_head_dim;
+
+    threadgroup float tg_q_scale;
+    threadgroup float tg_k_scale;
+    threadgroup float tg_norm_scale;
+    threadgroup float tg_out[256];
+
+    if (col == 0) {
+        float q_sum_sq = 0.0f;
+        float k_sum_sq = 0.0f;
+        for (uint i = 0; i < key_head_dim; i++) {
+            q_sum_sq += conv_out[q_base + i] * conv_out[q_base + i];
+            k_sum_sq += conv_out[q_dim + k_base + i] * conv_out[q_dim + k_base + i];
+        }
+        float q_norm = sqrt(q_sum_sq);
+        float k_norm = sqrt(k_sum_sq);
+        tg_q_scale = 1.0f / max(q_norm, rms_norm_eps);
+        tg_k_scale = 1.0f / max(k_norm, rms_norm_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_scale = tg_q_scale;
+    float k_scale = tg_k_scale;
+
+    const uint state_per_head = key_head_dim * value_head_dim;
+    const uint state_per_layer = num_value_heads * state_per_head;
+    const uint state_base = layer_index * state_per_layer + head * state_per_head;
+
+    for (uint row = 0; row < key_head_dim; row++) {
+        recurrent_state[state_base + row * value_head_dim + col] *= decay;
+    }
+
+    float sk = 0.0f;
+    for (uint row = 0; row < key_head_dim; row++) {
+        sk += recurrent_state[state_base + row * value_head_dim + col] * conv_out[q_dim + k_base + row] * k_scale;
+    }
+
+    float delta = (conv_out[q_dim + q_dim + v_base + col] - sk) * beta;
+    for (uint row = 0; row < key_head_dim; row++) {
+        recurrent_state[state_base + row * value_head_dim + col] += conv_out[q_dim + k_base + row] * k_scale * delta;
+    }
+
+    float output = 0.0f;
+    for (uint row = 0; row < key_head_dim; row++) {
+        output += recurrent_state[state_base + row * value_head_dim + col] * conv_out[q_base + row] * q_scale * scale;
+    }
+
+    tg_out[col] = output;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (col == 0) {
+        float sum_sq = 0.0f;
+        for (uint i = 0; i < value_head_dim; i++) {
+            sum_sq += tg_out[i] * tg_out[i];
+        }
+        tg_norm_scale = 1.0f / sqrt(sum_sq / float(value_head_dim) + rms_norm_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float z_val = z[v_base + col];
+    out[v_base + col] = tg_out[col] * tg_norm_scale * norm_weights[col] * ziggy_silu(z_val);
 }

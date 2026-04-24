@@ -27,9 +27,9 @@ We benchmark honestly and optimize ruthlessly for single-user, local text genera
 | **Mistral 7B**     | Q4_K_M | ~20 tok/s         | —            | 28.0 tok/s        |
 | **Ministral 3B**   | Q4_K_M | ~45.5 tok/s       | —            | 43.7 tok/s        |
 | **Gemma 2 2B**     | Q4_K_M | ~48 tok/s         | —            | —                 |
-| **Qwen3 1.7B**     | Q4_K_M | ~65 tok/s         | —            | 92.0 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | ~76 tok/s         | —            | 92.0 tok/s        |
 | **Qwen3.8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
-| **Qwen3.5 2B**     | Q4_K_M | ~48.9 tok/s       | —            | 62.4 tok/s        |
+| **Qwen3.5 2B**     | Q4_K_M | ~49.3 tok/s       | —            | 62.4 tok/s        |
 
 Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
 
@@ -148,7 +148,7 @@ ziggy-llm is open source and in active development, and we would love your help 
 
 - [ ] Implement OpenAI compatible server
 - [ ] Expand Qwen 3.5 MoE beyond the initial CPU-only `Q3_K` / `IQ3_XXS` / `IQ4_XS` support boundary and add Gemma 4
-- [ ] Make chat more robust
+- [ ] Improve ttft and tps
 - [ ] Test all quants (currently tested only Q4_K_M and Q6_K)
 - [ ] Test bigger models (of Qwen 3 and Llama families) with higher end hardware, bigger context sizes and benchmark performance
 

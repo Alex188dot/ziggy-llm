@@ -154,7 +154,7 @@ pub const DenseTensorStore = struct {
 
     pub fn storesRawQuant(tensor_type: llama.TensorType) bool {
         return switch (tensor_type) {
-            .q3_k, .q4_k, .q6_k, .q8_0, .iq3_xxs, .iq4_xs => true,
+            .q3_k, .q4_k, .q5_k, .q6_k, .q8_0, .iq3_xxs, .iq4_xs => true,
             else => false,
         };
     }
