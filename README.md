@@ -2,12 +2,14 @@
 
 ![ziggy-llm logo](assets/ziggy-llm-logo.png)
 
-Welcome to **ziggy-llm**, a Zig-native GGUF inference engine built specifically for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
+Welcome to **ziggy-llm**, a Zig-native GGUF inference engine built from absolute scratch for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
+
+Built from the ground up with **zero external dependencies**, every line of quantization kernels, Metal GPU shaders, GGUF parser, and inference runtime is written in Zig. This isn't a port or a wrapper around llama.cpp or any other inference engine. It's a clean-sheet implementation purpose-built for Apple Silicon performance.
 
 We don't try to do everything for everyone; instead, we do one thing exceptionally well. By focusing exclusively on Apple Metal and GGUF files, we deliver a single-binary, highly optimized CLI experience 💎
 
-- Apple Silicon first
-- Metal first
+- 100% custom, built from scratch, zero borrowed code
+- Apple Silicon and Metal first
 - GGUF only
 - Single binary
 - CLI first
