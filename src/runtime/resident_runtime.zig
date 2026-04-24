@@ -5,6 +5,7 @@ const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
 const llama_metal = @import("gpu/metal/tensor_store.zig");
 const metal_backend = @import("metal_backend.zig");
+const qwen35_metal_fallback = @import("qwen35_metal_fallback.zig");
 const types = @import("types.zig");
 
 pub const ResidentRuntime = struct {
@@ -78,6 +79,19 @@ pub const ResidentRuntime = struct {
         try self.ensureLoaded(model_path, options.backend, options.context_length, options.moon_quant, options.gpu_layers, options.metal_profile);
         const loaded = &self.loaded.?;
         loaded.last_used_ts = std.time.timestamp();
+
+        if (try qwen35_metal_fallback.maybeGenerate(
+            self.allocator,
+            &loaded.model,
+            loaded.execution.backend != null and loaded.execution.backend.?.label == .metal,
+            model_path,
+            prompt,
+            options,
+            stream_ctx,
+            stream_callback,
+        )) |fallback_report| {
+            return try self.finalizeReport(loaded, fallback_report, options);
+        }
 
         const lookup = if (loaded.execution.dense_tensors) |*dense_tensors|
             llama_cpu.DenseTensorLookup{
