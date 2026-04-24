@@ -75,10 +75,10 @@ pub fn dequantizeRowQ3K(out: []f32, row: []const u8, row_len: usize) !void {
                     out_offset += 1;
                 }
 
-                q_offset += 32;
                 shift += 2;
                 mask <<= 1;
             }
+            q_offset += 32;
         }
     }
 }
@@ -116,10 +116,10 @@ pub fn dotQ3KRow(row: []const u8, row_len: usize, input: []const f32) !f32 {
                     input_offset += 1;
                 }
 
-                q_offset += 32;
                 shift += 2;
                 mask <<= 1;
             }
+            q_offset += 32;
         }
     }
     return sum;

@@ -17,6 +17,7 @@ pub const max_draft_len = gpu_types.max_draft_len;
 const tensor_type_f32: u32 = 0;
 const tensor_type_f16: u32 = 1;
 const tensor_type_q8_0: u32 = 8;
+const tensor_type_q3_k: u32 = 11;
 const tensor_type_q4_k: u32 = 12;
 const tensor_type_q5_k: u32 = 13;
 const tensor_type_q6_k: u32 = 14;
@@ -316,9 +317,14 @@ pub const Session = struct {
         if (moe.shared_router_gate) |gate_tensor| {
             if (!supportsProjectionTensor(gate_tensor) or gate_tensor.rows != 1) return false;
         }
-        return moe.gate_exps.tensor_type == tensor_type_iq3_xxs and
-            moe.up_exps.tensor_type == tensor_type_iq3_xxs and
-            moe.down_exps.tensor_type == tensor_type_iq4_xs;
+        if (!supportsIndexedProjection(moe.gate_exps) or
+            !supportsIndexedProjection(moe.up_exps) or
+            !supportsIndexedProjection(moe.down_exps))
+        {
+            return false;
+        }
+        if (moe.gate_exps.tensor_type != moe.up_exps.tensor_type) return false;
+        return true;
     }
 
     pub fn readHidden(self: *Session, out: []f32) !void {
@@ -538,7 +544,7 @@ pub const Session = struct {
         });
 
         for (0..self.model.expert_used_count) |slot_idx| {
-            try self.runDualIndexedProjectionIQ3XXS(
+            try self.runDualIndexedProjection(
                 moe.gate_exps,
                 moe.up_exps,
                 self.normed,
@@ -709,8 +715,20 @@ pub const Session = struct {
             tensor_type_f32,
             tensor_type_f16,
             tensor_type_q8_0,
+            tensor_type_q3_k,
             tensor_type_q4_k,
             tensor_type_q6_k,
+            tensor_type_q5_k,
+            => true,
+            else => false,
+        };
+    }
+
+    fn supportsIndexedProjection(tensor: TensorDesc) bool {
+        return switch (tensor.tensor_type) {
+            tensor_type_q3_k,
+            tensor_type_iq3_xxs,
+            tensor_type_iq4_xs,
             => true,
             else => false,
         };
@@ -882,6 +900,10 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         var used_moon_quant = false;
         switch (tensor.tensor_type) {
+            11 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
@@ -943,6 +965,17 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
         switch (tensor.tensor_type) {
+            tensor_type_q3_k => try metal_backend.indexedMatvecQ3K(
+                self.backend,
+                matrix,
+                input,
+                output,
+                rows_per_expert,
+                tensor.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            ),
             tensor_type_iq3_xxs => try metal_backend.indexedMatvecIQ3XXS(
                 self.backend,
                 matrix,
@@ -975,7 +1008,7 @@ pub const Session = struct {
         });
     }
 
-    fn runDualIndexedProjectionIQ3XXS(
+    fn runDualIndexedProjection(
         self: *Session,
         tensor_a: TensorDesc,
         tensor_b: TensorDesc,
@@ -985,23 +1018,40 @@ pub const Session = struct {
         slot_idx: usize,
         rows_per_expert: usize,
     ) !void {
-        if (tensor_a.tensor_type != tensor_type_iq3_xxs or tensor_b.tensor_type != tensor_type_iq3_xxs) return error.UnsupportedTensorType;
         const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
         const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
         const start = std.time.nanoTimestamp();
-        try metal_backend.dualIndexedMatvecIQ3XXS(
-            self.backend,
-            matrix_a,
-            matrix_b,
-            input,
-            output_a,
-            output_b,
-            rows_per_expert,
-            tensor_a.cols,
-            self.shortlist_entries,
-            slot_idx,
-            rows_per_expert,
-        );
+        if (tensor_a.tensor_type == tensor_type_q3_k and tensor_b.tensor_type == tensor_type_q3_k) {
+            try metal_backend.dualIndexedMatvecQ3K(
+                self.backend,
+                matrix_a,
+                matrix_b,
+                input,
+                output_a,
+                output_b,
+                rows_per_expert,
+                tensor_a.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            );
+        } else if (tensor_a.tensor_type == tensor_type_iq3_xxs and tensor_b.tensor_type == tensor_type_iq3_xxs) {
+            try metal_backend.dualIndexedMatvecIQ3XXS(
+                self.backend,
+                matrix_a,
+                matrix_b,
+                input,
+                output_a,
+                output_b,
+                rows_per_expert,
+                tensor_a.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            );
+        } else {
+            return error.UnsupportedTensorType;
+        }
         const shape = metal_profile.ShapeDesc{
             .rows = rows_per_expert,
             .cols = tensor_a.cols,
@@ -1023,6 +1073,17 @@ pub const Session = struct {
         const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
         const start = std.time.nanoTimestamp();
         switch (tensor.tensor_type) {
+            tensor_type_q3_k => try metal_backend.indexedMatvecQ3KAddWeighted(
+                self.backend,
+                matrix,
+                input,
+                output,
+                rows_per_expert,
+                tensor.cols,
+                self.shortlist_entries,
+                slot_idx,
+                rows_per_expert,
+            ),
             tensor_type_iq4_xs => try metal_backend.indexedMatvecIQ4XSAddWeighted(
                 self.backend,
                 matrix,
@@ -1054,6 +1115,10 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         var used_moon_quant = false;
         switch (tensor.tensor_type) {
+            11 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
+            },
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KToDstBuffer(self.backend, matrix, input, output, output_offset_bytes, tensor.rows, tensor.cols);
@@ -1106,6 +1171,10 @@ pub const Session = struct {
         const start = std.time.nanoTimestamp();
         var used_moon_quant = false;
         switch (tensor.tensor_type) {
+            11 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);
+            },
             12 => {
                 if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
                     try metal_backend.runMatVecMoonQuantQ4KAddToBuffer(self.backend, matrix, input, output, tensor.rows, tensor.cols);

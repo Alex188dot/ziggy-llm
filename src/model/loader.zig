@@ -1217,17 +1217,22 @@ const Session = struct {
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
             const gpu_layer_desc = adaptLayerDesc(layer);
-            const use_gpu_layer = if (self.gpu_session) |*gpu_session| blk: {
-                if (!gpu_session.canRunAttentionBlock(gpu_layer_desc)) break :blk false;
-                if (layer.moe != null and !gpu_session.canRunMoeFfnBlock(gpu_layer_desc)) break :blk false;
-                break :blk true;
-            } else false;
+            const gpu_attn_ok = if (self.gpu_session) |*gpu_session|
+                gpu_session.canRunAttentionBlock(gpu_layer_desc)
+            else
+                false;
+            const gpu_moe_ffn_ok = gpu_attn_ok and layer.moe != null and
+                (if (self.gpu_session) |*gpu_session| gpu_session.canRunMoeFfnBlock(gpu_layer_desc) else false);
+            const use_gpu_layer = if (self.gpu_session != null)
+                gpu_attn_ok and (layer.moe == null or gpu_moe_ffn_ok)
+            else
+                false;
 
-            if (!use_gpu_layer) {
+            if (!use_gpu_layer and !gpu_attn_ok) {
                 try self.syncGpuHiddenForCpu();
             }
 
-            if (use_gpu_layer) {
+            if (use_gpu_layer or gpu_attn_ok) {
                 const gpu_session = &self.gpu_session.?;
                 if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
                 try gpu_session.runAttentionBlock(gpu_layer_desc, layer_index, self.position);
@@ -1247,6 +1252,11 @@ const Session = struct {
                 } else {
                     try gpu_session.runFfnBlock(gpu_layer_desc);
                 }
+                self.gpu_hidden_is_current = true;
+            } else if (gpu_attn_ok and layer.moe != null) {
+                const gpu_session = &self.gpu_session.?;
+                const moe = layer.moe.?;
+                try self.runMoeFfnHybrid(gpu_session, layer, moe);
                 self.gpu_hidden_is_current = true;
             } else {
                 addInPlace(self.hidden, self.attn_tmp);
