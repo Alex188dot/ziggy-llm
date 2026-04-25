@@ -59,7 +59,7 @@ pub fn runWarmBench(
     var warm_metal_profile_summary: ?[]u8 = null;
 
     for (1..bench_runs) |run_index| {
-        terminal.drawBenchRunProgress(run_index, bench_runs - 1);
+        terminal.drawBenchRunProgress(run_index + 1, bench_runs);
         var warm = try runtime.generate(model_path, prompt, options);
         warm_startup_total += warm.startup_ns;
         warm_prompt_total += warm.prompt_ns;
