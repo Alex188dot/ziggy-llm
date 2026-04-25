@@ -1,7 +1,7 @@
 const std = @import("std");
 const gguf = @import("../gguf.zig");
 const bench_runner = @import("bench_runner.zig");
-const llama_runtime = @import("llama_runtime.zig");
+const resident_runtime = @import("resident_runtime.zig");
 const types = @import("types.zig");
 const families_mod = @import("families/mod.zig");
 const registry_mod = @import("families/registry.zig");
@@ -115,7 +115,9 @@ pub fn runCommand(
     prompt: []const u8,
     options: GenerationOptions,
 ) !void {
-    var report = try generate(allocator, model_path, prompt, options);
+    var rt = resident_runtime.ResidentRuntime.init(allocator);
+    defer rt.deinit();
+    var report = try rt.generate(model_path, prompt, options);
     defer report.deinit(allocator);
 
     try writer.print(
@@ -275,7 +277,9 @@ pub fn benchCommand(
         return;
     }
 
-    var report = try generate(allocator, model_path, prompt, options);
+    var rt = resident_runtime.ResidentRuntime.init(allocator);
+    defer rt.deinit();
+    var report = try rt.generate(model_path, prompt, options);
     defer report.deinit(allocator);
 
     try writer.print(
