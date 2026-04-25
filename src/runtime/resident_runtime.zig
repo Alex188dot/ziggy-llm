@@ -1,5 +1,6 @@
 const std = @import("std");
 const gguf = @import("../gguf.zig");
+const terminal = @import("../terminal.zig");
 const llama_cpu = @import("../model/loader.zig");
 const llama_fixture = @import("llama_fixture.zig");
 const backend_api = @import("backend.zig");
@@ -182,14 +183,27 @@ pub const ResidentRuntime = struct {
             self.unload();
         }
 
+        const phases = [_][]const u8{
+            "parsing GGUF metadata...",
+            "preparing tensors...",
+            "initializing Metal...",
+            "GPU prewarm...",
+            "allocating session...",
+        };
+        var loading = terminal.LoadingBar.init(phases);
+        defer loading.clear();
+
+        loading.setPhase(0);
         const model_load_begin = std.time.nanoTimestamp();
         var model = try llama_cpu.loadModel(self.allocator, model_path);
         const model_load_ns = types.deltaNs(model_load_begin, std.time.nanoTimestamp());
         errdefer model.deinit(self.allocator);
 
-        var execution = try selectExecution(self.allocator, &model, backend_pref, moon_quant_mode, gpu_layers, startup_profile_enabled);
+        loading.setPhase(1);
+        var execution = try selectExecution(self.allocator, &model, backend_pref, moon_quant_mode, gpu_layers, startup_profile_enabled, &loading);
         errdefer execution.deinit(self.allocator);
 
+        loading.setPhase(4);
         const owned_model_path = try self.allocator.dupe(u8, model_path);
         errdefer self.allocator.free(owned_model_path);
 
@@ -334,11 +348,12 @@ fn selectExecution(
     moon_quant_mode: types.MoonQuantMode,
     gpu_layers: types.GpuLayers,
     startup_profile_enabled: bool,
+    loading: *terminal.LoadingBar,
 ) !ExecutionResources {
     return switch (preference) {
         .cpu => .{},
-        .metal => try createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled),
-        .auto => createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled) catch |err| {
+        .metal => try createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled, loading),
+        .auto => createMetalExecution(allocator, model, moon_quant_mode, gpu_layers, startup_profile_enabled, loading) catch |err| {
             if (isRecoverableMetalError(err)) return .{};
             return err;
         },
@@ -351,6 +366,7 @@ fn createMetalExecution(
     moon_quant_mode: types.MoonQuantMode,
     gpu_layers: types.GpuLayers,
     startup_profile_enabled: bool,
+    loading: *terminal.LoadingBar,
 ) !ExecutionResources {
     var dense_tensors = llama_metal.DenseTensorStore.init(allocator);
     errdefer dense_tensors.deinit();
@@ -360,10 +376,13 @@ fn createMetalExecution(
     try dense_tensors.populate(model, gpu_layers, device_info, moon_quant_mode, if (startup_profiler.enabled) &startup_profiler else null);
     const tensor_prepare_ns = types.deltaNs(tensor_prepare_begin, std.time.nanoTimestamp());
 
+    loading.setPhase(2);
     const backend_init_begin = std.time.nanoTimestamp();
     const backend = try metal_backend.create(allocator);
     const backend_init_ns = types.deltaNs(backend_init_begin, std.time.nanoTimestamp());
     errdefer backend.deinit(allocator);
+
+    loading.setPhase(3);
     const metal_prewarm_begin = std.time.nanoTimestamp();
     try dense_tensors.prewarm(backend, if (startup_profiler.enabled) &startup_profiler else null);
     const metal_prewarm_ns = types.deltaNs(metal_prewarm_begin, std.time.nanoTimestamp());

@@ -124,3 +124,49 @@ fn clearLine() void {
     const stderr = std.fs.File.stderr();
     stderr.writeAll("\r                                       \r") catch return;
 }
+
+pub fn drawBenchRunProgress(current_run: usize, total_runs: usize) void {
+    if (!shouldRender()) return;
+
+    const pct = if (total_runs > 0) @as(u32, @intCast((current_run * 100) / total_runs)) else @as(u32, 0);
+    const bar_width = 30;
+    const filled = if (total_runs > 0) (bar_width * current_run) / total_runs else @as(usize, 0);
+
+    var buf: [128]u8 = undefined;
+    var bar: [32]u8 = undefined;
+    var bar_idx: usize = 0;
+    var i: usize = 0;
+    while (i < filled) : (i += 1) {
+        if (bar_idx < bar.len - 1) {
+            bar[bar_idx] = '=';
+            bar_idx += 1;
+        }
+    }
+    if (filled < bar_width and current_run > 0) {
+        if (bar_idx < bar.len - 1) {
+            bar[bar_idx] = '>';
+            bar_idx += 1;
+        }
+    }
+    i = filled + 1;
+    while (i < bar_width) : (i += 1) {
+        if (bar_idx < bar.len - 1) {
+            bar[bar_idx] = ' ';
+            bar_idx += 1;
+        }
+    }
+    if (bar_idx < bar.len) bar[bar_idx] = 0;
+
+    const line = std.fmt.bufPrint(
+        &buf,
+        "\r  [{s}] {d: >3}%  run {d}/{d}",
+        .{ bar[0..bar_idx :0], pct, current_run, total_runs },
+    ) catch return;
+
+    const stderr = std.fs.File.stderr();
+    stderr.writeAll(line) catch return;
+}
+
+pub fn clearProgressLine() void {
+    clearLine();
+}

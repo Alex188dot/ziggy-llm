@@ -1,4 +1,5 @@
 const std = @import("std");
+const terminal = @import("../terminal.zig");
 const llama_fixture = @import("llama_fixture.zig");
 const resident_runtime = @import("resident_runtime.zig");
 const types = @import("types.zig");
@@ -57,7 +58,8 @@ pub fn runWarmBench(
     var warm_startup_breakdown_total = types.StartupBreakdown{};
     var warm_metal_profile_summary: ?[]u8 = null;
 
-    for (1..bench_runs) |_| {
+    for (1..bench_runs) |run_index| {
+        terminal.drawBenchRunProgress(run_index, bench_runs - 1);
         var warm = try runtime.generate(model_path, prompt, options);
         warm_startup_total += warm.startup_ns;
         warm_prompt_total += warm.prompt_ns;
@@ -77,6 +79,8 @@ pub fn runWarmBench(
         }
         warm.deinit(allocator);
     }
+
+    terminal.clearProgressLine();
 
     const warm_runs = bench_runs - 1;
     return .{
