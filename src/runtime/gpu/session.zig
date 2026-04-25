@@ -353,8 +353,7 @@ pub const Session = struct {
         const attn_q = layer.attn_q.?;
         var q_gate: ?metal_backend.BufferHandle = null;
         if (attn_q.rows == self.model.q_projection_size * 2) {
-            try self.runProjection(attn_q, self.normed, self.up);
-            if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.up);
+            try self.runProjectionWithOptionalBias(attn_q, layer.attn_q_bias, self.normed, self.up);
             try metal_backend.splitPackedQ(
                 self.backend,
                 self.up,
@@ -365,8 +364,7 @@ pub const Session = struct {
             );
             q_gate = self.q_gate;
         } else {
-            try self.runProjection(attn_q, self.normed, self.q);
-            if (layer.attn_q_bias) |b| try self.runBiasAdd(b, self.q);
+            try self.runProjectionWithOptionalBias(attn_q, layer.attn_q_bias, self.normed, self.q);
         }
         if (layer.attn_q_norm) |n| try self.runRmsNormPerHead(n, self.q, self.q, self.model.head_count, self.model.key_head_dimension);
 
@@ -383,17 +381,33 @@ pub const Session = struct {
         const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
         const kv_k_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_k.?, self.normed, self.k);
-        if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
-        if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.key_head_dimension);
-        try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.k,
-            self.k_cache,
-            kv_offset_elements,
-            self.model.kv_projection_size,
-        );
+        const k_fused = if (layer.attn_k_norm == null)
+            try self.tryRunProjectionStoreKv(
+                layer.attn_k.?,
+                layer.attn_k_bias,
+                self.normed,
+                self.k_cache,
+                kv_offset_elements,
+                self.model.head_count_kv,
+                self.model.key_head_dimension,
+                self.rotaryDimension(),
+                position,
+                true,
+            )
+        else
+            false;
+        if (!k_fused) {
+            try self.runProjectionWithOptionalBias(layer.attn_k.?, layer.attn_k_bias, self.normed, self.k);
+            if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.key_head_dimension);
+            try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
+            try metal_backend.storeKvHalf(
+                self.backend,
+                self.k,
+                self.k_cache,
+                kv_offset_elements,
+                self.model.kv_projection_size,
+            );
+        }
         self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
             .rows = self.model.head_count_kv,
             .cols = self.rotaryDimension(),
@@ -408,15 +422,28 @@ pub const Session = struct {
         });
 
         const kv_v_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_v.?, self.normed, self.v);
-        if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.v,
+        const v_fused = try self.tryRunProjectionStoreKv(
+            layer.attn_v.?,
+            layer.attn_v_bias,
+            self.normed,
             self.v_cache,
             kv_offset_elements,
-            self.model.kv_projection_size,
+            self.model.head_count_kv,
+            self.model.key_head_dimension,
+            self.rotaryDimension(),
+            position,
+            false,
         );
+        if (!v_fused) {
+            try self.runProjectionWithOptionalBias(layer.attn_v.?, layer.attn_v_bias, self.normed, self.v);
+            try metal_backend.storeKvHalf(
+                self.backend,
+                self.v,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.kv_projection_size,
+            );
+        }
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
             .cols = self.model.kv_projection_size,
@@ -467,8 +494,10 @@ pub const Session = struct {
 
     pub fn runFfnBlock(self: *Session, layer: LayerDesc) !void {
         try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-        try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-        try self.runProjection(layer.ffn_up, self.normed, self.up);
+        if (!try self.tryRunDualProjection(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+            try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+            try self.runProjection(layer.ffn_up, self.normed, self.up);
+        }
 
         const tensor = layer.ffn_down;
         var handled_fused = false;
@@ -576,8 +605,10 @@ pub const Session = struct {
             });
         }
 
-        try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-        try self.runProjection(layer.ffn_up, self.normed, self.up);
+        if (!try self.tryRunDualProjection(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+            try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+            try self.runProjection(layer.ffn_up, self.normed, self.up);
+        }
 
         const shared_act_start = std.time.nanoTimestamp();
         if (self.model.use_gelu_ffn) {
@@ -639,13 +670,51 @@ pub const Session = struct {
             .tensor_type = tensor.tensor_type,
         };
         const output_reduce_start = std.time.nanoTimestamp();
-        try self.runProjection(tensor, self.normed, self.tmp);
-        try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        var use_fused_argmax = false;
+        switch (tensor.tensor_type) {
+            tensor_type_q4_k => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset) == null) {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try self.initFusedArgmaxState();
+                    try metal_backend.runMatVecQ4KArgmaxToBuffer(self.backend, matrix, self.normed, self.sampled_token_packed, tensor.rows, tensor.cols);
+                    use_fused_argmax = true;
+                }
+            },
+            tensor_type_q6_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try self.initFusedArgmaxState();
+                try metal_backend.runMatVecQ6KArgmaxToBuffer(self.backend, matrix, self.normed, self.sampled_token_packed, tensor.rows, tensor.cols);
+                use_fused_argmax = true;
+            },
+            tensor_type_q8_0 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try self.initFusedArgmaxState();
+                try metal_backend.runMatVecQ8_0ArgmaxToBuffer(self.backend, matrix, self.normed, self.sampled_token_packed, tensor.rows, tensor.cols);
+                use_fused_argmax = true;
+            },
+            tensor_type_q3_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try self.initFusedArgmaxState();
+                try metal_backend.runMatVecQ3KArgmaxToBuffer(self.backend, matrix, self.normed, self.sampled_token_packed, tensor.rows, tensor.cols);
+                use_fused_argmax = true;
+            },
+            else => {},
+        }
+        if (!use_fused_argmax) {
+            try self.runProjection(tensor, self.normed, self.tmp);
+            try metal_backend.argmax(self.backend, self.tmp, self.sampled_token, self.model.vocab_size);
+        }
         self.recordCategoryWithShape(.output_reduce, output_reduce_start, shape);
         try self.commitOutputSequence(shape);
         const host_readback_start = std.time.nanoTimestamp();
         var token: [1]u32 = .{0};
-        try self.readBufferU32Committed(self.sampled_token, &token);
+        if (use_fused_argmax) {
+            var packed_state: [2]u32 = .{ 0, 0 };
+            try self.readBufferU32Committed(self.sampled_token_packed, &packed_state);
+            token[0] = packed_state[1];
+        } else {
+            try self.readBufferU32Committed(self.sampled_token, &token);
+        }
         self.recordCategoryWithShape(.host_readback, host_readback_start, shape);
         return token[0];
     }
@@ -752,23 +821,20 @@ pub const Session = struct {
         try metal_backend.readBufferU32(buffer, out);
     }
 
+    fn initFusedArgmaxState(self: *Session) !void {
+        var packed_state: [2]u32 = .{ orderedFloatBits(-std.math.inf(f32)), 0 };
+        try metal_backend.writeBufferU32(self.sampled_token_packed, &packed_state);
+    }
+
     fn applyRoPEBuffer(
         self: *Session,
         buffer: metal_backend.BufferHandle,
-        host_values: []f32,
+        _: []f32,
         head_count: usize,
         head_dim: usize,
         position: usize,
     ) !void {
         const rope_dim = self.rotaryDimension();
-        const value_count = head_count * head_dim;
-        if (self.model.rope_style == 2) {
-            try self.readBufferF32Committed(buffer, host_values[0..value_count]);
-            applyRoPEHost(host_values[0..value_count], head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, self.model.rope_dimension_sections);
-            try metal_backend.writeBufferF32(buffer, host_values[0..value_count]);
-            return;
-        }
-
         try metal_backend.applyRoPE(
             self.backend,
             buffer,
@@ -952,6 +1018,189 @@ pub const Session = struct {
         }
     }
 
+    fn runProjectionWithOptionalBias(
+        self: *Session,
+        tensor: TensorDesc,
+        bias: ?TensorDesc,
+        input: metal_backend.BufferHandle,
+        output: metal_backend.BufferHandle,
+    ) !void {
+        if (bias == null) {
+            try self.runProjection(tensor, input, output);
+            return;
+        }
+
+        const bias_tensor = bias.?;
+        const bias_weights = self.dense_lookup.getDense(bias_tensor.offset) orelse return error.InvalidTensorMetadata;
+        const start = std.time.nanoTimestamp();
+
+        switch (tensor.tensor_type) {
+            tensor_type_f32 => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+            },
+            tensor_type_q3_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+            },
+            tensor_type_q4_k => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset) != null) {
+                    try self.runProjection(tensor, input, output);
+                    try self.runBiasAdd(bias_tensor, output);
+                    return;
+                }
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ4KWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+            },
+            tensor_type_q5_k => {
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+                }
+            },
+            tensor_type_q6_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KWithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+            },
+            tensor_type_q8_0 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0WithBiasToBuffer(self.backend, matrix, input, output, bias_weights, tensor.rows, tensor.cols);
+            },
+            else => {
+                try self.runProjection(tensor, input, output);
+                try self.runBiasAdd(bias_tensor, output);
+                return;
+            },
+        }
+
+        const shape = metal_profile.ShapeDesc{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+        };
+        self.recordCategoryWithShape(.projections, start, shape);
+    }
+
+    fn tryRunDualProjection(
+        self: *Session,
+        tensor_a: TensorDesc,
+        tensor_b: TensorDesc,
+        input: metal_backend.BufferHandle,
+        output_a: metal_backend.BufferHandle,
+        output_b: metal_backend.BufferHandle,
+    ) !bool {
+        if (tensor_a.rows != tensor_b.rows or tensor_a.cols != tensor_b.cols or tensor_a.tensor_type != tensor_b.tensor_type) return false;
+
+        const start = std.time.nanoTimestamp();
+        switch (tensor_a.tensor_type) {
+            tensor_type_f32 => {
+                const matrix_a = self.dense_lookup.getDense(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                const matrix_b = self.dense_lookup.getDense(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runDualMatVecToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+            },
+            tensor_type_q3_k => {
+                const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runDualMatVecQ3KToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+            },
+            tensor_type_q4_k => {
+                if (self.dense_lookup.getMoonQuant(tensor_a.offset) != null or self.dense_lookup.getMoonQuant(tensor_b.offset) != null) return false;
+                const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runDualMatVecQ4KToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+            },
+            tensor_type_q5_k => {
+                if (self.dense_lookup.getRaw(tensor_a.offset)) |matrix_a| {
+                    const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runDualMatVecQ5KToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+                } else {
+                    const matrix_a = self.dense_lookup.getDense(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                    const matrix_b = self.dense_lookup.getDense(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runDualMatVecToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+                }
+            },
+            tensor_type_q6_k => {
+                const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runDualMatVecQ6KToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+            },
+            tensor_type_q8_0 => {
+                const matrix_a = self.dense_lookup.getRaw(tensor_a.offset) orelse return error.InvalidTensorMetadata;
+                const matrix_b = self.dense_lookup.getRaw(tensor_b.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runDualMatVecQ8_0ToBuffers(self.backend, matrix_a, matrix_b, input, output_a, output_b, tensor_a.rows, tensor_a.cols);
+            },
+            else => return false,
+        }
+
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = tensor_a.rows,
+            .cols = tensor_a.cols,
+            .tensor_type = tensor_a.tensor_type,
+            .extra = 2,
+        });
+        return true;
+    }
+
+    fn tryRunProjectionStoreKv(
+        self: *Session,
+        tensor: TensorDesc,
+        bias: ?TensorDesc,
+        input: metal_backend.BufferHandle,
+        dst: metal_backend.BufferHandle,
+        dst_offset_elements: usize,
+        head_count: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        apply_rope: bool,
+    ) !bool {
+        const bias_weights: ?[]const f32 = if (bias) |b| (self.dense_lookup.getDense(b.offset) orelse return error.InvalidTensorMetadata) else null;
+        const start = std.time.nanoTimestamp();
+
+        switch (tensor.tensor_type) {
+            tensor_type_f32 => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+            },
+            tensor_type_q3_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+            },
+            tensor_type_q4_k => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset) != null) return false;
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ4KStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+            },
+            tensor_type_q5_k => {
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+                }
+            },
+            tensor_type_q6_k => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KStoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+            },
+            tensor_type_q8_0 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0StoreKvHalf(self.backend, matrix, input, bias_weights, dst, dst_offset_elements, tensor.rows, tensor.cols, head_count, head_dim, rope_dim, position, self.model.rope_freq_base, self.model.rope_style, apply_rope);
+            },
+            else => return false,
+        }
+
+        self.recordCategoryWithShape(.projections, start, .{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+            .extra = if (apply_rope) 2 else 1,
+        });
+        return true;
+    }
+
     fn runIndexedProjection(
         self: *Session,
         tensor: TensorDesc,
@@ -1056,7 +1305,6 @@ pub const Session = struct {
             .tensor_type = tensor_a.tensor_type,
             .extra = slot_idx,
         };
-        self.recordCategoryWithShape(.projections, start, shape);
         self.recordCategoryWithShape(.projections, start, shape);
     }
 
@@ -1522,6 +1770,11 @@ pub const Session = struct {
         return @intCast(@max(@as(i128, 0), std.time.nanoTimestamp() - start_ns));
     }
 
+    fn orderedFloatBits(value: f32) u32 {
+        const bits: u32 = @bitCast(value);
+        return if ((bits & 0x8000_0000) != 0) ~bits else (bits | 0x8000_0000);
+    }
+
     pub fn runBatchSpeculativeDecode(
         self: *Session,
         layers: []const LayerDesc,
@@ -1550,31 +1803,35 @@ pub const Session = struct {
 
             for (layers, 0..) |layer, layer_index| {
                 try self.runRmsNorm(layer.attn_norm, self.hidden, self.normed);
-                try self.runProjection(layer.attn_q, self.normed, self.q);
+                try self.runProjection(layer.attn_q.?, self.normed, self.q);
 
                 try self.applyRoPEBuffer(self.q, self.host_q_values, self.model.head_count, self.model.key_head_dimension, position);
 
                 const layer_base = layer_index * self.model.context_length * self.model.kv_projection_size;
                 const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
-                try self.runProjection(layer.attn_k, self.normed, self.k);
-                try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.k,
-                    self.k_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
+                if (!try self.tryRunProjectionStoreKv(layer.attn_k.?, null, self.normed, self.k_cache, kv_offset_elements, self.model.head_count_kv, self.model.key_head_dimension, self.rotaryDimension(), position, true)) {
+                    try self.runProjection(layer.attn_k.?, self.normed, self.k);
+                    try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
+                    try metal_backend.storeKvHalf(
+                        self.backend,
+                        self.k,
+                        self.k_cache,
+                        kv_offset_elements,
+                        self.model.kv_projection_size,
+                    );
+                }
 
-                try self.runProjection(layer.attn_v, self.normed, self.v);
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.v,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
+                if (!try self.tryRunProjectionStoreKv(layer.attn_v.?, null, self.normed, self.v_cache, kv_offset_elements, self.model.head_count_kv, self.model.key_head_dimension, self.rotaryDimension(), position, false)) {
+                    try self.runProjection(layer.attn_v.?, self.normed, self.v);
+                    try metal_backend.storeKvHalf(
+                        self.backend,
+                        self.v,
+                        self.v_cache,
+                        kv_offset_elements,
+                        self.model.kv_projection_size,
+                    );
+                }
 
                 try metal_backend.attentionFused(
                     self.backend,
@@ -1594,13 +1851,15 @@ pub const Session = struct {
                     self.model.attn_logit_softcapping,
                 );
 
-                try self.runProjectionAdd(layer.attn_output, self.attn, self.hidden);
+                try self.runProjectionAdd(layer.attn_output.?, self.attn, self.hidden);
             }
 
             for (layers) |layer| {
                 try self.runRmsNorm(layer.ffn_norm, self.hidden, self.normed);
-                try self.runProjection(layer.ffn_gate, self.normed, self.gate);
-                try self.runProjection(layer.ffn_up, self.normed, self.up);
+                if (!try self.tryRunDualProjection(layer.ffn_gate, layer.ffn_up, self.normed, self.gate, self.up)) {
+                    try self.runProjection(layer.ffn_gate, self.normed, self.gate);
+                    try self.runProjection(layer.ffn_up, self.normed, self.up);
+                }
                 if (self.model.use_gelu_ffn) {
                     try metal_backend.geluMul(self.backend, self.gate, self.up, self.model.feed_forward_length);
                 } else {

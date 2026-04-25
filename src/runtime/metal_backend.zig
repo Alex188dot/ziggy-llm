@@ -359,6 +359,250 @@ pub fn commitSequenceTimed(backend: backend_api.MatVecBackend) !CommitStats {
     };
 }
 
+fn maybeBiasBuffer(state: *State, bias_weights: ?[]const f32, count: usize) !?BufferHandle {
+    if (bias_weights) |weights| {
+        if (weights.len < count) return error.InvalidTensorMetadata;
+        return try state.matrixBuffer(weights[0..count]);
+    }
+    return null;
+}
+
+fn runDenseMatVecWithBiasCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (matrix.len < rows * cols or input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
+    const bias_buffer = try maybeBiasBuffer(state, bias_weights, rows);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        if (bias_buffer) |buffer| buffer.raw else null,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runRawMatVecWithBiasCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    const bias_buffer = try maybeBiasBuffer(state, bias_weights, rows);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output.raw,
+        if (bias_buffer) |buffer| buffer.raw else null,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runDenseDualMatVecCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix_a: []const f32,
+    matrix_b: []const f32,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (matrix_a.len < rows * cols or matrix_b.len < rows * cols or input.byte_len < cols * @sizeOf(f32) or output_a.byte_len < rows * @sizeOf(f32) or output_b.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_a_buffer = try state.matrixBuffer(matrix_a[0 .. rows * cols]);
+    const matrix_b_buffer = try state.matrixBuffer(matrix_b[0 .. rows * cols]);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_a_buffer.raw,
+        matrix_b_buffer.raw,
+        input.raw,
+        output_a.raw,
+        output_b.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runRawDualMatVecCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output_a.byte_len < rows * @sizeOf(f32) or output_b.byte_len < rows * @sizeOf(f32)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_a_buffer = try state.rawBuffer(matrix_a_bytes);
+    const matrix_b_buffer = try state.rawBuffer(matrix_b_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_a_buffer.raw,
+        matrix_b_buffer.raw,
+        input.raw,
+        output_a.raw,
+        output_b.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runDenseMatVecStoreKvHalfCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (matrix.len < rows * cols or input.byte_len < cols * @sizeOf(f32) or dst.byte_len < (dst_offset_elements + rows) * @sizeOf(f16)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.matrixBuffer(matrix[0 .. rows * cols]);
+    const bias_buffer = try maybeBiasBuffer(state, bias_weights, rows);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        if (bias_buffer) |buffer| buffer.raw else null,
+        dst.raw,
+        dst_offset_elements,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        rope_style,
+        if (apply_rope) @as(u32, 1) else 0,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runRawMatVecStoreKvHalfCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or dst.byte_len < (dst_offset_elements + rows) * @sizeOf(f16)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    const bias_buffer = try maybeBiasBuffer(state, bias_weights, rows);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        if (bias_buffer) |buffer| buffer.raw else null,
+        dst.raw,
+        dst_offset_elements,
+        @intCast(rows),
+        @intCast(cols),
+        @intCast(head_count),
+        @intCast(head_dim),
+        @intCast(rope_dim),
+        @intCast(position),
+        freq_base,
+        rope_style,
+        if (apply_rope) @as(u32, 1) else 0,
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
+fn runRawMatVecArgmaxCommon(
+    comptime runner: anytype,
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (!build_enabled_value) return error.MetalDisabled;
+    if (input.byte_len < cols * @sizeOf(f32) or output_packed.byte_len < @sizeOf(u64)) return error.MetalBufferError;
+    const state = stateFromCtx(backend.ctx);
+    const matrix_buffer = try state.rawBuffer(matrix_bytes);
+    var error_buf: [err_buf_len]u8 = std.mem.zeroes([err_buf_len]u8);
+    try mapStatus(runner(
+        state.context,
+        matrix_buffer.raw,
+        input.raw,
+        output_packed.raw,
+        @intCast(rows),
+        @intCast(cols),
+        &error_buf,
+        error_buf.len,
+    ), &error_buf);
+}
+
 pub fn runMatVecToBuffer(
     backend: backend_api.MatVecBackend,
     matrix: []const f32,
@@ -434,6 +678,393 @@ pub fn runMatVecAddToBuffer(
         &error_buf,
         error_buf.len,
     ), &error_buf);
+}
+
+pub fn runMatVecWithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runDenseMatVecWithBiasCommon(c.ziggy_metal_run_matvec_bias_f32, backend, matrix, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a: []const f32,
+    matrix_b: []const f32,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runDenseDualMatVecCommon(c.ziggy_metal_run_dual_matvec_f32, backend, matrix_a, matrix_b, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecStoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix: []const f32,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runDenseMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_store_kv_half_f32, backend, matrix, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ4KWithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecWithBiasCommon(c.ziggy_metal_run_matvec_q4k_bias_f32, backend, matrix_bytes, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecQ4KToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawDualMatVecCommon(c.ziggy_metal_run_dual_matvec_q4k_f32, backend, matrix_a_bytes, matrix_b_bytes, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ4KStoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_q4k_store_kv_half_f32, backend, matrix_bytes, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ4KArgmaxToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecArgmaxCommon(c.ziggy_metal_run_matvec_q4k_argmax_f32, backend, matrix_bytes, input, output_packed, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ5KWithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecWithBiasCommon(c.ziggy_metal_run_matvec_q5k_bias_f32, backend, matrix_bytes, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecQ5KToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawDualMatVecCommon(c.ziggy_metal_run_dual_matvec_q5k_f32, backend, matrix_a_bytes, matrix_b_bytes, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ5KStoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_q5k_store_kv_half_f32, backend, matrix_bytes, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ6KWithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecWithBiasCommon(c.ziggy_metal_run_matvec_q6k_bias_f32, backend, matrix_bytes, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecQ6KToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawDualMatVecCommon(c.ziggy_metal_run_dual_matvec_q6k_f32, backend, matrix_a_bytes, matrix_b_bytes, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ6KStoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_q6k_store_kv_half_f32, backend, matrix_bytes, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ8_0WithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecWithBiasCommon(c.ziggy_metal_run_matvec_q8_0_bias_f32, backend, matrix_bytes, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecQ8_0ToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawDualMatVecCommon(c.ziggy_metal_run_dual_matvec_q8_0_f32, backend, matrix_a_bytes, matrix_b_bytes, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ8_0StoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_q8_0_store_kv_half_f32, backend, matrix_bytes, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ8_0ArgmaxToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecArgmaxCommon(c.ziggy_metal_run_matvec_q8_0_argmax_f32, backend, matrix_bytes, input, output_packed, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ3KWithBiasToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output: BufferHandle,
+    bias_weights: ?[]const f32,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecWithBiasCommon(c.ziggy_metal_run_matvec_q3k_bias_f32, backend, matrix_bytes, input, output, bias_weights, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runDualMatVecQ3KToBuffers(
+    backend: backend_api.MatVecBackend,
+    matrix_a_bytes: []const u8,
+    matrix_b_bytes: []const u8,
+    input: BufferHandle,
+    output_a: BufferHandle,
+    output_b: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawDualMatVecCommon(c.ziggy_metal_run_dual_matvec_q3k_f32, backend, matrix_a_bytes, matrix_b_bytes, input, output_a, output_b, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ3KStoreKvHalf(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    bias_weights: ?[]const f32,
+    dst: BufferHandle,
+    dst_offset_elements: usize,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    position: usize,
+    freq_base: f32,
+    rope_style: u32,
+    apply_rope: bool,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecStoreKvHalfCommon(c.ziggy_metal_run_matvec_q3k_store_kv_half_f32, backend, matrix_bytes, input, bias_weights, dst, dst_offset_elements, rows, cols, head_count, head_dim, rope_dim, position, freq_base, rope_style, apply_rope);
+        return;
+    }
+    return error.MetalDisabled;
+}
+
+pub fn runMatVecQ3KArgmaxToBuffer(
+    backend: backend_api.MatVecBackend,
+    matrix_bytes: []const u8,
+    input: BufferHandle,
+    output_packed: BufferHandle,
+    rows: usize,
+    cols: usize,
+) !void {
+    if (build_enabled_value) {
+        try runRawMatVecArgmaxCommon(c.ziggy_metal_run_matvec_q3k_argmax_f32, backend, matrix_bytes, input, output_packed, rows, cols);
+        return;
+    }
+    return error.MetalDisabled;
 }
 
 pub fn runMatVecQ4KToBuffer(
