@@ -86,7 +86,7 @@ const negative_infinity = -std.math.inf(f32);
 const simd_lane_count: usize = 8;
 const parallel_matvec_min_rows: usize = 2048;
 const parallel_matvec_min_work: usize = 4_000_000;
-const max_matvec_helper_threads: usize = 3;
+const max_matvec_helper_threads: usize = 11;
 pub const LayerType = enum {
     full_attention,
     linear_attention,
@@ -1217,17 +1217,22 @@ const Session = struct {
         for (self.model.layers, 0..) |layer, layer_index| {
             const is_linear_attn = layer.linear_attn != null;
             const gpu_layer_desc = adaptLayerDesc(layer);
-            const use_gpu_layer = if (self.gpu_session) |*gpu_session| blk: {
-                if (!gpu_session.canRunAttentionBlock(gpu_layer_desc)) break :blk false;
-                if (layer.moe != null and !gpu_session.canRunMoeFfnBlock(gpu_layer_desc)) break :blk false;
-                break :blk true;
-            } else false;
+            const gpu_attn_ok = if (self.gpu_session) |*gpu_session|
+                gpu_session.canRunAttentionBlock(gpu_layer_desc)
+            else
+                false;
+            const gpu_moe_ffn_ok = gpu_attn_ok and layer.moe != null and
+                (if (self.gpu_session) |*gpu_session| gpu_session.canRunMoeFfnBlock(gpu_layer_desc) else false);
+            const use_gpu_layer = if (self.gpu_session != null)
+                gpu_attn_ok and (layer.moe == null or gpu_moe_ffn_ok)
+            else
+                false;
 
-            if (!use_gpu_layer) {
+            if (!use_gpu_layer and !gpu_attn_ok) {
                 try self.syncGpuHiddenForCpu();
             }
 
-            if (use_gpu_layer) {
+            if (use_gpu_layer or gpu_attn_ok) {
                 const gpu_session = &self.gpu_session.?;
                 if (!self.gpu_hidden_is_current) try gpu_session.beginToken(self.hidden);
                 try gpu_session.runAttentionBlock(gpu_layer_desc, layer_index, self.position);
@@ -1247,6 +1252,11 @@ const Session = struct {
                 } else {
                     try gpu_session.runFfnBlock(gpu_layer_desc);
                 }
+                self.gpu_hidden_is_current = true;
+            } else if (gpu_attn_ok and layer.moe != null) {
+                const gpu_session = &self.gpu_session.?;
+                const moe = layer.moe.?;
+                try self.runMoeFfnHybrid(gpu_session, layer, moe);
                 self.gpu_hidden_is_current = true;
             } else {
                 addInPlace(self.hidden, self.attn_tmp);
@@ -2063,9 +2073,6 @@ pub fn generateLoadedStreaming(
     stream_callback: ?StreamCallback,
 ) !GenerateReport {
     const startup_begin = std.time.nanoTimestamp();
-    var spinner = terminal.Spinner{};
-    try spinner.start();
-    errdefer spinner.stop();
     var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
@@ -2087,7 +2094,6 @@ pub fn generateLoadedStreaming(
     const session_init_ns = deltaNs(session_init_begin, std.time.nanoTimestamp());
     defer session.deinit(allocator);
     const startup_end = std.time.nanoTimestamp();
-    spinner.stop();
     const backend_used: runtime_types.BackendUsed = if (backend == null) .cpu else .metal;
     const sampling_path = chooseSamplingPath(session.gpu_session != null, options);
     const shortlist_len = sampling.shortlistLenFor(options, session.logits.len);
@@ -2284,15 +2290,11 @@ pub fn generateLoadedStreamingCached(
     stream_callback: ?StreamCallback,
 ) !GenerateReport {
     const startup_begin = std.time.nanoTimestamp();
-    var spinner = terminal.Spinner{};
-    try spinner.start();
-    errdefer spinner.stop();
     var profiler = metal_profile.Profiler.init(allocator, backend != null and backend.?.label == .metal and options.metal_profile);
     defer profiler.deinit();
     var prng = std.Random.DefaultPrng.init(options.seed);
     const random = prng.random();
     const startup_end = std.time.nanoTimestamp();
-    spinner.stop();
     const context_length = effectiveContextLength(model, options);
 
     const prompt_tokens = try allocator.alloc(u32, context_length);

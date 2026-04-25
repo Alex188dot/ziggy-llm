@@ -2,12 +2,14 @@
 
 ![ziggy-llm logo](assets/ziggy-llm-logo.png)
 
-Welcome to **ziggy-llm**, a Zig-native GGUF inference engine built specifically for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
+Welcome to **ziggy-llm**, a Zig-native GGUF inference engine built from absolute scratch for Apple Silicon. If you're looking for an impossibly fast, understandable and deliberately narrow local AI runner, you're in the right place. 🚀
+
+Built from the ground up with **zero external dependencies**, every line of quantization kernels, Metal GPU shaders, GGUF parser, and inference runtime is written in Zig. This isn't a port or a wrapper around llama.cpp or any other inference engine. It's a clean-sheet implementation purpose-built for Apple Silicon performance.
 
 We don't try to do everything for everyone; instead, we do one thing exceptionally well. By focusing exclusively on Apple Metal and GGUF files, we deliver a single-binary, highly optimized CLI experience 💎
 
-- Apple Silicon first
-- Metal first
+- 100% custom, built from scratch, zero borrowed code
+- Apple Silicon and Metal first
 - GGUF only
 - Single binary
 - CLI first
@@ -21,15 +23,15 @@ We benchmark honestly and optimize ruthlessly for single-user, local text genera
 
 | Model              | GGUF   | ziggy-llm (Metal) | ZINC (Metal) | llama.cpp (Metal) |
 | ------------------ | ------ | ----------------- | ------------ | ----------------- |
-| **TinyLlama 1.1B** | Q4_K_M | ~123 tok/s        | —            | 151.4 tok/s       |
-| **Llama 3.2 3B**   | Q4_K_M | ~48 tok/s         | —            | 53.5 tok/s        |
-| **Llama 3.1 8B**   | Q4_K_M | ~22.4 tok/s       | ~10 tok/s    | 23.1 tok/s        |
-| **Mistral 7B**     | Q4_K_M | ~20 tok/s         | —            | 28.0 tok/s        |
-| **Ministral 3B**   | Q4_K_M | ~45.5 tok/s       | —            | 43.7 tok/s        |
-| **Gemma 2 2B**     | Q4_K_M | ~48 tok/s         | —            | —                 |
-| **Qwen3 1.7B**     | Q4_K_M | ~76 tok/s         | —            | 92.0 tok/s        |
-| **Qwen3.8B**       | Q4_K_M | ~17.5 tok/s       | ~8 tok/s     | 25.0 tok/s        |
-| **Qwen3.5 2B**     | Q4_K_M | ~49.3 tok/s       | —            | 62.4 tok/s        |
+| **TinyLlama 1.1B** | Q4_K_M | ~135.5 tok/s      | —            | 151.4 tok/s       |
+| **Llama 3.2 3B**   | Q4_K_M | ~45.2 tok/s       | —            | 53.5 tok/s        |
+| **Llama 3.1 8B**   | Q4_K_M | ~20.6 tok/s       | ~10 tok/s    | 23.1 tok/s        |
+| **Mistral 7B**     | Q4_K_M | ~20.9 tok/s       | —            | 28.0 tok/s        |
+| **Ministral 3B**   | Q4_K_M | ~41.8 tok/s       | —            | 43.7 tok/s        |
+| **Gemma 2 2B**     | Q4_K_M | ~50 tok/s         | —            | 63.5 tok/s        |
+| **Qwen3 1.7B**     | Q4_K_M | ~78.7 tok/s       | —            | 92.0 tok/s        |
+| **Qwen3.8B**       | Q4_K_M | ~19.7 tok/s       | ~8 tok/s     | 25.0 tok/s        |
+| **Qwen3.5 2B**     | Q4_K_M | ~43.7 tok/s       | —            | 62.4 tok/s        |
 
 Note: ZINC's supported models are limited to the models listed in their documentation and the hardware they tested on (M1 Max 32 GB).
 

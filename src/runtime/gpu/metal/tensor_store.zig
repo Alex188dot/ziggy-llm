@@ -60,12 +60,19 @@ pub const DenseTensorStore = struct {
             if (layer.attn_v_bias) |b| try self.addTensor(model, b, moon_quant_mode, profiler);
             if (layer.attn_output) |o| try self.addTensor(model, o, moon_quant_mode, profiler);
             if (layer.post_attention_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
-            if (layer.moe == null or policy.offloadsMoeFfn(layer.moe != null)) {
+            if (layer.moe == null or policy.offloadsMoeFfn(layer.moe != null, layer_index)) {
                 try self.addTensor(model, layer.ffn_norm, moon_quant_mode, profiler);
                 try self.addTensor(model, layer.ffn_gate, moon_quant_mode, profiler);
                 try self.addTensor(model, layer.ffn_down, moon_quant_mode, profiler);
                 try self.addTensor(model, layer.ffn_up, moon_quant_mode, profiler);
                 if (layer.post_ffw_norm) |n| try self.addTensor(model, n, moon_quant_mode, profiler);
+                if (layer.moe) |moe| {
+                    try self.addTensor(model, moe.router, moon_quant_mode, profiler);
+                    try self.addTensor(model, moe.gate_exps, moon_quant_mode, profiler);
+                    try self.addTensor(model, moe.up_exps, moon_quant_mode, profiler);
+                    try self.addTensor(model, moe.down_exps, moon_quant_mode, profiler);
+                    if (moe.shared_router_gate) |gate| try self.addTensor(model, gate, moon_quant_mode, profiler);
+                }
             }
             if (layer.linear_attn) |la| {
                 try self.addTensor(model, la.in_proj_qkv, moon_quant_mode, profiler);
