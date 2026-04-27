@@ -38,7 +38,25 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KAdd5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> ropePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> ropeToDstPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> ropeStoreToCachePipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> storeKvHalfPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecStoreKv2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecStoreKv5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KStoreKv2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ4KStoreKv5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ5KStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ5KStoreKv2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ5KStoreKv5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KStoreKv2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ6KStoreKv5632Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ80StoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecQ3KStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KStoreKvPipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KStoreKv2048Pipeline;
+@property(nonatomic, strong) id<MTLComputePipelineState> matvecMoonQ4KStoreKv5632Pipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> attentionFusedPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> siluMulPipeline;
 @property(nonatomic, strong) id<MTLComputePipelineState> geluMulPipeline;
@@ -273,6 +291,51 @@ static id<MTLComputePipelineState> ziggy_select_q5k_add_pipeline(
 ) {
     (void)cols;
     return state.matvecQ5KAddPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_dense_store_kv_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecStoreKv2048Pipeline;
+    if (cols == 5632) return state.matvecStoreKv5632Pipeline;
+    return state.matvecStoreKvPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_q4k_store_kv_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecQ4KStoreKv2048Pipeline;
+    if (cols == 5632) return state.matvecQ4KStoreKv5632Pipeline;
+    return state.matvecQ4KStoreKvPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_q5k_store_kv_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecQ5KStoreKv2048Pipeline;
+    if (cols == 5632) return state.matvecQ5KStoreKv5632Pipeline;
+    return state.matvecQ5KStoreKvPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_q6k_store_kv_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecQ6KStoreKv2048Pipeline;
+    if (cols == 5632) return state.matvecQ6KStoreKv5632Pipeline;
+    return state.matvecQ6KStoreKvPipeline;
+}
+
+static id<MTLComputePipelineState> ziggy_select_moonq_q4k_store_kv_pipeline(
+    ZiggyMetalState *state,
+    uint32_t cols
+) {
+    if (cols == 2048) return state.matvecMoonQ4KStoreKv2048Pipeline;
+    if (cols == 5632) return state.matvecMoonQ4KStoreKv5632Pipeline;
+    return state.matvecMoonQ4KStoreKvPipeline;
 }
 
 static NSUInteger ziggy_rowwise_thread_count(id<MTLComputePipelineState> pipeline) {
@@ -704,6 +767,63 @@ int ziggy_metal_create_context(
             return ZIGGY_METAL_INITIALIZATION_FAILED;
         }
 
+        id<MTLComputePipelineState> rope_store_to_cache_pipeline = ziggy_pipeline(device, library, @"apply_rope_and_store_to_cache_f32", &pipeline_error);
+        if (rope_store_to_cache_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal rope-store-to-cache pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> matvec_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_store_kv_f32", &pipeline_error);
+        if (matvec_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal matvec store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_store_kv_2048_pipeline = ziggy_pipeline(device, library, @"matvec_store_kv_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_store_kv_5632_pipeline = ziggy_pipeline(device, library, @"matvec_store_kv_5632_f32", &pipeline_error);
+
+        id<MTLComputePipelineState> matvec_q4k_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_store_kv_f32", &pipeline_error);
+        if (matvec_q4k_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q4k store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_q4k_store_kv_2048_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_store_kv_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_q4k_store_kv_5632_pipeline = ziggy_pipeline(device, library, @"matvec_q4k_store_kv_5632_f32", &pipeline_error);
+
+        id<MTLComputePipelineState> matvec_q5k_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_q5k_store_kv_f32", &pipeline_error);
+        if (matvec_q5k_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q5k store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_q5k_store_kv_2048_pipeline = ziggy_pipeline(device, library, @"matvec_q5k_store_kv_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_q5k_store_kv_5632_pipeline = ziggy_pipeline(device, library, @"matvec_q5k_store_kv_5632_f32", &pipeline_error);
+
+        id<MTLComputePipelineState> matvec_q6k_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_store_kv_f32", &pipeline_error);
+        if (matvec_q6k_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q6k store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_q6k_store_kv_2048_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_store_kv_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_q6k_store_kv_5632_pipeline = ziggy_pipeline(device, library, @"matvec_q6k_store_kv_5632_f32", &pipeline_error);
+
+        id<MTLComputePipelineState> matvec_q80_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_q8_0_store_kv_f32", &pipeline_error);
+        if (matvec_q80_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q8_0 store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_q3k_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_q3k_store_kv_f32", &pipeline_error);
+        if (matvec_q3k_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal q3k store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+
+        id<MTLComputePipelineState> matvec_moon_q4k_store_kv_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_store_kv_f32", &pipeline_error);
+        if (matvec_moon_q4k_store_kv_pipeline == nil) {
+            ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal moonq q4k store kv pipeline");
+            return ZIGGY_METAL_INITIALIZATION_FAILED;
+        }
+        id<MTLComputePipelineState> matvec_moon_q4k_store_kv_2048_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_store_kv_2048_f32", &pipeline_error);
+        id<MTLComputePipelineState> matvec_moon_q4k_store_kv_5632_pipeline = ziggy_pipeline(device, library, @"matvec_moonq_q4k_store_kv_5632_f32", &pipeline_error);
+
         id<MTLComputePipelineState> attention_fused_pipeline = ziggy_pipeline(device, library, @"attention_fused_f32", &pipeline_error);
         if (attention_fused_pipeline == nil) {
             ziggy_write_error(error_message, error_message_len, pipeline_error.localizedDescription ?: @"failed to create Metal fused-attention pipeline");
@@ -894,7 +1014,25 @@ int ziggy_metal_create_context(
         state.matvecMoonQ4KSiluDownAdd5632Pipeline = matvec_moon_q4k_silu_down_add_5632_pipeline;
         state.ropePipeline = rope_pipeline;
         state.ropeToDstPipeline = rope_to_dst_pipeline;
+        state.ropeStoreToCachePipeline = rope_store_to_cache_pipeline;
         state.storeKvHalfPipeline = store_kv_half_pipeline;
+        state.matvecStoreKvPipeline = matvec_store_kv_pipeline;
+        state.matvecStoreKv2048Pipeline = matvec_store_kv_2048_pipeline;
+        state.matvecStoreKv5632Pipeline = matvec_store_kv_5632_pipeline;
+        state.matvecQ4KStoreKvPipeline = matvec_q4k_store_kv_pipeline;
+        state.matvecQ4KStoreKv2048Pipeline = matvec_q4k_store_kv_2048_pipeline;
+        state.matvecQ4KStoreKv5632Pipeline = matvec_q4k_store_kv_5632_pipeline;
+        state.matvecQ5KStoreKvPipeline = matvec_q5k_store_kv_pipeline;
+        state.matvecQ5KStoreKv2048Pipeline = matvec_q5k_store_kv_2048_pipeline;
+        state.matvecQ5KStoreKv5632Pipeline = matvec_q5k_store_kv_5632_pipeline;
+        state.matvecQ6KStoreKvPipeline = matvec_q6k_store_kv_pipeline;
+        state.matvecQ6KStoreKv2048Pipeline = matvec_q6k_store_kv_2048_pipeline;
+        state.matvecQ6KStoreKv5632Pipeline = matvec_q6k_store_kv_5632_pipeline;
+        state.matvecQ80StoreKvPipeline = matvec_q80_store_kv_pipeline;
+        state.matvecQ3KStoreKvPipeline = matvec_q3k_store_kv_pipeline;
+        state.matvecMoonQ4KStoreKvPipeline = matvec_moon_q4k_store_kv_pipeline;
+        state.matvecMoonQ4KStoreKv2048Pipeline = matvec_moon_q4k_store_kv_2048_pipeline;
+        state.matvecMoonQ4KStoreKv5632Pipeline = matvec_moon_q4k_store_kv_5632_pipeline;
         state.attentionFusedPipeline = attention_fused_pipeline;
         state.siluMulPipeline = silu_mul_pipeline;
         state.geluMulPipeline = gelu_mul_pipeline;
@@ -2417,6 +2555,458 @@ int ziggy_metal_store_kv_half(
             error_message,
             error_message_len
         );
+    }
+}
+
+int ziggy_metal_apply_rope_and_store_to_cache_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *src,
+    ZiggyMetalBuffer *dst,
+    size_t dst_offset_bytes,
+    uint32_t head_count,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t position,
+    float freq_base,
+    uint32_t rope_style,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || src == NULL || dst == NULL || head_count == 0 || head_dim == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal rope-store-to-cache request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    const uint32_t pair_count = (rope_dim < head_dim ? rope_dim : head_dim) / 2;
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *src_buffer = ziggy_const_buffer(src);
+        ZiggyMetalBufferState *dst_buffer = ziggy_buffer(dst);
+        const size_t element_count = (size_t)head_count * (size_t)head_dim;
+        const size_t byte_count = element_count * sizeof(float);
+        if (byte_count == 0 || src_buffer.length < byte_count ||
+            dst_offset_bytes + element_count * 2 > dst_buffer.length) {
+            ziggy_write_error(error_message, error_message_len, @"Metal rope-store-to-cache exceeded allocation");
+            return ZIGGY_METAL_BUFFER_FAILED;
+        }
+
+        const uint32_t dst_offset = (uint32_t)(dst_offset_bytes / 2);
+        return ziggy_run_compute(
+            state,
+            state.ropeStoreToCachePipeline,
+            element_count,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:src_buffer.buffer offset:0 atIndex:0];
+                [encoder setBuffer:dst_buffer.buffer offset:0 atIndex:1];
+                [encoder setBytes:&dst_offset length:sizeof(dst_offset) atIndex:2];
+                [encoder setBytes:&head_count length:sizeof(head_count) atIndex:3];
+                [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+                [encoder setBytes:&pair_count length:sizeof(pair_count) atIndex:5];
+                [encoder setBytes:&position length:sizeof(position) atIndex:6];
+                [encoder setBytes:&freq_base length:sizeof(freq_base) atIndex:7];
+                [encoder setBytes:&rope_style length:sizeof(rope_style) atIndex:8];
+            },
+            error_message,
+            error_message_len
+        );
+    }
+}
+
+int ziggy_metal_run_matvec_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_dense_store_kv_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_rowwise(encoder, pipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q4k_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q4k matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_q4k_store_kv_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q4k matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q5k_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q5k matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_q5k_store_kv_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q5k matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q6k_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q6k matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_q6k_store_kv_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_q4k_rows(encoder, pipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q6k matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q8_0_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q8_0 matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecQ80StoreKvPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_q4k_rows(encoder, state.matvecQ80StoreKvPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q8_0 matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_q3k_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal q3k matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        [encoder setComputePipelineState:state.matvecQ3KStoreKvPipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_q4k_rows(encoder, state.matvecQ3KStoreKvPipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal q3k matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
+    }
+}
+
+int ziggy_metal_run_matvec_moonq_q4k_store_kv_f32(
+    ZiggyMetalContext *ctx,
+    const ZiggyMetalBuffer *matrix,
+    const ZiggyMetalBuffer *input,
+    ZiggyMetalBuffer *cache,
+    size_t cache_offset_elements,
+    uint32_t rows,
+    uint32_t cols,
+    char *error_message,
+    size_t error_message_len
+) {
+    if (ctx == NULL || matrix == NULL || input == NULL || cache == NULL || rows == 0 || cols == 0) {
+        ziggy_write_error(error_message, error_message_len, @"invalid Metal moonq q4k matvec store kv request");
+        return ZIGGY_METAL_EXECUTION_FAILED;
+    }
+
+    @autoreleasepool {
+        ZiggyMetalState *state = ziggy_state(ctx);
+        const ZiggyMetalBufferState *matrix_buffer = ziggy_const_buffer(matrix);
+        const ZiggyMetalBufferState *input_buffer = ziggy_const_buffer(input);
+        ZiggyMetalBufferState *cache_buffer = ziggy_buffer(cache);
+        id<MTLCommandBuffer> command_buffer = state.pendingCommandBuffer;
+        const bool has_pending = command_buffer != nil;
+        if (command_buffer == nil) command_buffer = ziggy_new_command_buffer(state.queue, error_message, error_message_len);
+        if (command_buffer == nil) return ZIGGY_METAL_EXECUTION_FAILED;
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            ziggy_write_error(error_message, error_message_len, @"failed to create Metal compute encoder");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = ziggy_select_moonq_q4k_store_kv_pipeline(state, cols);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:matrix_buffer.buffer offset:0 atIndex:0];
+        [encoder setBuffer:input_buffer.buffer offset:0 atIndex:1];
+        [encoder setBuffer:cache_buffer.buffer offset:0 atIndex:2];
+        [encoder setBytes:&rows length:sizeof(rows) atIndex:3];
+        [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        uint32_t cache_offset = (uint32_t)cache_offset_elements;
+        [encoder setBytes:&cache_offset length:sizeof(cache_offset) atIndex:5];
+        ziggy_dispatch_moonq_q4k_rows(encoder, pipeline, rows);
+        [encoder endEncoding];
+
+        if (has_pending) return ZIGGY_METAL_OK;
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            ziggy_write_error(error_message, error_message_len, command_buffer.error.localizedDescription ?: @"Metal moonq q4k matvec store kv command failed");
+            return ZIGGY_METAL_EXECUTION_FAILED;
+        }
+        return ZIGGY_METAL_OK;
     }
 }
 

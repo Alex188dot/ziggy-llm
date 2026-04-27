@@ -386,20 +386,7 @@ pub const Session = struct {
         try self.runProjection(layer.attn_k.?, self.normed, self.k);
         if (layer.attn_k_bias) |b| try self.runBiasAdd(b, self.k);
         if (layer.attn_k_norm) |n| try self.runRmsNormPerHead(n, self.k, self.k, self.model.head_count_kv, self.model.key_head_dimension);
-        try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.k,
-            self.k_cache,
-            kv_offset_elements,
-            self.model.kv_projection_size,
-        );
-        self.recordCategoryWithShape(.elementwise_ops, kv_k_start, .{
-            .rows = self.model.head_count_kv,
-            .cols = self.rotaryDimension(),
-            .depth = self.rotaryDimension(),
-            .extra = position + 1,
-        });
+        try self.applyRoPEAndStoreToCache(self.k, self.k_cache, kv_offset_elements, self.model.head_count_kv, self.model.key_head_dimension, position);
         self.recordCategoryWithShape(.kv_writes, kv_k_start, .{
             .rows = 1,
             .cols = self.model.kv_projection_size,
@@ -408,15 +395,19 @@ pub const Session = struct {
         });
 
         const kv_v_start = std.time.nanoTimestamp();
-        try self.runProjection(layer.attn_v.?, self.normed, self.v);
-        if (layer.attn_v_bias) |b| try self.runBiasAdd(b, self.v);
-        try metal_backend.storeKvHalf(
-            self.backend,
-            self.v,
-            self.v_cache,
-            kv_offset_elements,
-            self.model.kv_projection_size,
-        );
+        if (layer.attn_v_bias) |b| {
+            try self.runProjection(layer.attn_v.?, self.normed, self.v);
+            try self.runBiasAdd(b, self.v);
+            try metal_backend.storeKvHalf(
+                self.backend,
+                self.v,
+                self.v_cache,
+                kv_offset_elements,
+                self.model.kv_projection_size,
+            );
+        } else {
+            try self.runProjectionStoreKv(layer.attn_v.?, self.normed, self.v_cache, kv_offset_elements);
+        }
         self.recordCategoryWithShape(.kv_writes, kv_v_start, .{
             .rows = 1,
             .cols = self.model.kv_projection_size,
@@ -781,6 +772,41 @@ pub const Session = struct {
         );
     }
 
+    fn applyRoPEAndStoreToCache(
+        self: *Session,
+        src: metal_backend.BufferHandle,
+        cache: metal_backend.BufferHandle,
+        kv_offset_elements: usize,
+        head_count: usize,
+        head_dim: usize,
+        position: usize,
+    ) !void {
+        const rope_dim = self.rotaryDimension();
+        if (self.model.rope_style == 2) {
+            try self.applyRoPEBuffer(src, self.host_attn_values, head_count, head_dim, position);
+            try metal_backend.storeKvHalf(
+                self.backend,
+                src,
+                cache,
+                kv_offset_elements,
+                head_count * head_dim,
+            );
+            return;
+        }
+        try metal_backend.applyRoPEAndStoreToCache(
+            self.backend,
+            src,
+            cache,
+            kv_offset_elements * 2,
+            head_count,
+            head_dim,
+            rope_dim,
+            position,
+            self.model.rope_freq_base,
+            self.model.rope_style,
+        );
+    }
+
     fn softcapInPlace(values: []f32, cap: f32) void {
         if (!(cap > 0)) return;
         for (values) |*value| value.* = std.math.tanh(value.* / cap) * cap;
@@ -945,6 +971,63 @@ pub const Session = struct {
             .tensor_type = tensor.tensor_type,
         };
         self.recordCategoryWithShape(.projections, start, shape);
+        if (used_moon_quant) {
+            if (self.profiler) |profiler| {
+                profiler.recordMoonQuantProjection(elapsedSince(start), shape);
+            }
+        }
+    }
+
+    fn runProjectionStoreKv(
+        self: *Session,
+        tensor: TensorDesc,
+        input: metal_backend.BufferHandle,
+        cache: metal_backend.BufferHandle,
+        cache_offset_elements: usize,
+    ) !void {
+        const start = std.time.nanoTimestamp();
+        var used_moon_quant = false;
+        switch (tensor.tensor_type) {
+            11 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ3KStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+            },
+            12 => {
+                if (self.dense_lookup.getMoonQuant(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecMoonQ4KStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+                    used_moon_quant = true;
+                } else {
+                    const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecQ4KStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+                }
+            },
+            13 => {
+                if (self.dense_lookup.getRaw(tensor.offset)) |matrix| {
+                    try metal_backend.runMatVecQ5KStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+                } else {
+                    const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                    try metal_backend.runMatVecStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+                }
+            },
+            14 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ6KStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+            },
+            8 => {
+                const matrix = self.dense_lookup.getRaw(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecQ8_0StoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+            },
+            else => {
+                const matrix = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                try metal_backend.runMatVecStoreKvToBuffer(self.backend, matrix, input, cache, cache_offset_elements, tensor.rows, tensor.cols);
+            },
+        }
+        const shape = metal_profile.ShapeDesc{
+            .rows = tensor.rows,
+            .cols = tensor.cols,
+            .tensor_type = tensor.tensor_type,
+        };
+        self.recordCategoryWithShape(.kv_writes, start, shape);
         if (used_moon_quant) {
             if (self.profiler) |profiler| {
                 profiler.recordMoonQuantProjection(elapsedSince(start), shape);
@@ -1558,23 +1641,9 @@ pub const Session = struct {
                 const kv_offset_elements = layer_base + position * self.model.kv_projection_size;
 
                 try self.runProjection(layer.attn_k, self.normed, self.k);
-                try self.applyRoPEBuffer(self.k, self.host_attn_values, self.model.head_count_kv, self.model.key_head_dimension, position);
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.k,
-                    self.k_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
+                try self.applyRoPEAndStoreToCache(self.k, self.k_cache, kv_offset_elements, self.model.head_count_kv, self.model.key_head_dimension, position);
 
-                try self.runProjection(layer.attn_v, self.normed, self.v);
-                try metal_backend.storeKvHalf(
-                    self.backend,
-                    self.v,
-                    self.v_cache,
-                    kv_offset_elements,
-                    self.model.kv_projection_size,
-                );
+                try self.runProjectionStoreKv(layer.attn_v, self.normed, self.v_cache, kv_offset_elements);
 
                 try metal_backend.attentionFused(
                     self.backend,
