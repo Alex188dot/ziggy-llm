@@ -2,7 +2,6 @@ const std = @import("std");
 const backend_api = @import("../backend.zig");
 const metal_backend = @import("../metal_backend.zig");
 const metal_profile = @import("../metal_profile.zig");
-const qwen35_linear_common = @import("../qwen35_linear_common.zig");
 const gpu_types = @import("types.zig");
 pub const DenseLookup = gpu_types.DenseLookup;
 pub const TensorDesc = gpu_types.TensorDesc;
@@ -54,15 +53,15 @@ pub const Session = struct {
     linear_conv_tmp: metal_backend.BufferHandle,
     linear_conv_state: metal_backend.BufferHandle,
     linear_recurrent_state: metal_backend.BufferHandle,
+    linear_conv_weight_buf: metal_backend.BufferHandle,
+    linear_dt_bias_weight_buf: metal_backend.BufferHandle,
+    linear_a_log_weight_buf: metal_backend.BufferHandle,
+    linear_norm_weight_buf: metal_backend.BufferHandle,
     host_q_values: []f32,
     host_gate_values: []f32,
     host_attn_values: []f32,
-    host_linear_qkv: []f32,
     host_linear_z: []f32,
-    host_linear_a: []f32,
-    host_linear_b: []f32,
     host_linear_g: []f32,
-    host_linear_conv_tmp: []f32,
     host_linear_conv_state: []f32,
     host_linear_recurrent_state: []f32,
     host_linear_conv_weights: []f32,
@@ -139,29 +138,29 @@ pub const Session = struct {
         errdefer metal_backend.destroyBuffer(linear_conv_state);
         const linear_recurrent_state = try metal_backend.createScratchBuffer(backend, model.block_count * recurrent_state_per_layer);
         errdefer metal_backend.destroyBuffer(linear_recurrent_state);
+        const max_conv_weights = linear_qkv_dim * @as(usize, @intCast(model.linear_conv_kernel_dim));
+        const linear_conv_weight_buf = try metal_backend.createScratchBuffer(backend, max_conv_weights);
+        errdefer metal_backend.destroyBuffer(linear_conv_weight_buf);
+        const linear_dt_bias_weight_buf = try metal_backend.createScratchBuffer(backend, linear_num_v_heads);
+        errdefer metal_backend.destroyBuffer(linear_dt_bias_weight_buf);
+        const linear_a_log_weight_buf = try metal_backend.createScratchBuffer(backend, linear_num_v_heads);
+        errdefer metal_backend.destroyBuffer(linear_a_log_weight_buf);
+        const linear_norm_weight_buf = try metal_backend.createScratchBuffer(backend, linear_value_dim_per_head);
+        errdefer metal_backend.destroyBuffer(linear_norm_weight_buf);
         const host_q_values = try allocator.alloc(f32, model.q_projection_size);
         errdefer allocator.free(host_q_values);
         const host_gate_values = try allocator.alloc(f32, model.q_projection_size);
         errdefer allocator.free(host_gate_values);
         const host_attn_values = try allocator.alloc(f32, model.q_projection_size);
         errdefer allocator.free(host_attn_values);
-        const host_linear_qkv = try allocator.alloc(f32, linear_qkv_dim);
-        errdefer allocator.free(host_linear_qkv);
         const host_linear_z = try allocator.alloc(f32, linear_z_dim);
         errdefer allocator.free(host_linear_z);
-        const host_linear_a = try allocator.alloc(f32, linear_num_v_heads);
-        errdefer allocator.free(host_linear_a);
-        const host_linear_b = try allocator.alloc(f32, linear_num_v_heads);
-        errdefer allocator.free(host_linear_b);
         const host_linear_g = try allocator.alloc(f32, linear_num_v_heads);
         errdefer allocator.free(host_linear_g);
-        const host_linear_conv_tmp = try allocator.alloc(f32, linear_qkv_dim);
-        errdefer allocator.free(host_linear_conv_tmp);
         const host_linear_conv_state = try allocator.alloc(f32, model.block_count * conv_state_per_layer);
         errdefer allocator.free(host_linear_conv_state);
         const host_linear_recurrent_state = try allocator.alloc(f32, model.block_count * recurrent_state_per_layer);
         errdefer allocator.free(host_linear_recurrent_state);
-        const max_conv_weights = linear_qkv_dim * @as(usize, @intCast(model.linear_conv_kernel_dim));
         const host_linear_conv_weights = try allocator.alloc(f32, max_conv_weights);
         errdefer allocator.free(host_linear_conv_weights);
         @memset(host_linear_conv_state, 0);
@@ -199,15 +198,15 @@ pub const Session = struct {
             .linear_conv_tmp = linear_conv_tmp,
             .linear_conv_state = linear_conv_state,
             .linear_recurrent_state = linear_recurrent_state,
+            .linear_conv_weight_buf = linear_conv_weight_buf,
+            .linear_dt_bias_weight_buf = linear_dt_bias_weight_buf,
+            .linear_a_log_weight_buf = linear_a_log_weight_buf,
+            .linear_norm_weight_buf = linear_norm_weight_buf,
             .host_q_values = host_q_values,
             .host_gate_values = host_gate_values,
             .host_attn_values = host_attn_values,
-            .host_linear_qkv = host_linear_qkv,
             .host_linear_z = host_linear_z,
-            .host_linear_a = host_linear_a,
-            .host_linear_b = host_linear_b,
             .host_linear_g = host_linear_g,
-            .host_linear_conv_tmp = host_linear_conv_tmp,
             .host_linear_conv_state = host_linear_conv_state,
             .host_linear_recurrent_state = host_linear_recurrent_state,
             .host_linear_conv_weights = host_linear_conv_weights,
@@ -240,15 +239,15 @@ pub const Session = struct {
         metal_backend.destroyBuffer(self.linear_conv_tmp);
         metal_backend.destroyBuffer(self.linear_conv_state);
         metal_backend.destroyBuffer(self.linear_recurrent_state);
+        metal_backend.destroyBuffer(self.linear_conv_weight_buf);
+        metal_backend.destroyBuffer(self.linear_dt_bias_weight_buf);
+        metal_backend.destroyBuffer(self.linear_a_log_weight_buf);
+        metal_backend.destroyBuffer(self.linear_norm_weight_buf);
         allocator.free(self.host_q_values);
         allocator.free(self.host_gate_values);
         allocator.free(self.host_attn_values);
-        allocator.free(self.host_linear_qkv);
         allocator.free(self.host_linear_z);
-        allocator.free(self.host_linear_a);
-        allocator.free(self.host_linear_b);
         allocator.free(self.host_linear_g);
-        allocator.free(self.host_linear_conv_tmp);
         allocator.free(self.host_linear_conv_state);
         allocator.free(self.host_linear_recurrent_state);
         allocator.free(self.host_linear_conv_weights);
@@ -1343,207 +1342,81 @@ pub const Session = struct {
         try self.runProjectionToDst(la.in_proj_a, self.normed, self.linear_a, 0);
         try self.runProjectionToDst(la.in_proj_b, self.normed, self.linear_b, 0);
 
-        if (model.is_qwen35_text) {
-            // GPU-only path for Qwen3.5 dense: zero CPU readbacks
-            const conv_weights = self.dense_lookup.getDense(la.conv1d.offset) orelse return error.InvalidTensorMetadata;
-            const dt_bias_weights = self.dense_lookup.getDense(la.dt_bias.offset) orelse return error.InvalidTensorMetadata;
-            const a_log_weights = self.dense_lookup.getDense(la.A_log.offset) orelse return error.InvalidTensorMetadata;
-            const norm_weights = self.dense_lookup.getDense(la.norm_weight.offset) orelse return error.InvalidTensorMetadata;
+        const conv_buffer = try self.linearWeightBuffer(la.conv1d, self.host_linear_conv_weights, self.linear_conv_weight_buf);
+        const dt_bias_buffer = try self.linearWeightBuffer(la.dt_bias, self.host_linear_g, self.linear_dt_bias_weight_buf);
+        const a_log_buffer = try self.linearWeightBuffer(la.A_log, self.host_linear_g, self.linear_a_log_weight_buf);
+        const norm_buffer = try self.linearWeightBuffer(la.norm_weight, self.host_linear_z, self.linear_norm_weight_buf);
 
-            const conv_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, conv_weights);
-            const dt_bias_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, dt_bias_weights);
-            const a_log_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, a_log_weights);
-            const norm_buffer = try metal_backend.getOrCreateBufferForF32(self.backend, norm_weights);
-
-            const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
-
-            const conv_start = std.time.nanoTimestamp();
-            try metal_backend.linearConv1dF32(
-                self.backend,
-                self.linear_qkv,
-                self.linear_conv_state,
-                conv_buffer,
-                self.linear_conv_tmp,
-                @intCast(layer_index),
-                @intCast(model.block_count),
-                @intCast(kernel_dim),
-                @intCast(qkv_dim),
-            );
-            self.recordCategoryWithShape(.elementwise_ops, conv_start, .{
-                .rows = 1,
-                .cols = qkv_dim,
-                .depth = kernel_dim,
-            });
-
-            const recurrent_start = std.time.nanoTimestamp();
-            try metal_backend.linearRecurrentNormF32(
-                self.backend,
-                self.linear_conv_tmp,
-                self.linear_recurrent_state,
-                self.linear_z,
-                self.linear_a,
-                self.linear_b,
-                dt_bias_buffer,
-                a_log_buffer,
-                norm_buffer,
-                self.linear_qkv,
-                @intCast(layer_index),
-                @intCast(num_key_heads),
-                @intCast(num_value_heads),
-                @intCast(key_head_dim),
-                @intCast(value_head_dim),
-                @intCast(qkv_dim),
-                model.rms_norm_eps,
-                scale,
-            );
-            self.recordCategoryWithShape(.elementwise_ops, recurrent_start, .{
-                .rows = num_value_heads,
-                .cols = value_head_dim,
-                .depth = key_head_dim,
-            });
-
-            try self.runProjectionAdd(la.out_proj, self.linear_qkv, self.hidden);
-            return;
-        }
-
-        // CPU fallback path for MoE and other models
-        const conv_state_per_layer = qkv_dim * (kernel_dim - 1);
-        const recurrent_state_per_layer = num_value_heads * key_head_dim * value_head_dim;
-        const conv_state_base = layer_index * conv_state_per_layer;
-        const recurrent_state_base = layer_index * recurrent_state_per_layer;
-        const conv_state = self.host_linear_conv_state[conv_state_base..][0..conv_state_per_layer];
-        const recurrent_state = self.host_linear_recurrent_state[recurrent_state_base..][0..recurrent_state_per_layer];
-        const qkv = self.host_linear_qkv[0..qkv_dim];
-        const z = self.host_linear_z[0..v_dim];
-        const alpha = self.host_linear_a[0..num_value_heads];
-        const beta = self.host_linear_b[0..num_value_heads];
-        const gate = self.host_linear_g[0..num_value_heads];
-        const conv_out = self.host_linear_conv_tmp[0..qkv_dim];
-
-        try self.flushSequenceForHostAccess();
-        try metal_backend.readBufferF32(self.linear_qkv, qkv);
-        try metal_backend.readBufferF32(self.linear_z, z);
-        try metal_backend.readBufferF32(self.linear_a, alpha);
-        try metal_backend.readBufferF32(self.linear_b, beta);
-
-        if (num_value_heads > 128) return error.InvalidTensorMetadata;
-        var dt_bias_vals: [128]f32 = undefined;
-        var a_log_vals: [128]f32 = undefined;
-        try self.loadTensorF32(la.dt_bias, dt_bias_vals[0..num_value_heads]);
-        try self.loadTensorF32(la.A_log, a_log_vals[0..num_value_heads]);
-
-        const conv1d_len = qkv_dim * kernel_dim;
-        const conv1d_vals = self.host_linear_conv_weights[0..conv1d_len];
-        try self.loadTensorF32(la.conv1d, conv1d_vals);
-
-        for (0..num_value_heads) |h| {
-            gate[h] = a_log_vals[h] * softplusScalar(alpha[h] + dt_bias_vals[h]);
-            beta[h] = sigmoidScalar(beta[h]);
-        }
-
-        @memset(conv_out, 0);
-        for (0..kernel_dim - 1) |kernel_idx| {
-            const state_offset = kernel_idx * qkv_dim;
-            const weight_offset = kernel_idx * qkv_dim;
-            for (0..qkv_dim) |channel| {
-                conv_out[channel] += conv_state[state_offset + channel] * conv1d_vals[weight_offset + channel];
-            }
-        }
-        const final_weight_offset = (kernel_dim - 1) * qkv_dim;
-        for (0..qkv_dim) |channel| {
-            conv_out[channel] += qkv[channel] * conv1d_vals[final_weight_offset + channel];
-            conv_out[channel] = siluScalar(conv_out[channel]);
-        }
-        if (kernel_dim > 1) {
-            var state_idx: usize = 0;
-            while (state_idx + qkv_dim < conv_state_per_layer) : (state_idx += qkv_dim) {
-                const src_offset = state_idx + qkv_dim;
-                std.mem.copyForwards(f32, conv_state[state_idx..][0..qkv_dim], conv_state[src_offset..][0..qkv_dim]);
-            }
-            const last_offset = (kernel_dim - 2) * qkv_dim;
-            @memcpy(conv_state[last_offset..][0..qkv_dim], qkv);
-        }
-
-        const q_conv = conv_out[0..q_dim];
-        const k_conv = conv_out[q_dim .. q_dim * 2];
-        const v_conv = conv_out[q_dim * 2 ..][0..v_dim];
-        l2NormalizePerHead(q_conv, num_key_heads, key_head_dim, model.rms_norm_eps);
-        l2NormalizePerHead(k_conv, num_key_heads, key_head_dim, model.rms_norm_eps);
-
-        const delta_out = self.host_q_values[0..v_dim];
         const scale = @as(f32, 1.0) / @sqrt(@as(f32, @floatFromInt(key_head_dim)));
-        if (value_head_dim > 256) return error.InvalidTensorMetadata;
-        for (0..num_value_heads) |head| {
-            const recurrent_offset = head * key_head_dim * value_head_dim;
-            const qk_head = try qwen35_linear_common.qkHeadIndex(head, num_key_heads, num_value_heads);
-            const q_head = q_conv[qk_head * key_head_dim ..][0..key_head_dim];
-            const k_head = k_conv[qk_head * key_head_dim ..][0..key_head_dim];
-            const v_head = v_conv[head * value_head_dim ..][0..value_head_dim];
-            const out_head = delta_out[head * value_head_dim ..][0..value_head_dim];
-            const state = recurrent_state[recurrent_offset..][0 .. key_head_dim * value_head_dim];
-            const decay = @exp(gate[head]);
 
-            for (0..state.len) |idx| state[idx] *= decay;
+        const conv_start = std.time.nanoTimestamp();
+        try metal_backend.linearConv1dF32(
+            self.backend,
+            self.linear_qkv,
+            self.linear_conv_state,
+            conv_buffer,
+            self.linear_conv_tmp,
+            @intCast(layer_index),
+            @intCast(model.block_count),
+            @intCast(kernel_dim),
+            @intCast(qkv_dim),
+        );
+        self.recordCategoryWithShape(.elementwise_ops, conv_start, .{
+            .rows = 1,
+            .cols = qkv_dim,
+            .depth = kernel_dim,
+        });
 
-            var sk: [256]f32 = undefined;
-            var delta_arr: [256]f32 = undefined;
-            @memset(sk[0..value_head_dim], 0);
+        const recurrent_start = std.time.nanoTimestamp();
+        try metal_backend.linearRecurrentNormF32(
+            self.backend,
+            self.linear_conv_tmp,
+            self.linear_recurrent_state,
+            self.linear_z,
+            self.linear_a,
+            self.linear_b,
+            dt_bias_buffer,
+            a_log_buffer,
+            norm_buffer,
+            self.linear_qkv,
+            @intCast(layer_index),
+            @intCast(num_key_heads),
+            @intCast(num_value_heads),
+            @intCast(key_head_dim),
+            @intCast(value_head_dim),
+            @intCast(qkv_dim),
+            model.rms_norm_eps,
+            scale,
+        );
+        self.recordCategoryWithShape(.elementwise_ops, recurrent_start, .{
+            .rows = num_value_heads,
+            .cols = value_head_dim,
+            .depth = key_head_dim,
+        });
 
-            for (0..key_head_dim) |row| {
-                const k_row = k_head[row];
-                const row_offset = row * value_head_dim;
-                for (0..value_head_dim) |col| {
-                    sk[col] += state[row_offset + col] * k_row;
-                }
-            }
-
-            for (0..value_head_dim) |col| {
-                delta_arr[col] = (v_head[col] - sk[col]) * beta[head];
-            }
-
-            for (0..key_head_dim) |row| {
-                const k_row = k_head[row];
-                const row_offset = row * value_head_dim;
-                for (0..value_head_dim) |col| {
-                    state[row_offset + col] += k_row * delta_arr[col];
-                }
-            }
-
-            @memset(sk[0..value_head_dim], 0);
-            for (0..key_head_dim) |row| {
-                const q_row = q_head[row] * scale;
-                const row_offset = row * value_head_dim;
-                for (0..value_head_dim) |col| {
-                    sk[col] += state[row_offset + col] * q_row;
-                }
-            }
-
-            for (0..value_head_dim) |col| {
-                out_head[col] = sk[col];
-            }
-        }
-
-        const norm_weights = self.dense_lookup.getDense(la.norm_weight.offset) orelse return error.InvalidTensorMetadata;
-        if (norm_weights.len < value_head_dim) return error.InvalidTensorMetadata;
-        for (0..num_value_heads) |head| {
-            const head_data = delta_out[head * value_head_dim ..][0..value_head_dim];
-            var sum_sq: f32 = 0;
-            for (head_data) |v| sum_sq += v * v;
-            const scale_norm = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(value_head_dim)) + model.rms_norm_eps);
-            for (head_data, 0..) |*v, i| {
-                v.* *= scale_norm * norm_weights[i];
-            }
-        }
-        for (0..v_dim) |idx| {
-            delta_out[idx] *= siluScalar(z[idx]);
-        }
-        try self.writeHostSlice(self.linear_z, delta_out);
-        try metal_backend.beginSequence(self.backend);
-        try self.runProjectionAdd(la.out_proj, self.linear_z, self.hidden);
+        try self.runProjectionAdd(la.out_proj, self.linear_qkv, self.hidden);
     }
 
-    fn writeHostSlice(_: *Session, buffer: metal_backend.BufferHandle, values: []const f32) !void {
-        try metal_backend.writeBufferF32(buffer, values);
+    fn linearWeightBuffer(
+        self: *Session,
+        tensor: TensorDesc,
+        host_buf: []f32,
+        gpu_buf: metal_backend.BufferHandle,
+    ) !metal_backend.BufferHandle {
+        const len = tensor.rows * tensor.cols;
+        if (host_buf.len < len) return error.InvalidTensorMetadata;
+        return switch (tensor.tensor_type) {
+            tensor_type_f32 => blk: {
+                const data = self.dense_lookup.getDense(tensor.offset) orelse return error.InvalidTensorMetadata;
+                break :blk try metal_backend.getOrCreateBufferForF32(self.backend, data);
+            },
+            tensor_type_f16 => blk: {
+                try self.loadTensorF32(tensor, host_buf[0..len]);
+                try metal_backend.writeBufferF32(gpu_buf, host_buf[0..len]);
+                break :blk gpu_buf;
+            },
+            else => error.UnsupportedTensorType,
+        };
     }
 
     fn readTensorValue(self: *Session, tensor: TensorDesc, index: usize) !f32 {
@@ -1718,35 +1591,6 @@ pub const Session = struct {
         return accepted;
     }
 };
-
-fn siluScalar(value: f32) f32 {
-    return value / (1 + @exp(-value));
-}
-
-fn sigmoidScalar(value: f32) f32 {
-    if (value >= 0) {
-        const exp_neg = @exp(-value);
-        return 1 / (1 + exp_neg);
-    }
-    const exp_pos = @exp(value);
-    return exp_pos / (1 + exp_pos);
-}
-
-fn softplusScalar(value: f32) f32 {
-    if (value > 0) return value + std.math.log1p(@exp(-value));
-    return std.math.log1p(@exp(value));
-}
-
-fn l2NormalizePerHead(values: []f32, head_count: usize, head_dim: usize, eps: f32) void {
-    for (0..head_count) |head_index| {
-        const head = values[head_index * head_dim ..][0..head_dim];
-        var norm_sq: f32 = 0;
-        for (head) |value| norm_sq += value * value;
-        const norm = @sqrt(norm_sq);
-        const scale = @as(f32, 1.0) / @max(norm, eps);
-        for (head) |*value| value.* *= scale;
-    }
-}
 
 test "readTensorValue maps dense tensors from column-major storage to logical row-major order" {
     const weights = [_]f32{
